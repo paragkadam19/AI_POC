@@ -1,0 +1,3 @@
+data_source ai_poc_dq:
+  type: duckdb
+  path: /Users/paragkadam/Downloads/AI_POC/poc_package/ai_poc_dq.duckdb
