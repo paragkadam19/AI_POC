@@ -4,56 +4,40 @@ duckdb_helper.py — All metadata + sampling via DuckDB only
 No Polars. No pandas. No full file in memory.
 DuckDB reads the data on disk, returns only what we need.
 
-- Adaptive memory/thread config based on file size (small files get
-  more RAM headroom, large files get a safe cap + generous disk
-  spill budget on /tmp, which is confirmed to be on local SSD).
-- Low-cardinality columns get value_counts (not just distinct values)
-  via DuckDB's histogram() aggregate, in a single combined query.
-- Every ingested table gets 3 audit columns added in the same single
-  CREATE TABLE AS SELECT pass: created_date, is_active, file_name.
+Memory/thread config is back to the fixed, manually-tuned settings
+that gave the best confirmed results (16.56s disk-write / 20.82s
+ingest on a 4.5GB file) — adaptive sizing was tried and reverted.
+
+temp_directory stays pointed at /tmp — confirmed to be on the local
+SSD, not network storage, so spilling there is fast.
+
+Low-cardinality columns get value_counts (not just distinct values)
+via DuckDB's histogram() aggregate, in a single combined query/scan.
+
+Every ingested table gets 3 audit columns added in the same single
+CREATE TABLE AS SELECT pass: created_date, is_active, file_name.
 """
 import os
 import duckdb
 from datetime import date
-from logger_config import get_logger
-logger = get_logger(__name__)
 
-BASE_CONFIG = {
+DUCKDB_CONFIG = {
+    "memory_limit":              "2GB",
+    "max_memory":                "2GB",
     "temp_directory":            "/tmp",
+    "max_temp_directory_size":   "10GB",
+    "threads":                   4,
     "preserve_insertion_order":  False,
 }
 
-SAMPLE_ROWS_SCHEMA = 100
+SAMPLE_ROWS_SCHEMA = 30
 SAMPLE_ROWS_DQ     = 200
 
 LOW_CARDINALITY_THRESHOLD = 100
 
 
-def get_duckdb_config(file_size_bytes: int = 0) -> dict:
-    """
-    Build a DuckDB config tuned to the file size being processed.
-    """
-    size_gb = file_size_bytes / (1024 ** 3) if file_size_bytes else 0
-
-    if size_gb > 3:
-        memory_limit, max_temp, threads = "2GB", "20GB", 4
-    elif size_gb > 1:
-        memory_limit, max_temp, threads = "3GB", "15GB", 4
-    else:
-        memory_limit, max_temp, threads = "3GB", "10GB", 4
-
-    return {
-        **BASE_CONFIG,
-        "memory_limit":            memory_limit,
-        "max_memory":              memory_limit,
-        "max_temp_directory_size": max_temp,
-        "threads":                 threads,
-    }
-
-
-def _connect(db_file: str, read_only: bool = False, file_size_bytes: int = 0):
-    config = get_duckdb_config(file_size_bytes)
-    return duckdb.connect(db_file, read_only=read_only, config=config)
+def _connect(db_file: str, read_only: bool = False):
+    return duckdb.connect(db_file, read_only=read_only, config=DUCKDB_CONFIG)
 
 
 # ── Ingest ─────────────────────────────────────────────────────────────────────
@@ -68,8 +52,7 @@ def ingest_csv(csv_file: str, db_file: str, table: str, original_filename: str =
     """
     try:
         file_size_bytes = os.path.getsize(csv_file)
-        config          = get_duckdb_config(file_size_bytes)
-        conn            = duckdb.connect(db_file, config=config)
+        conn = duckdb.connect(db_file, config=DUCKDB_CONFIG)
 
         conn.execute(f"DROP TABLE IF EXISTS {table}")
 
@@ -115,6 +98,14 @@ def get_preview(db_file: str, table: str, n: int = 8, row_count: int = None) -> 
 
 # ── Full metadata via SUMMARIZE + single-pass value-count extraction ─────────
 def get_metadata(db_file: str, table: str) -> dict:
+    """
+    SUMMARIZE: one query, full-dataset column stats, single pass.
+
+    For low-cardinality columns, value counts (e.g. {"Yes": 1200,
+    "No": 340}) are fetched using DuckDB's histogram() aggregate in
+    ONE combined query across all qualifying columns — ONE full-table
+    scan, not one scan per column.
+    """
     conn = _connect(db_file, read_only=True)
 
     row_count  = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -148,7 +139,7 @@ def get_metadata(db_file: str, table: str) -> dict:
                     str(val): int(cnt) for val, cnt in sorted_items[:LOW_CARDINALITY_THRESHOLD]
                 }
         except Exception as e:
-            logger.warning(f"combined histogram fetch failed for candidates={candidates}: {e}")
+            print(f"  [warning] combined histogram fetch failed: {e}")
 
     conn.close()
 
