@@ -1,5 +1,5 @@
 """
-app.py — Flask backend for Manufacturing Data Quality POC Console
+app.py — Flask backend for Data Quality POC Console
 =================================================================
 Flow: Upload CSV → DuckDB ingest → Schema Discovery → SODA YAML →
       Data Quality → Schema Validation → Schema Changes
