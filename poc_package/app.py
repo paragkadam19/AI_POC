@@ -11,6 +11,11 @@ sent over the network. 100% of Tab 4's AI cost is gone.
 import os, sys, json, re, time, shutil
 from datetime import datetime
 
+from logger_config import setup_logging, get_logger
+
+setup_logging()
+logger = get_logger(__name__)
+
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 STORAGE_DIR   = os.path.join(BASE_DIR, "storage")
 ENGINES_DIR   = os.path.join(BASE_DIR, "engines")
@@ -34,7 +39,7 @@ from duckdb_helper import ingest_csv, get_preview, get_full_metadata_for_ai, get
 from prompt_builder import build_schema_discovery_prompt
 from soda_executor import run_soda_checks_from_yaml
 
-SAMPLE_ROWS_SCHEMA = 500
+SAMPLE_ROWS_SCHEMA = 30
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
@@ -160,7 +165,7 @@ def upload():
         t0 = time.time()
         with open(csv_path, "wb") as out:
             shutil.copyfileobj(request.stream, out, length=16 * 1024 * 1024)
-        print(f"  [upload] streamed to disk: {time.time()-t0:.2f}s")
+        logger.info(f"upload streamed to disk in {time.time()-t0:.2f}s | file={filename}")
 
     # ── Fallback: classic multipart form upload ──────────────────────────────
     elif "file" in request.files:
@@ -172,7 +177,7 @@ def upload():
         csv_path   = os.path.join(udir, f"{ts()}.csv")
         t0 = time.time()
         f.save(csv_path)
-        print(f"  [upload] saved to disk (multipart): {time.time()-t0:.2f}s")
+        logger.info(f"upload saved to disk (multipart) in {time.time()-t0:.2f}s | file={filename}")
 
     # ── Fallback: pasted CSV text as JSON ─────────────────────────────────────
     else:
@@ -196,13 +201,13 @@ def upload():
     try:
         table = table_name(dataset_id)
         t1    = time.time()
-        ingest_result = ingest_csv(csv_path, DB_FILE, table)
-        print(f"  [upload] DuckDB ingest: {time.time()-t1:.2f}s")
+        ingest_result = ingest_csv(csv_path, DB_FILE, table, original_filename=filename)
+        logger.info(f"DuckDB ingest completed in {time.time()-t1:.2f}s | table={table}")
 
         if not ingest_result.get("success"):
+            logger.error(f"DuckDB ingest reported failure for table={table}: {ingest_result.get('error')}")
             return jsonify({"error": ingest_result.get("error", "DuckDB ingest failed")}), 500
 
-        # row_count already known from ingest — don't recompute with another COUNT(*)
         sample, columns, row_count = get_preview(
             DB_FILE, table, n=8, row_count=ingest_result["row_count"]
         )
@@ -215,6 +220,7 @@ def upload():
             "duckdb":     ingest_result,
         })
     except Exception as e:
+        logger.error(f"Upload/ingest failed for dataset={dataset_id}: {e}", exc_info=True)
         return jsonify({"error": f"DuckDB error: {str(e)}"}), 500
 
 
@@ -231,6 +237,8 @@ def run_poc1():
         metadata        = get_full_metadata_for_ai(DB_FILE, tbl, STATE["filename"], file_size_bytes, SAMPLE_ROWS_SCHEMA)
 
         system_prompt, user_prompt = build_schema_discovery_prompt(metadata)
+        print(f"BEDROCK CALL from: {__name__}")
+        import traceback; traceback.print_stack(limit=5)
         result = ask_json(user_prompt, system_prompt)
 
         versioned_name = save_versioned(ds, "poc1", result)
@@ -247,6 +255,7 @@ def run_poc1():
         result["_contract_created"] = is_new_contract
         return jsonify(result)
     except Exception as e:
+        logger.error(f"Schema discovery (poc1) failed for dataset={ds}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/poc1/versions")
@@ -265,9 +274,10 @@ def run_poc7():
     if not schema_profile:
         return jsonify({"error": "Run Schema Discovery (Tab 2) first"}), 400
     try:
-        prompt      = poc7.PROMPT.format(
-            table          = table_name(ds),
-            schema_profile = json.dumps(schema_profile, indent=2)
+        # FIX: Use safe string replacement instead of .format()
+        schema_json = json.dumps(schema_profile, indent=2)
+        prompt = poc7.PROMPT.replace("{table}", table_name(ds)).replace(
+            "{schema_profile}", schema_json
         )
         yaml_output = ask(prompt, poc7.SYSTEM).strip()
         if yaml_output.startswith("```"):
@@ -283,6 +293,7 @@ def run_poc7():
         )
         return jsonify({"yaml": yaml_output, "check_count": check_count, "dataset_id": ds})
     except Exception as e:
+        logger.error(f"SODA YAML generation (poc7) failed for dataset={ds}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
@@ -304,6 +315,7 @@ def run_poc2():
         save_versioned(ds, "poc2", result)
         return jsonify(result)
     except Exception as e:
+        logger.error(f"Data quality check run (poc2) failed for dataset={ds}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
@@ -333,6 +345,7 @@ def run_poc3a():
         save_versioned(ds, "poc3a", result)
         return jsonify(result)
     except Exception as e:
+        logger.error(f"Schema validation (poc3a) failed for dataset={ds}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
@@ -378,4 +391,5 @@ def run_poc3b():
         save_versioned(ds, "poc3b", result)
         return jsonify(result)
     except Exception as e:
+        logger.error(f"Schema change detection (poc3b) failed for dataset={ds}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500

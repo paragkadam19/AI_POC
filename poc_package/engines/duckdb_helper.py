@@ -4,51 +4,99 @@ duckdb_helper.py — All metadata + sampling via DuckDB only
 No Polars. No pandas. No full file in memory.
 DuckDB reads the data on disk, returns only what we need.
 
-OPTIMIZED: distinct values for ALL low-cardinality columns are now
-fetched in ONE combined query/scan instead of one query per column.
-row_count is computed once and threaded through, instead of being
-recomputed by every helper that needs it.
+- Adaptive memory/thread config based on file size (small files get
+  more RAM headroom, large files get a safe cap + generous disk
+  spill budget on /tmp, which is confirmed to be on local SSD).
+- Low-cardinality columns get value_counts (not just distinct values)
+  via DuckDB's histogram() aggregate, in a single combined query.
+- Every ingested table gets 3 audit columns added in the same single
+  CREATE TABLE AS SELECT pass: created_date, is_active, file_name.
 """
+import os
 import duckdb
+from datetime import date
+from logger_config import get_logger
+logger = get_logger(__name__)
 
-DUCKDB_CONFIG = {
-    "memory_limit":              "2GB",
-    "max_memory":                "2GB",
+BASE_CONFIG = {
     "temp_directory":            "/tmp",
-    "max_temp_directory_size":   "10GB",
-    "threads":                   6,
     "preserve_insertion_order":  False,
 }
 
-SAMPLE_ROWS_SCHEMA = 500
-SAMPLE_ROWS_DQ     = 500
+SAMPLE_ROWS_SCHEMA = 100
+SAMPLE_ROWS_DQ     = 200
 
 LOW_CARDINALITY_THRESHOLD = 100
 
 
-def _connect(db_file: str, read_only: bool = False):
-    return duckdb.connect(db_file, read_only=read_only, config=DUCKDB_CONFIG)
+def get_duckdb_config(file_size_bytes: int = 0) -> dict:
+    """
+    Build a DuckDB config tuned to the file size being processed.
+    """
+    size_gb = file_size_bytes / (1024 ** 3) if file_size_bytes else 0
+
+    if size_gb > 3:
+        memory_limit, max_temp, threads = "2GB", "20GB", 4
+    elif size_gb > 1:
+        memory_limit, max_temp, threads = "3GB", "15GB", 4
+    else:
+        memory_limit, max_temp, threads = "3GB", "10GB", 4
+
+    return {
+        **BASE_CONFIG,
+        "memory_limit":            memory_limit,
+        "max_memory":              memory_limit,
+        "max_temp_directory_size": max_temp,
+        "threads":                 threads,
+    }
+
+
+def _connect(db_file: str, read_only: bool = False, file_size_bytes: int = 0):
+    config = get_duckdb_config(file_size_bytes)
+    return duckdb.connect(db_file, read_only=read_only, config=config)
 
 
 # ── Ingest ─────────────────────────────────────────────────────────────────────
-def ingest_csv(csv_file: str, db_file: str, table: str) -> dict:
+def ingest_csv(csv_file: str, db_file: str, table: str, original_filename: str = None) -> dict:
+    """
+    Ingest CSV into DuckDB, adding 3 audit/control columns to every table
+    in the same single CREATE TABLE AS SELECT pass (no extra scan needed):
+
+      - created_date : today's date, set at ingest time
+      - is_active    : boolean, true for every row by default
+      - file_name    : the original uploaded filename
+    """
     try:
-        conn = _connect(db_file)
+        file_size_bytes = os.path.getsize(csv_file)
+        config          = get_duckdb_config(file_size_bytes)
+        conn            = duckdb.connect(db_file, config=config)
+
         conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+        today     = date.today().isoformat()
+        file_name = (original_filename or os.path.basename(csv_file)).replace("'", "''")
+
         conn.execute(f"""
             CREATE TABLE {table} AS
-            SELECT * FROM read_csv_auto('{csv_file}', sample_size=10000)
+            SELECT
+                *,
+                DATE '{today}'  AS created_date,
+                true            AS is_active,
+                '{file_name}'   AS file_name
+            FROM read_csv_auto('{csv_file}', sample_size=10000)
         """)
+
         row_count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         cols      = conn.execute(f"DESCRIBE {table}").fetchall()
         conn.close()
 
         return {
-            "success":   True,
-            "table":     table,
-            "row_count": row_count,
-            "columns":   [{"name": c[0], "type": c[1]} for c in cols],
-            "col_names": [c[0] for c in cols],
+            "success":      True,
+            "table":        table,
+            "row_count":    row_count,
+            "columns":      [{"name": c[0], "type": c[1]} for c in cols],
+            "col_names":    [c[0] for c in cols],
+            "file_size_mb": round(file_size_bytes / (1024 * 1024), 2),
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -56,10 +104,6 @@ def ingest_csv(csv_file: str, db_file: str, table: str) -> dict:
 
 # ── Preview (8 rows for UI table) ─────────────────────────────────────────────
 def get_preview(db_file: str, table: str, n: int = 8, row_count: int = None) -> tuple:
-    """
-    8 rows for UI preview. row_count can be passed in (e.g. from ingest_csv's
-    result) to skip a redundant COUNT(*) scan.
-    """
     conn = _connect(db_file, read_only=True)
     cols = [c[0] for c in conn.execute(f"DESCRIBE {table}").fetchall()]
     rows = conn.execute(f"SELECT * FROM {table} LIMIT {n}").fetchall()
@@ -69,16 +113,8 @@ def get_preview(db_file: str, table: str, n: int = 8, row_count: int = None) -> 
     return [dict(zip(cols, row)) for row in rows], cols, row_count
 
 
-# ── Full metadata via SUMMARIZE + single-pass low-cardinality extraction ──────
+# ── Full metadata via SUMMARIZE + single-pass value-count extraction ─────────
 def get_metadata(db_file: str, table: str) -> dict:
-    """
-    SUMMARIZE: one query, full-dataset column stats, single pass.
-
-    Low-cardinality distinct values used to be fetched with a NEW connection
-    and a NEW full-table scan PER column. Now it's ONE combined query that
-    fetches distinct values for every qualifying column in a single scan,
-    using DuckDB's list(DISTINCT col) aggregate.
-    """
     conn = _connect(db_file, read_only=True)
 
     row_count  = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -98,18 +134,21 @@ def get_metadata(db_file: str, table: str) -> dict:
         if unique_count and unique_count < LOW_CARDINALITY_THRESHOLD and unique_count < row_count:
             candidates.append(col_name)
 
-    distinct_map = {}
+    value_counts_map = {}
     if candidates:
         select_parts = ", ".join(
-            f'list(DISTINCT "{c}") AS "{c}__vals"' for c in candidates
+            f'histogram("{c}") AS "{c}__hist"' for c in candidates
         )
         try:
             combined = conn.execute(f"SELECT {select_parts} FROM {table}").fetchone()
             for i, c in enumerate(candidates):
-                vals = combined[i] or []
-                distinct_map[c] = sorted(str(v) for v in vals)[:LOW_CARDINALITY_THRESHOLD]
+                hist = combined[i] or {}
+                sorted_items = sorted(hist.items(), key=lambda kv: kv[1], reverse=True)
+                value_counts_map[c] = {
+                    str(val): int(cnt) for val, cnt in sorted_items[:LOW_CARDINALITY_THRESHOLD]
+                }
         except Exception as e:
-            print(f"  [warning] combined distinct-value fetch failed: {e}")
+            logger.warning(f"combined histogram fetch failed for candidates={candidates}: {e}")
 
     conn.close()
 
@@ -128,8 +167,8 @@ def get_metadata(db_file: str, table: str) -> dict:
             "max":           str(r.get("max", "") or ""),
             "mean":          str(r.get("avg", "") or ""),
         }
-        if col_name in distinct_map:
-            col_dict["distinct_values"] = distinct_map[col_name]
+        if col_name in value_counts_map:
+            col_dict["value_counts"] = value_counts_map[col_name]
 
         columns.append(col_dict)
 
@@ -142,7 +181,6 @@ def get_metadata(db_file: str, table: str) -> dict:
 
 # ── Sample rows as list[dict] ──────────────────────────────────────────────────
 def get_sample_rows(db_file: str, table: str, n_rows: int, row_count: int = None) -> list:
-    """row_count can be passed in to skip a redundant COUNT(*) scan."""
     conn = _connect(db_file, read_only=True)
     if row_count is None:
         row_count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -158,7 +196,7 @@ def get_sample_rows(db_file: str, table: str, n_rows: int, row_count: int = None
     return [dict(zip(cols, row)) for row in rows]
 
 
-# ── Stratified sample as CSV string (kept for any caller that still wants it) ─
+# ── Stratified sample as CSV string ───────────────────────────────────────────
 def get_sample_csv(db_file: str, table: str, n_rows: int, row_count: int = None) -> str:
     conn = _connect(db_file, read_only=True)
     if row_count is None:
@@ -187,7 +225,6 @@ def get_full_metadata_for_ai(db_file: str, table: str, filename: str,
                               file_size_bytes: int,
                               n_sample: int = SAMPLE_ROWS_SCHEMA) -> dict:
     metadata    = get_metadata(db_file, table)
-    # row_count already known from get_metadata — don't recompute it again
     sample_rows = get_sample_rows(db_file, table, n_sample, row_count=metadata["total_rows"])
     schema_dict = {c["name"]: c["dtype"] for c in metadata["columns"]}
 

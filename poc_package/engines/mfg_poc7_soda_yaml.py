@@ -1,79 +1,212 @@
 """
-Manufacturing POC 7 — SODA Quality Checks YAML Generator
-=========================================================
-This module only defines the prompt used by app.py's /api/poc7/run
-route. app.py passes in the active dataset's schema profile and
-table name directly — no hardcoded schema-profile path here, so
-this works the same regardless of which file was uploaded.
-
-Approach: Uses the schema already discovered by POC 1 — column names,
-types, null counts, and categorical values. AI dynamically writes a
-SODA Core 3.x YAML based on whatever schema POC 1 found, so this
-works for ANY CSV without hardcoded column names.
+Manufacturing POC 7 — SODA Quality Checks YAML Generator (ENHANCED)
+===================================================================
+Uses FULL schema profile including:
+- Validation rules (business rules discovered by AI)
+- Null percentages (smart thresholds, not just 0)
+- Sample values (actual data patterns)
+- Quality concerns (issues to flag)
+- Categorical values (with counts)
 """
 
 SYSTEM = """You are a data quality engineer expert in SODA Core 3.x.
 You write valid SODA Core 3.x YAML check files based on a schema
-profile, not raw data. Return only valid YAML. No markdown fences,
-no explanation, no comments."""
+profile INCLUDING validation rules, sample values, quality concerns,
+and actual null patterns — NOT just columns.
+
+Return only valid YAML. No markdown fences, no explanation, no comments.
+
+Use the FULL context:
+- validation_rule: Business rule discovered by AI
+- sample_values: Actual data seen (shows real patterns)
+- quality_concerns: Issues flagged (high nulls, duplicates, etc.)
+- null_count / null_pct: ACTUAL null stats (not just 0 or all)
+"""
 
 PROMPT = """
-You have a schema profile (from an automated schema discovery step)
+You have a COMPLETE schema profile (from automated schema discovery)
 for table: {table}
 
-Generate a SODA Core 3.x quality checks YAML file using ONLY this
-schema profile — do not assume any columns beyond what is listed.
+This profile includes:
+1. Column names and data types
+2. Null counts AND percentages (actual data patterns)
+3. Sample values (real data from the file)
+4. Validation rules (business rules AI inferred)
+5. Categorical values WITH frequency counts (class distribution)
+6. Quality concerns (high nulls, duplicates, format issues, etc.)
+7. Critical data points (security/business impact)
 
-CRITICAL — use ONLY these supported SODA Core 3.x check syntaxes:
+Generate a SODA Core 3.x quality checks YAML file using ALL this context.
 
-1. Row count:
+CRITICAL — SODA Core 3.x check syntaxes:
+
+1. Row count (always):
    - row_count > 0
 
-2. Null checks (for non-nullable or low-null columns):
-   - missing_count(column_name) = 0
+2. Null checks (use ACTUAL null_pct, not just 0):
+   - missing_count(column_name) = 0         # For nullable=false
+   - missing_count(column_name) < 50        # If actual nulls=45, allow some
+   - missing_count(column_name) < 1000      # If actual nulls=500, allow <1000
 
-3. Duplicate checks (for any column pair that looks like a natural key,
-   e.g. an ID column + a step/sequence column):
+3. Duplicate checks (for natural keys identified in validation_rule):
    - duplicate_count(column1, column2) = 0
 
-4. Numeric range (only for data_type integer or float, NEVER for
-   data_type percentage since those are stored as strings like '97.00%'):
+4. Numeric range (from validation_rule + sample_values):
    - min(column_name) >= 0
+   - max(column_name) <= 1000000
+   (Use sample_values and validation_rule to set realistic bounds)
 
-5. Valid values (only for data_type categorical, using the
-   categorical_values list from the schema profile):
+5. Valid values (from categorical_values WITH distribution):
    - invalid_count(column_name) = 0:
        valid values:
          - value1
          - value2
 
-6. Named checks (add name as sub-key):
+6. Class balance check (if categorical with imbalance in quality_concerns):
+   - missing_count(column_name) = 0:
+       name: DQ-MFG-07 Column X class imbalance detected
+
+7. Named checks (always add name):
    - missing_count(Batch_ID) = 0:
-       name: DQ-MFG-01 Batch ID not null
+       name: DQ-MFG-01 Batch ID cannot be null (critical key)
 
-DO NOT use: alert, fail, warn, valid_format, regex, max()/min() on
-percentage columns, arithmetic expressions like (a + b = c), or any
-key not shown above.
+DO NOT use: alert, fail, warn, valid_format, regex, or unsupported keys.
 
-INSTRUCTIONS — build the checks yourself from the schema profile:
-1. Always start with row_count > 0
-2. For every column where nullable=false OR null_count=0, add a
-   missing_count check
-3. Identify the most likely natural key (commonly an ID column plus a
-   sequence/step column) and add ONE duplicate_count check on that pair
-4. For every column with data_type integer or float, add a
-   min(column) >= 0 check (skip if the column commonly contains
-   negative values per its business_meaning)
-5. For every column with data_type categorical AND a categorical_values
-   list of 10 or fewer values, add an invalid_count check using those
-   exact values
-6. Skip any column flagged in quality_concerns as "100% null" or
-   "dead column" entirely — do not generate checks for it
-7. Number every check DQ-MFG-01, DQ-MFG-02, ... sequentially
-8. Quote any column name containing special characters (%, -, spaces)
+═════════════════════════════════════════════════════════════════
 
-SCHEMA PROFILE (from automated discovery):
+INSTRUCTIONS — use FULL schema context:
+
+STEP 1: ROW COUNT (always)
+  - Start with: row_count > 0
+  - Name: DQ-MFG-01 Table must have data
+
+STEP 2: NULL CHECKS (use actual null_pct, not just ≤0)
+  For EVERY column:
+    - If validation_rule says "Required" or "Cannot be null":
+      missing_count(col) = 0 with name
+    - If null_count > 0 but null_pct < 5%:
+      missing_count(col) < 10 (allow observed nulls, warn if much higher)
+    - If null_count > 0 and null_pct > 5%:
+      missing_count(col) < (null_count * 2) (allow 2x normal)
+    - If quality_concerns mentions "high nulls":
+      flag with MEDIUM severity threshold
+
+  Example from schema:
+    column: "created_date"
+    null_count: 0
+    nullable: false
+    validation_rule: "Valid DATE format, should not be future-dated"
+    → Check: missing_count(created_date) = 0
+                name: DQ-MFG-02 Creation date is required
+
+    column: "notes"
+    null_count: 500
+    null_pct: 2.7
+    nullable: true
+    → Check: missing_count(notes) < 1000
+                name: DQ-MFG-08 Notes nulls stay within 2.7% baseline
+
+STEP 3: RANGE CHECKS (use sample_values + validation_rule)
+  For every numeric column:
+    - Extract min/max from sample_values
+    - Read validation_rule for business bounds
+    - Set realistic checks based on BOTH
+    - Do NOT assume 0-100% for percentages (they're strings!)
+
+  Example:
+    column: "income"
+    data_type: "FLOAT64"
+    sample_values: ["50000", "75000", "120000", "500000"]
+    validation_rule: "Annual salary, >= $30k, <= $2M"
+    → Checks:
+        - min(income) >= 30000
+        - max(income) <= 2000000
+
+  Example (DO NOT assume 0-100 for percentages):
+    column: "approval_rate"
+    data_type: "VARCHAR"  ← STRING, not numeric!
+    sample_values: ["97.50%", "85.00%", "100%"]
+    → DO NOT write: min(approval_rate) >= 0
+    → Instead: Check only for format via categorical_values
+
+STEP 4: DUPLICATE KEY CHECKS (from validation_rule + data_type)
+  - Look for columns where validation_rule says "unique" or "primary key"
+  - Look for ID-like columns (applicantid, transaction_id, etc.)
+  - If you find a likely natural key (e.g., applicantid + sequence):
+    duplicate_count(applicantid, sequence) = 0
+    name: DQ-MFG-XX Natural key uniqueness
+
+STEP 5: CATEGORICAL/VALID VALUES (from categorical_values + distribution)
+  For EVERY column with categorical_values list:
+    - Check length: if <= 10 unique values, add invalid_count check
+    - Use actual categorical_values names exactly
+    - Add name showing the valid set
+    - If quality_concerns mentions unexpected values, flag them
+
+  Example:
+    column: "employment"
+    data_type: "VARCHAR"
+    categorical_values: ["Salaried", "Self-Employed", "Unemployed"]
+    value_counts: {"Salaried": 1200, "Self-Employed": 450, "Unemployed": 90}
+    quality_concerns: ["employment has only 3 values"]
+    → Check:
+        - invalid_count(employment) = 0:
+            name: DQ-MFG-03 Employment only valid types
+            valid values:
+              - Salaried
+              - Self-Employed
+              - Unemployed
+
+STEP 6: CLASS IMBALANCE (from quality_concerns + value_counts)
+  If quality_concerns mentions "class imbalance" or one value > 95%:
+    - Add check noting the concern
+    - Use missing_count as marker:
+      missing_count(imbalanced_column) < 50:
+          name: DQ-MFG-XX Column X has class imbalance detected
+
+STEP 7: QUALITY CONCERNS (read and flag)
+  For EVERY quality_concern listed:
+    - "High nulls (>50%)" → Add missing_count threshold
+    - "Duplicates detected" → Add duplicate_count check
+    - "Format inconsistency" → Add invalid_count or note
+    - "Unexpected values" → Reference in categorical check
+
+  Example quality_concern: "employment has only 3 values but 'XYZ' 
+  appears 2x (likely error)"
+  → Add comment in check: name: DQ-MFG-03 Employment validation 
+    (XYZ flagged as potential error)
+
+STEP 8: SAMPLE VALUE VALIDATION (use sample_values for reality check)
+  Before finalizing min/max/ranges:
+    - Look at sample_values
+    - If they show different patterns, adjust check bounds
+    - Example: min(income) sample is ["50000", ...], not ["0", ...]
+      → Set min(income) >= 30000, not >= 0
+
+STEP 9: BUSINESS RULES (from validation_rule)
+  For EVERY column with validation_rule:
+    - Encode the rule into the appropriate SODA check
+    - Use rule text in the check name
+    - Example rule: "Date should not be future-dated"
+      → Add comment: name: DQ-MFG-05 Creation date not future-dated
+
+STEP 10: NUMBERING
+  - Start at DQ-MFG-01
+  - Increment for every check
+  - Group by category: nulls, ranges, categorical, keys, concerns
+
+═════════════════════════════════════════════════════════════════
+
+SCHEMA PROFILE (COMPLETE — use all fields):
 {schema_profile}
+
+Output format:
+checks for {table}:
+  - row_count > 0:
+      name: DQ-MFG-01 Table must have data
+  - missing_count(column_name) = 0:
+      name: DQ-MFG-02 Column name cannot be null
+  [... continue for all checks ...]
 
 Start directly with: checks for {table}:
 """

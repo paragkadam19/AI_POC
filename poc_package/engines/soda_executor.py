@@ -1,21 +1,30 @@
 """
 soda_executor.py — Execute SODA checks against DuckDB data
 ===========================================================
-Instead of calling Bedrock AI for data quality checks (Tab 4),
-we now:
-1. Read the SODA YAML from Tab 3
-2. Parse the check definitions
-3. Execute them directly against DuckDB
-4. Return results to display
-
-This saves 100% of Tab 4 Bedrock costs!
 """
 
 import re
+import json
 import duckdb
 import yaml
-import json
+from datetime import date, datetime
 from typing import List, Dict, Any, Tuple, Optional
+
+
+# ✅ JSON Serialization Helper
+def make_serializable(obj):
+    """
+    Convert non-JSON-serializable objects to strings.
+    Handles date/datetime objects and nested structures.
+    """
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    elif isinstance(obj, (list, tuple)):
+        return [make_serializable(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {k: make_serializable(v) for k, v in obj.items()}
+    else:
+        return obj
 
 
 def load_soda_yaml(yaml_path: str) -> Dict[str, Any]:
@@ -25,43 +34,12 @@ def load_soda_yaml(yaml_path: str) -> Dict[str, Any]:
 
 
 def parse_soda_checks(yaml_content: Dict[str, Any], table_name: str) -> List[Dict[str, Any]]:
-    """
-    Extract check definitions from SODA YAML.
-
-    Real SODA Core syntax uses a LITERAL top-level key of the form
-    "checks for <table_name>:" — NOT a nested {"checks": {table: [...]}}
-    dict. e.g.:
-
-        checks for tbl_applicant_data_1gb_csv:
-          - row_count > 0:
-              name: DQ-MFG-01 Row count greater than zero
-          - invalid_count(employment) = 0:
-              name: DQ-MFG-13 employment valid values
-              valid values:
-                - Salaried
-                - Self-Employed
-                - Unemployed
-
-    Returns list of check dicts:
-    [
-        {
-            "check_id": "DQ-MFG-01",
-            "check_name": "Row count greater than zero",
-            "type": "row_count",
-            "query": "SELECT COUNT(*) FROM table_name",
-            "expected": "> 0",
-            "sql_definition": "row_count > 0"
-        },
-        ...
-    ]
-    """
+    """Extract check definitions from SODA YAML."""
     checks = []
 
     if not yaml_content:
         return checks
 
-    # Find the "checks for <table_name>" key directly — this is a literal
-    # string key in real SODA YAML, not a nested dict lookup.
     target_key = f"checks for {table_name}"
     checks_list = None
     for key, value in yaml_content.items():
@@ -80,7 +58,6 @@ def parse_soda_checks(yaml_content: Dict[str, Any], table_name: str) -> List[Dic
         if isinstance(check_def, str):
             check_str = check_def.strip()
         elif isinstance(check_def, dict):
-            # Real shape: { "invalid_count(col) = 0": { "name": "...", "valid values": [...] } }
             if check_def:
                 check_str = list(check_def.keys())[0]
                 extra = check_def[check_str] or {}
@@ -90,14 +67,12 @@ def parse_soda_checks(yaml_content: Dict[str, Any], table_name: str) -> List[Dic
         if not check_str:
             continue
 
-        # Default id/display name — overridden below if YAML supplied a "name"
         check_id = f"DQ-{check_id_counter:02d}"
         check_name = check_str
         check_id_counter += 1
 
         name_field = extra.get("name") if isinstance(extra, dict) else None
         if name_field:
-            # "DQ-MFG-01 Row count greater than zero" -> id="DQ-MFG-01", name="Row count greater than zero"
             m = re.match(r"(\S+)\s+(.*)", name_field.strip())
             if m:
                 check_id, check_name = m.group(1), m.group(2)
@@ -125,15 +100,7 @@ def parse_soda_checks(yaml_content: Dict[str, Any], table_name: str) -> List[Dic
 
 def parse_check_string(check_str: str, table_name: str,
                         valid_values: Optional[List[str]] = None) -> Tuple[str, str, str]:
-    """
-    Parse a single SODA check string into type, SQL query, and expected result.
-
-    Examples:
-        "row_count > 0" → ("row_count", "SELECT COUNT(*) FROM table", "> 0")
-        "missing_count(age) = 0" → ("null_check", "SELECT COUNT(*) FROM table WHERE age IS NULL", "= 0")
-        "invalid_count(status) = 0" + valid_values=[...] →
-            ("invalid_count", "SELECT COUNT(*) FROM table WHERE status NOT IN (...) AND status IS NOT NULL", "= 0")
-    """
+    """Parse a single SODA check string into type, SQL query, and expected result."""
 
     check_str = check_str.strip()
 
@@ -160,7 +127,7 @@ def parse_check_string(check_str: str, table_name: str,
                 f"{operator} {value}"
             )
 
-    # 3. invalid_count (enum/categorical) — now actually uses valid_values if supplied
+    # 3. invalid_count (enum/categorical)
     if "invalid_count" in check_str:
         match = re.match(r"invalid_count\(([\w\-\"']+)\)\s*([<>=]+)\s*(\d+)", check_str)
         if match:
@@ -168,8 +135,6 @@ def parse_check_string(check_str: str, table_name: str,
             col_name = col_name.strip('"\'')
 
             if valid_values:
-                # Build a NOT IN (...) clause so invalid_count actually means something.
-                # Rows that are NULL are excluded here — missing_count already covers nulls.
                 escaped = [str(v).replace("'", "''") for v in valid_values]
                 in_list = ", ".join(f"'{v}'" for v in escaped)
                 sql = (
@@ -177,8 +142,6 @@ def parse_check_string(check_str: str, table_name: str,
                     f'WHERE "{col_name}" IS NOT NULL AND "{col_name}" NOT IN ({in_list})'
                 )
             else:
-                # No valid_values supplied — nothing meaningful to validate against.
-                # Fall back to a query that can never report a false pass.
                 sql = f'SELECT COUNT(*) FROM {table_name} WHERE 1=0'
 
             return ("invalid_count", sql, f"{operator} {value}")
@@ -219,32 +182,12 @@ def parse_check_string(check_str: str, table_name: str,
                 f"{operator} {value}"
             )
 
-    # If we couldn't parse it, return generic info
     return ("unknown", "", check_str)
 
 
 def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Execute all checks against DuckDB and return results.
-
-    Returns:
-    {
-        "audit_passed": bool,
-        "total_checks": int,
-        "passed_checks": int,
-        "failed_checks": int,
-        "checks": [
-            {
-                "check_id": "DQ-01",
-                "check_name": "row_count > 0",
-                "passed": bool,
-                "actual_value": 1000,
-                "expected": "> 0",
-                "error_message": null or str
-            },
-            ...
-        ]
-    }
     """
 
     conn = duckdb.connect(db_file, read_only=True)
@@ -261,11 +204,9 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
         expected = check["expected"]
 
         try:
-            # Execute the query
             result = conn.execute(sql_query).fetchall()
             actual_value = result[0][0] if result else None
 
-            # Evaluate if check passed
             passed, error_msg = evaluate_check(actual_value, expected, check_type)
 
             if passed:
@@ -273,12 +214,13 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
             else:
                 failed_count += 1
 
+            # ✅ Make actual_value JSON-serializable
             results.append({
                 "check_id": check_id,
                 "check_name": check_name,
                 "type": check_type,
                 "passed": passed,
-                "actual_value": actual_value,
+                "actual_value": make_serializable(actual_value),  # ← FIXED!
                 "expected": expected,
                 "error_message": error_msg
             })
@@ -297,28 +239,22 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
 
     conn.close()
 
-    return {
+    # ✅ Ensure entire result is JSON-serializable
+    return make_serializable({
         "audit_passed": failed_count == 0,
         "total_checks": len(checks),
         "passed_checks": passed_count,
         "failed_checks": failed_count,
         "checks": results
-    }
+    })
 
 
 def evaluate_check(actual_value: Any, expected_str: str, check_type: str) -> Tuple[bool, str]:
-    """
-    Evaluate if actual value matches the expected condition.
-
-    Examples:
-        actual=1000, expected="> 0" → (True, None)
-        actual=0, expected="> 0" → (False, "0 is not > 0")
-    """
+    """Evaluate if actual value matches the expected condition."""
 
     if actual_value is None:
         return False, "Actual value is NULL"
 
-    # Parse expected string: "> 0", "= 5", etc.
     match = re.match(r"([<>=]+)\s*([\d\.-]+)", expected_str.strip())
     if not match:
         return False, f"Could not parse expected: {expected_str}"
@@ -331,7 +267,6 @@ def evaluate_check(actual_value: Any, expected_str: str, check_type: str) -> Tup
     except:
         return False, f"Could not convert to number: actual={actual_value}, expected={expected_value}"
 
-    # Evaluate
     if operator == ">":
         passed = actual_value > expected_value
     elif operator == "<":
@@ -356,11 +291,8 @@ def evaluate_check(actual_value: Any, expected_str: str, check_type: str) -> Tup
 def run_soda_checks_from_yaml(db_file: str, yaml_path: str, table_name: str) -> Dict[str, Any]:
     """
     End-to-end: load YAML → parse checks → execute → return results.
-
-    This is the main function called from app.py Tab 4.
     """
 
-    # Load and parse
     yaml_content = load_soda_yaml(yaml_path)
     checks = parse_soda_checks(yaml_content, table_name)
 
@@ -374,7 +306,6 @@ def run_soda_checks_from_yaml(db_file: str, yaml_path: str, table_name: str) -> 
             "checks": []
         }
 
-    # Execute
     results = execute_checks(db_file, table_name, checks)
 
     return results

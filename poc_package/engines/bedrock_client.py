@@ -3,6 +3,9 @@ import json
 import time
 import re
 
+from logger_config import get_logger
+logger = get_logger(__name__)
+
 MODEL_HAIKU = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 REGION      = "us-east-1"
 
@@ -26,50 +29,18 @@ def get_token_stats() -> dict:
     return _token_stats.copy()
 
 
-def print_token_usage(input_tokens: int = 0, output_tokens: int = 0, total: int = 0):
-    _token_stats["input_tokens"] += input_tokens
+def print_token_usage(input_tokens=0, output_tokens=0, total=0):
+    _token_stats["input_tokens"]  += input_tokens     # ← increment FIRST
     _token_stats["output_tokens"] += output_tokens
-    _token_stats["total_tokens"] += total
-    _token_stats["requests"] += 1
+    _token_stats["total_tokens"]  += total
+    _token_stats["requests"]      += 1
 
-    CONTEXT_WINDOW = 100000
+    ... # existing box-drawing print() calls ...
 
-    used_pct = (_token_stats["total_tokens"] / CONTEXT_WINDOW) * 100
-    remaining = CONTEXT_WINDOW - _token_stats["total_tokens"]
-
-    bar_width = 30
-    filled = int((used_pct / 100) * bar_width)
-    bar = "█" * filled + "░" * (bar_width - filled)
-
-    if used_pct < 50:
-        status = "✅ GOOD"
-        color_code = "\033[92m"
-    elif used_pct < 80:
-        status = "⚠️  CAUTION"
-        color_code = "\033[93m"
-    else:
-        status = "🔴 CRITICAL"
-        color_code = "\033[91m"
-
-    reset_code = "\033[0m"
-
-    print(f"\n{color_code}{'═' * 70}{reset_code}")
-    print(f"{color_code}  TOKEN USAGE REPORT{reset_code}")
-    print(f"{color_code}{'═' * 70}{reset_code}")
-    print(f"\n  This Request:")
-    print(f"    Input:   {input_tokens:>7,} tokens")
-    print(f"    Output:  {output_tokens:>7,} tokens")
-    print(f"    Total:   {total:>7,} tokens")
-    print(f"\n  Session Total (Requests: {_token_stats['requests']}):")
-    print(f"    Input:   {_token_stats['input_tokens']:>7,} tokens")
-    print(f"    Output:  {_token_stats['output_tokens']:>7,} tokens")
-    print(f"    Total:   {_token_stats['total_tokens']:>7,} tokens  ({used_pct:.1f}%)")
-    print(f"\n  Capacity:")
-    print(f"    {status}")
-    print(f"    [{bar}]")
-    print(f"    Used: {_token_stats['total_tokens']:,} / {CONTEXT_WINDOW:,}")
-    print(f"    Remaining: {remaining:,} tokens")
-    print(f"\n{color_code}{'═' * 70}{reset_code}\n")
+    logger.info(                                       # ← THEN log, after increment
+        f"bedrock call | input_tokens={input_tokens} output_tokens={output_tokens} "
+        f"total={total} session_total={_token_stats['total_tokens']} requests={_token_stats['requests']}"
+    )
 
 
 def ask(prompt: str,
@@ -105,15 +76,16 @@ def ask(prompt: str,
             if verbose:
                 print_token_usage(input_tokens, output_tokens, total_tokens)
 
-            return result["content"][0]["text"]
+            return result["content"][0]["text"] 
 
         except Exception as e:
             err = str(e)
             if "ThrottlingException" in err and attempt < retries - 1:
                 wait = 2 ** (attempt + 1)
-                print(f"  [throttled] waiting {wait}s before retry {attempt+2}/{retries}...")
+                logger.warning(f"Bedrock throttled, waiting {wait}s before retry {attempt+2}/{retries}")
                 time.sleep(wait)
             else:
+                logger.error(f"Bedrock call failed: {err}", exc_info=True)
                 raise
 
 
@@ -144,8 +116,7 @@ def ask_json(prompt: str,
     try:
         return json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"\n  [DEBUG] JSON parse failed: {e}")
-        print(f"  [DEBUG] Raw response (first 500 chars):\n{raw[:500]}")
+        logger.error(f"JSON parse failed: {e} | raw (first 500 chars): {raw[:500]}")
         raise
 
 
