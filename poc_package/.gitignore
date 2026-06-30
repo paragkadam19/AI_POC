@@ -9,3 +9,5 @@ uploads/
 contracts/
 *.egg-info/
 .pytest_cache/
+*.log
+storage/
