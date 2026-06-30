@@ -1,5 +1,5 @@
 """
-app.py — Flask backend for Manufacturing Data Quality POC Console
+app.py — Flask backend for Data Quality POC Console
 =================================================================
 Flow: Upload CSV → DuckDB ingest → Schema Discovery → SODA YAML →
       Data Quality → Schema Validation → Schema Changes
@@ -22,6 +22,7 @@ ENGINES_DIR   = os.path.join(BASE_DIR, "engines")
 OUTPUTS_DIR   = os.path.join(STORAGE_DIR, "outputs")
 UPLOADS_DIR   = os.path.join(STORAGE_DIR, "uploads")
 CONTRACTS_DIR = os.path.join(STORAGE_DIR, "contracts")
+os.environ["STORAGE_DIR"] = STORAGE_DIR
 for d in (STORAGE_DIR, OUTPUTS_DIR, UPLOADS_DIR, CONTRACTS_DIR):
     os.makedirs(d, exist_ok=True)
 
@@ -205,8 +206,8 @@ def upload():
         logger.info(f"DuckDB ingest completed in {time.time()-t1:.2f}s | table={table}")
 
         if not ingest_result.get("success"):
-            logger.error(f"DuckDB ingest reported failure for table={table}: {ingest_result.get('error')}")
-            return jsonify({"error": ingest_result.get("error", "DuckDB ingest failed")}), 500
+            logger.error(f"DB ingest reported failure for table={table}: {ingest_result.get('error')}")
+            return jsonify({"error": ingest_result.get("error", "DB ingest failed")}), 500
 
         sample, columns, row_count = get_preview(
             DB_FILE, table, n=8, row_count=ingest_result["row_count"]
@@ -221,7 +222,7 @@ def upload():
         })
     except Exception as e:
         logger.error(f"Upload/ingest failed for dataset={dataset_id}: {e}", exc_info=True)
-        return jsonify({"error": f"DuckDB error: {str(e)}"}), 500
+        return jsonify({"error": f"DB error: {str(e)}"}), 500
 
 
 # ── Tab 2: Schema Discovery (POC 1) ───────────────────────────────────────────
@@ -293,7 +294,7 @@ def run_poc7():
         )
         return jsonify({"yaml": yaml_output, "check_count": check_count, "dataset_id": ds})
     except Exception as e:
-        logger.error(f"SODA YAML generation (poc7) failed for dataset={ds}: {e}", exc_info=True)
+        logger.error(f"DQ YAML generation (poc7) failed for dataset={ds}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
