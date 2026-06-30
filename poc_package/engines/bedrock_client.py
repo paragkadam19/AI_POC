@@ -60,13 +60,18 @@ def ask(prompt: str,
 
     for attempt in range(retries):
         try:
+            t0 = time.time()
             resp = get_client().invoke_model(
                 modelId     = model,
                 body        = json.dumps(body),
                 contentType = "application/json",
                 accept      = "application/json",
             )
+            logger.info(f"[bedrock] invoke_model network+generation time: {time.time()-t0:.3f}s")
+
+            t0 = time.time()
             result = json.loads(resp["body"].read())
+            logger.info(f"[bedrock] response body read+json.loads: {time.time()-t0:.3f}s")
 
             usage = result.get("usage", {})
             input_tokens = usage.get("input_tokens", 0)
@@ -76,7 +81,7 @@ def ask(prompt: str,
             if verbose:
                 print_token_usage(input_tokens, output_tokens, total_tokens)
 
-            return result["content"][0]["text"] 
+            return result["content"][0]["text"]
 
         except Exception as e:
             err = str(e)
@@ -97,8 +102,11 @@ def ask_json(prompt: str,
     full_system = (system + "\n\n" if system else "") + \
                   "CRITICAL: Return ONLY valid JSON. No markdown fences, no explanation, no preamble. Use double quotes only, never apostrophes inside strings."
 
+    t0 = time.time()
     raw = ask(prompt, system=full_system, model=model, max_tokens=max_tokens, verbose=verbose)
+    logger.info(f"[ask_json] ask() total (network+generation+read): {time.time()-t0:.3f}s")
 
+    t0 = time.time()
     raw = raw.strip()
     raw = re.sub(r'^```(?:json)?\s*', '', raw)
     raw = re.sub(r'\s*```\s*$', '', raw)
@@ -114,7 +122,9 @@ def ask_json(prompt: str,
         raw = raw[start:end]
 
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        logger.info(f"[ask_json] cleanup + json.loads parse: {time.time()-t0:.3f}s")
+        return parsed
     except json.JSONDecodeError as e:
         logger.error(f"JSON parse failed: {e} | raw (first 500 chars): {raw[:500]}")
         raise

@@ -39,8 +39,10 @@ from bedrock_client import ask_json, ask
 from duckdb_helper import ingest_csv, get_preview, get_full_metadata_for_ai, get_sample_csv
 from prompt_builder import build_schema_discovery_prompt
 from soda_executor import run_soda_checks_from_yaml
-
-SAMPLE_ROWS_SCHEMA = 30
+from duckdb_helper import (
+    ingest_csv, get_preview, get_full_metadata_for_ai, get_sample_csv,
+    SAMPLE_ROWS_SCHEMA,
+)
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
@@ -233,31 +235,55 @@ def run_poc1():
     if not ds or not csv_path:
         return jsonify({"error": "Upload a CSV first"}), 400
     try:
+        t_start = time.time()
+
+        # ── Step 1: get file size ────────────────────────────────────────────
+        t0 = time.time()
         file_size_bytes = os.path.getsize(csv_path)
         tbl             = table_name(ds)
-        metadata        = get_full_metadata_for_ai(DB_FILE, tbl, STATE["filename"], file_size_bytes, SAMPLE_ROWS_SCHEMA)
+        logger.info(f"[poc1] STEP 1 - getsize: {time.time()-t0:.3f}s")
 
+        # ── Step 2: fetch metadata from DuckDB (SUMMARIZE + histogram + sample) ─
+        t0 = time.time()
+        metadata = get_full_metadata_for_ai(DB_FILE, tbl, STATE["filename"], file_size_bytes, SAMPLE_ROWS_SCHEMA)
+        logger.info(f"[poc1] STEP 2 - get_full_metadata_for_ai (DuckDB): {time.time()-t0:.3f}s")
+
+        # ── Step 3: build the prompt strings ─────────────────────────────────
+        t0 = time.time()
         system_prompt, user_prompt = build_schema_discovery_prompt(metadata)
-        print(f"BEDROCK CALL from: {__name__}")
-        import traceback; traceback.print_stack(limit=5)
+        prompt_len_chars = len(system_prompt) + len(user_prompt)
+        logger.info(f"[poc1] STEP 3 - build_schema_discovery_prompt: {time.time()-t0:.3f}s | prompt_chars={prompt_len_chars}")
+        logger.info(f"[poc1] USER PROMPT:\n{user_prompt}")  
+        # ── Step 4: the actual Bedrock call (network + model generation) ────
+        t0 = time.time()
         result = ask_json(user_prompt, system_prompt)
+        logger.info(f"[poc1] STEP 4 - ask_json (Bedrock call, incl. JSON parse): {time.time()-t0:.3f}s")
 
+        # ── Step 5: save result to disk ───────────────────────────────────────
+        t0 = time.time()
         versioned_name = save_versioned(ds, "poc1", result)
+        logger.info(f"[poc1] STEP 5 - save_versioned: {time.time()-t0:.3f}s")
 
+        # ── Step 6: contract creation (first run only) ───────────────────────
+        t0 = time.time()
         cpath           = contract_path(ds)
         is_new_contract = not os.path.exists(cpath)
         if is_new_contract:
             contract = {col["column"]: col["data_type"] for col in result.get("schema", [])}
             with open(cpath, "w") as f:
                 json.dump(contract, f, indent=2)
+        logger.info(f"[poc1] STEP 6 - contract write: {time.time()-t0:.3f}s | new_contract={is_new_contract}")
 
         result["_dataset_id"]       = ds
         result["_version_file"]     = versioned_name
         result["_contract_created"] = is_new_contract
+
+        logger.info(f"[poc1] TOTAL route time: {time.time()-t_start:.3f}s")
         return jsonify(result)
     except Exception as e:
         logger.error(f"Schema discovery (poc1) failed for dataset={ds}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
+    
 
 @app.route("/api/poc1/versions")
 def poc1_versions():

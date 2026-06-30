@@ -31,9 +31,8 @@ DUCKDB_CONFIG = {
 }
 
 SAMPLE_ROWS_SCHEMA = 30
-SAMPLE_ROWS_DQ     = 200
 
-LOW_CARDINALITY_THRESHOLD = 100
+LOW_CARDINALITY_THRESHOLD = 20
 
 
 def _connect(db_file: str, read_only: bool = False):
@@ -66,7 +65,7 @@ def ingest_csv(csv_file: str, db_file: str, table: str, original_filename: str =
                 DATE '{today}'  AS created_date,
                 true            AS is_active,
                 '{file_name}'   AS file_name
-            FROM read_csv_auto('{csv_file}', sample_size=10000)
+            FROM read_csv_auto('{csv_file}', sample_size=10000, nullstr='')
         """)
 
         row_count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]

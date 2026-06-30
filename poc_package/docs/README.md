@@ -204,7 +204,7 @@ CSV Upload (any size)
         ▼  f.save() — stream to disk, no RAM
    uploads/<dataset_id>/<timestamp>.csv
         │
-        ▼  DuckDB read_csv_auto (sample_size=200000)
+        ▼  DuckDB read_csv_auto (sample_size=10000)
    ai_poc_dq.duckdb  →  tbl_<dataset_id>
         │
         ├──► DuckDB SUMMARIZE  ──► POC 1 (full-dataset stats)
