@@ -116,6 +116,7 @@ EVERY check must have: name: DQ-### Description
 
 Identify situations where the value of one column determines whether another
 column should or should not contain data.
+column names must be exactly same as given in input, below examples are only for reference.
 
 Examples of controlling relationships
 
@@ -201,6 +202,7 @@ No markdown.
 No explanations.
 No comments.
 No prose.
+Use exact column names when writing SQL
 
 Start directly with: checks for {table}:
 """

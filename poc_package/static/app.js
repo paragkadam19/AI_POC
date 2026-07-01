@@ -82,11 +82,11 @@ function renderUpload(data) {
   if (d && d.success) {
     $("duckdbBanner").innerHTML = `
       <div class="banner ok">
-        ✓ Ingested into DuckDB — table <code>${d.table}</code> · ${d.row_count} rows · ${d.columns.length} columns
+        ✓ Ingested into DB — table <code>${d.table}</code> · ${d.row_count} rows · ${d.columns.length} columns
       </div>`;
   } else {
     $("duckdbBanner").innerHTML = `
-      <div class="banner error">✗ DuckDB ingestion failed${d && d.error ? ": " + d.error : ""}</div>`;
+      <div class="banner error">✗ DB ingestion failed${d && d.error ? ": " + d.error : ""}</div>`;
   }
 
   const cols = data.columns;
@@ -210,7 +210,7 @@ function renderSoda(d) {
     .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 
   let html = `
-    <div class="banner ok">✓ SODA YAML Generated · ${d.check_count} checks</div>
+    <div class="banner ok">✓ DQ YAML Generated · ${d.check_count} checks</div>
     <div class="summary-strip">
       <div class="kpi teal"><div class="v">${d.check_count}</div><div class="l">checks generated</div></div>
     </div>
