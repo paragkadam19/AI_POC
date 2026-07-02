@@ -56,8 +56,13 @@ def ask(prompt: str,
         "messages": [{"role": "user", "content": prompt}],
     }
     if system:
-        body["system"] = system
-
+        body["system"] = [
+            {
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
     for attempt in range(retries):
         try:
             t0 = time.time()

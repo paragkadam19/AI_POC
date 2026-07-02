@@ -306,6 +306,7 @@ def run_poc7():
         prompt = poc7.PROMPT.replace("{table}", table_name(ds)).replace(
             "{schema_profile}", schema_json
         )
+        logger.info(f"SODA YAML Prompt (first 500 chars):\n{prompt[:500]}")
         yaml_output = ask(prompt, poc7.SYSTEM).strip()
         if yaml_output.startswith("```"):
             yaml_output = "\n".join(yaml_output.split("\n")[1:])

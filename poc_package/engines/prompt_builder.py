@@ -128,6 +128,22 @@ STEP 6 — RECOMMEND INDEXES
   - "Join condition with other tables"
   - "Sorts and aggregations on this column"
   - "Low-cardinality status field — improves filter selectivity"
+  
+STEP 7 - Conditional / Dependency Checks (Column-Controlled Mandatory Fields) 
+  Identify situations where the value of one column determines whether another column should or should not contain data. 
+  Examples of controlling relationships Application_Status 
+  - Loan_Account_Number Payment_Status 
+  - Payment_Date Order_Status 
+  - Delivery_Date Approval_Flag 
+  - Approved_By Is_Active 
+  - Deactivation_Date Employment_Status 
+  - Exit_Date Customer_Type 
+  -> GST_Number Loan_Status 
+  -> Disbursement_Date Product_Type 
+  -> Product_Code Country 
+  -> State Generate failed rows checks for these dependencies. 
+  Examples If Application_Status = 'Disbursed', Loan_Account_Number must not be NULL
+  Generate similar validations whenever one column logically controls another.
 
 Return JSON with schema profile:
 {

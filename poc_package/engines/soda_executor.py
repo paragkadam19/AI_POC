@@ -9,14 +9,13 @@ import duckdb
 import yaml
 from datetime import date, datetime
 from typing import List, Dict, Any, Tuple, Optional
+from logger_config import get_logger
+
+logger = get_logger(__name__)
 
 
-# ✅ JSON Serialization Helper
 def make_serializable(obj):
-    """
-    Convert non-JSON-serializable objects to strings.
-    Handles date/datetime objects and nested structures.
-    """
+    """Convert non-JSON-serializable objects to strings."""
     if isinstance(obj, (date, datetime)):
         return obj.isoformat()
     elif isinstance(obj, (list, tuple)):
@@ -67,7 +66,7 @@ def parse_soda_checks(yaml_content: Dict[str, Any], table_name: str) -> List[Dic
         if not check_str:
             continue
 
-        check_id = f"DQ-{check_id_counter:02d}"
+        check_id = f"DQ-{check_id_counter:03d}"
         check_name = check_str
         check_id_counter += 1
 
@@ -82,7 +81,7 @@ def parse_soda_checks(yaml_content: Dict[str, Any], table_name: str) -> List[Dic
         valid_values = extra.get("valid values") if isinstance(extra, dict) else None
 
         check_type, sql_query, expected = parse_check_string(
-            check_str, table_name, valid_values=valid_values
+            check_str, table_name, valid_values=valid_values, extra=extra
         )
 
         if check_type:
@@ -99,10 +98,12 @@ def parse_soda_checks(yaml_content: Dict[str, Any], table_name: str) -> List[Dic
 
 
 def parse_check_string(check_str: str, table_name: str,
-                        valid_values: Optional[List[str]] = None) -> Tuple[str, str, str]:
+                        valid_values: Optional[List[str]] = None,
+                        extra: Optional[Dict] = None) -> Tuple[str, str, str]:
     """Parse a single SODA check string into type, SQL query, and expected result."""
 
     check_str = check_str.strip()
+    extra = extra or {}
 
     # 1. row_count
     if check_str.startswith("row_count"):
@@ -182,6 +183,18 @@ def parse_check_string(check_str: str, table_name: str,
                 f"{operator} {value}"
             )
 
+    # 6. failed rows (NEW!)
+    if check_str == "failed rows":
+        fail_query = extra.get("fail query", "")
+        if fail_query:
+            # Clean up the query
+            fail_query = fail_query.strip()
+            return (
+                "failed_rows",
+                fail_query,
+                "= 0"
+            )
+
     return ("unknown", "", check_str)
 
 
@@ -205,22 +218,42 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
 
         try:
             result = conn.execute(sql_query).fetchall()
-            actual_value = result[0][0] if result else None
-
-            passed, error_msg = evaluate_check(actual_value, expected, check_type)
+            
+            if check_type == "failed_rows":
+                # For failed rows: count the returned rows
+                # If 0 rows → PASS (no violations)
+                # If > 0 rows → FAIL (violations found)
+                actual_value = len(result) if result else 0
+                passed = actual_value == 0
+                
+                if not passed:
+                    # Show the failing data
+                    error_msg = f"Found {actual_value} rows violating rule:\n"
+                    if result:
+                        # Show first 3 failing rows
+                        for i, row in enumerate(result[:3]):
+                            error_msg += f"  Row {i+1}: {row}\n"
+                        if len(result) > 3:
+                            error_msg += f"  ... and {len(result) - 3} more rows"
+                else:
+                    error_msg = None
+            else:
+                # For other checks: evaluate the result
+                actual_value = result[0][0] if result else None
+                passed, error_msg = evaluate_check(actual_value, expected, check_type)
 
             if passed:
                 passed_count += 1
             else:
                 failed_count += 1
 
-            # ✅ Make actual_value JSON-serializable
+            # Make actual_value JSON-serializable
             results.append({
                 "check_id": check_id,
                 "check_name": check_name,
                 "type": check_type,
                 "passed": passed,
-                "actual_value": make_serializable(actual_value),  # ← FIXED!
+                "actual_value": make_serializable(actual_value),
                 "expected": expected,
                 "error_message": error_msg
             })
@@ -239,7 +272,7 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
 
     conn.close()
 
-    # ✅ Ensure entire result is JSON-serializable
+    # Ensure entire result is JSON-serializable
     return make_serializable({
         "audit_passed": failed_count == 0,
         "total_checks": len(checks),

@@ -37,6 +37,9 @@ Use the FULL context:
 
 PROMPT = """RULE GENERATION PRIORITY
 
+DO NOT use: failed rows, fail query, alert, warn, valid_format, regex
+ONLY use: row_count, missing_count, duplicate_count, min(), max(), invalid_count
+
 1. TABLE LEVEL CHECKS
 Always include checks for <table_name>:
   - row_count > 0
@@ -116,18 +119,19 @@ EVERY check must have: name: DQ-### Description
 
 Identify situations where the value of one column determines whether another
 column should or should not contain data.
+column names must be exactly same as present in dataset or table, below examples are only for reference.
 
 Examples of controlling relationships
 
-Application_Status -> Loan_Account_Number
-Payment_Status     -> Payment_Date
-Order_Status       -> Delivery_Date
-Approval_Flag      -> Approved_By
-Is_Active          -> Deactivation_Date
-Employment_Status  -> Exit_Date
-Customer_Type      -> GST_Number
-Loan_Status        -> Disbursement_Date
-Product_Type       -> Product_Code
+Application Status -> Loan Account Number
+Payment Status     -> Payment Date
+Order Status       -> Delivery Date
+Approval Flag      -> Approved By
+Is Active          -> Deactivation Date
+Employment Status  -> Exit Date
+Customer Type      -> GST Number
+Loan Status        -> Disbursement Date
+Product Type       -> Product Code
 Country            -> State
 
 Generate failed rows checks for these dependencies.
@@ -137,15 +141,15 @@ the presence rule (value MUST exist) and the absence rule (value must NOT exist)
 
 Examples
 
-If Application_Status = 'Disbursed', Loan_Account_Number must not be NULL
+If Application Status = 'Disbursed', Loan Account Number must not be NULL
 
 - failed rows:
     name: DQ-020 Loan Account Number mandatory for Disbursed applications
     fail query: |
       SELECT *
       FROM dataset
-      WHERE Application_Status = 'Disbursed'
-      AND Loan_Account_Number IS NULL
+      WHERE {exact column name} = 'Disbursed'
+      AND {exact column name} IS NULL
 
 If Application_Status != 'Disbursed', Loan_Account_Number should be NULL
 
@@ -154,8 +158,8 @@ If Application_Status != 'Disbursed', Loan_Account_Number should be NULL
     fail query: |
       SELECT *
       FROM dataset
-      WHERE Application_Status <> 'Disbursed'
-      AND Loan_Account_Number IS NOT NULL
+      WHERE {exact column name} <> 'Disbursed'
+      AND {exact column name} IS NOT NULL
 
 Generate similar checks whenever one column logically controls another.
 
@@ -180,6 +184,12 @@ validation rules.
 Never invent business rules that are not supported by the provided inputs.
 Assign a descriptive name to every conditional check.
 
+SCHEMA DISCOVERY PROFILE
+
+Use this schema discovery result as the source of truth:
+
+{schema_profile}
+
 INFERENCE RULES
 
 - Use metadata before sample rows
@@ -201,6 +211,7 @@ No markdown.
 No explanations.
 No comments.
 No prose.
+Use exact column names when writing SQL
 
 Start directly with: checks for {table}:
 """
