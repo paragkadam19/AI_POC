@@ -217,7 +217,7 @@ function renderSoda(d) {
     <h3>Generated YAML <button class="btn sm" onclick="copyYaml()">Copy</button></h3>
     <div class="yaml-block" id="yamlBlock">${escaped}</div>
     <div class="actions">
-      <button class="btn primary" onclick="downloadYaml()">⬇ Download manufacturing_checks.yaml</button>
+      <button class="btn primary" onclick="downloadYaml()">⬇ Download DQ_checks.yaml</button>
     </div>`;
 
   el.innerHTML = html;
@@ -232,7 +232,7 @@ function downloadYaml() {
   const blob = new Blob([window._lastYaml || ""], { type: "text/yaml" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = "manufacturing_checks.yaml";
+  a.download = "DQ_checks.yaml";
   a.click();
 }
 
