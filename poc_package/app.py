@@ -36,7 +36,6 @@ import mfg_poc7_soda_yaml as poc7
 import mfg_poc3a_drift    as poc3a
 import mfg_poc3b_drift    as poc3b
 from bedrock_client import ask_json, ask
-from duckdb_helper import ingest_csv, get_preview, get_full_metadata_for_ai, get_sample_csv
 from prompt_builder import build_schema_discovery_prompt
 from soda_executor import run_soda_checks_from_yaml
 from duckdb_helper import (

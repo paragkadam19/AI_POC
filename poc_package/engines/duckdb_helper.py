@@ -98,7 +98,7 @@ def get_preview(db_file: str, table: str, n: int = 8, row_count: int = None) -> 
 # ── Full metadata via SUMMARIZE + single-pass value-count extraction ─────────
 def get_metadata(db_file: str, table: str) -> dict:
     """
-    SUMMARIZE: one query, full-dataset column stats, single pass.
+    SUMMARIZE: one query for null/range stats, plus exact distinct counts.
 
     For low-cardinality columns, value counts (e.g. {"Yes": 1200,
     "No": 340}) are fetched using DuckDB's histogram() aggregate in
@@ -108,18 +108,34 @@ def get_metadata(db_file: str, table: str) -> dict:
     conn = _connect(db_file, read_only=True)
 
     row_count  = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-    total_cols = len(conn.execute(f"DESCRIBE {table}").fetchall())
+    describe_rows = conn.execute(f"DESCRIBE {table}").fetchall()
+    total_cols = len(describe_rows)
+    col_names = [c[0] for c in describe_rows]
 
     cur          = conn.execute(f"SUMMARIZE {table}")
     summary_cols = [d[0] for d in cur.description]
     summary_rows = cur.fetchall()
 
+    exact_distinct_map = {}
+    if col_names:
+        distinct_select = ", ".join(
+            f'COUNT(DISTINCT "{c}") AS "{c}__distinct"' for c in col_names
+        )
+        try:
+            distinct_row = conn.execute(f"SELECT {distinct_select} FROM {table}").fetchone()
+            exact_distinct_map = {
+                c: int(distinct_row[i]) if distinct_row[i] is not None else 0
+                for i, c in enumerate(col_names)
+            }
+        except Exception as e:
+            print(f"  [warning] exact distinct count query failed: {e}")
+
     parsed     = []
     candidates = []
     for row in summary_rows:
         r            = dict(zip(summary_cols, row))
-        unique_count = r.get("approx_unique")
         col_name     = r["column_name"]
+        unique_count = exact_distinct_map.get(col_name, r.get("approx_unique"))
         parsed.append((r, unique_count, col_name))
         if unique_count and unique_count < LOW_CARDINALITY_THRESHOLD and unique_count < row_count:
             candidates.append(col_name)

@@ -154,15 +154,40 @@ def parse_check_string(check_str: str, table_name: str,
             cols_str, operator, value = match.groups()
             cols = [c.strip().strip('"\'') for c in cols_str.split(',')]
             cols_quoted = ', '.join([f'"{c}"' for c in cols])
+            null_filter = " AND ".join([f'"{c}" IS NOT NULL' for c in cols])
+            where_clause = f"WHERE {null_filter}" if null_filter else ""
             return (
                 "duplicate_count",
-                f"SELECT COUNT(*) - COUNT(DISTINCT ({cols_quoted})) FROM {table_name}",
+                f"SELECT COUNT(*) - COUNT(DISTINCT ({cols_quoted})) FROM {table_name} {where_clause}",
                 f"{operator} {value}"
             )
 
-    # 5. min/max (numeric range)
+    # 5. min_length / max_length
+    if "min_length" in check_str:
+        match = re.match(r"min_length\(([\w\-\"']+)\)\s*([<>=]+)\s*(\d+)", check_str)
+        if match:
+            col_name, operator, value = match.groups()
+            col_name = col_name.strip('"\'')
+            return (
+                "min_length",
+                f'SELECT MIN(LENGTH(CAST("{col_name}" AS VARCHAR))) FROM {table_name}',
+                f"{operator} {value}"
+            )
+
+    if "max_length" in check_str:
+        match = re.match(r"max_length\(([\w\-\"']+)\)\s*([<>=]+)\s*(\d+)", check_str)
+        if match:
+            col_name, operator, value = match.groups()
+            col_name = col_name.strip('"\'')
+            return (
+                "max_length",
+                f'SELECT MAX(LENGTH(CAST("{col_name}" AS VARCHAR))) FROM {table_name}',
+                f"{operator} {value}"
+            )
+
+    # 6. min/max (numeric or date range)
     if re.search(r"min\(", check_str):
-        match = re.match(r"min\(([\w\-\"']+)\)\s*([<>=]+)\s*([\d\.-]+)", check_str)
+        match = re.match(r"min\(([\w\-\"']+)\)\s*([<>=]+)\s*([\w\-\.: ]+)", check_str)
         if match:
             col_name, operator, value = match.groups()
             col_name = col_name.strip('"\'')
@@ -173,7 +198,7 @@ def parse_check_string(check_str: str, table_name: str,
             )
 
     if re.search(r"max\(", check_str):
-        match = re.match(r"max\(([\w\-\"']+)\)\s*([<>=]+)\s*([\d\.-]+)", check_str)
+        match = re.match(r"max\(([\w\-\"']+)\)\s*([<>=]+)\s*([\w\-\.: ]+)", check_str)
         if match:
             col_name, operator, value = match.groups()
             col_name = col_name.strip('"\'')
@@ -189,6 +214,26 @@ def parse_check_string(check_str: str, table_name: str,
         if fail_query:
             # Clean up the query
             fail_query = fail_query.strip()
+            # DuckDB does not support "NOT REGEXP"; translate common pattern syntax.
+            fail_query = re.sub(
+                r"\bREGEXP_LIKE\s*\(",
+                "regexp_matches(",
+                fail_query,
+                flags=re.IGNORECASE,
+            )
+            regex_match = re.search(
+                r"WHERE\s+(\w+)\s+NOT\s+REGEXP\s+'([^']+)'",
+                fail_query,
+                flags=re.IGNORECASE,
+            )
+            if regex_match:
+                col_name, pattern = regex_match.groups()
+                fail_query = re.sub(
+                    r"WHERE\s+\w+\s+NOT\s+REGEXP\s+'[^']+'",
+                    f"WHERE NOT regexp_matches({col_name}, '{pattern}')",
+                    fail_query,
+                    flags=re.IGNORECASE,
+                )
             return (
                 "failed_rows",
                 fail_query,
@@ -293,6 +338,29 @@ def evaluate_check(actual_value: Any, expected_str: str, check_type: str) -> Tup
         return False, f"Could not parse expected: {expected_str}"
 
     operator, expected_value = match.groups()
+
+    # Date-ish expected values are compared lexicographically after normalization.
+    if re.match(r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?$", str(expected_value)):
+        actual_str = actual_value.isoformat() if isinstance(actual_value, (date, datetime)) else str(actual_value)
+        expected_str_norm = str(expected_value)
+        if operator == ">":
+            passed = actual_str > expected_str_norm
+        elif operator == "<":
+            passed = actual_str < expected_str_norm
+        elif operator == ">=":
+            passed = actual_str >= expected_str_norm
+        elif operator == "<=":
+            passed = actual_str <= expected_str_norm
+        elif operator == "=":
+            passed = actual_str == expected_str_norm
+        elif operator == "!=":
+            passed = actual_str != expected_str_norm
+        else:
+            return False, f"Unknown operator: {operator}"
+
+        if not passed:
+            return False, f"Expected {expected_str}, but actual is {actual_str}"
+        return True, None
 
     try:
         expected_value = float(expected_value) if '.' in expected_value else int(expected_value)

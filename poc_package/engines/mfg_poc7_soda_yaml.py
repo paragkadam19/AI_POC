@@ -37,8 +37,8 @@ Use the FULL context:
 
 PROMPT = """RULE GENERATION PRIORITY
 
-DO NOT use: failed rows, fail query, alert, warn, valid_format, regex
-ONLY use: row_count, missing_count, duplicate_count, min(), max(), invalid_count
+DO NOT use: alert, warn, valid_format, regex, regexp_like, RLIKE, like-based pattern rules
+ONLY use: row_count, missing_count, duplicate_count, min(), max(), min_length(), max_length(), invalid_count, failed rows
 
 1. TABLE LEVEL CHECKS
 Always include checks for <table_name>:
@@ -65,8 +65,9 @@ Never invent unrealistic ranges.
 
 5. DATE CHECKS
 Infer date formats. Examples:
-  - valid_format(Order_Date,'yyyy-MM-dd')
   - invalid_count(Order_Date)=0
+  - min(Order_Date) >= 2024-01-01
+  - max(Order_Date) <= 2026-12-31
 
 6. STRING LENGTH CHECKS
 Infer expected lengths. Examples:
@@ -76,7 +77,9 @@ Use observed values.
 
 7. PATTERN CHECKS
 Detect IDs, Emails, Phone Numbers, ZIP codes.
-Use regex or invalid_count checks.
+Use invalid_count checks for known allowed-value lists.
+Avoid regex-based checks entirely.
+If a pattern is absolutely necessary, prefer a simple failed rows check only when it can be expressed with DuckDB-safe operators like `LIKE`, `SUBSTR`, `LEFT`, `RIGHT`, `LENGTH`, `regexp_matches`, or direct comparisons.
 
 8. LOW CARDINALITY CHECKS
 If low-cardinality values provided, generate:
