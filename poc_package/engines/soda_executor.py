@@ -29,7 +29,10 @@ def make_serializable(obj):
 def load_soda_yaml(yaml_path: str) -> Dict[str, Any]:
     """Parse SODA YAML file and return as dict."""
     with open(yaml_path, 'r') as f:
-        return yaml.safe_load(f)
+        try:
+            return yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            raise ValueError(f"Invalid YAML in {yaml_path}: {e}") from e
 
 
 def parse_soda_checks(yaml_content: Dict[str, Any], table_name: str) -> List[Dict[str, Any]]:
@@ -107,9 +110,11 @@ def parse_check_string(check_str: str, table_name: str,
 
     # 1. row_count
     if check_str.startswith("row_count"):
-        match = re.match(r"row_count\s*([<>=]+)\s*(\d+)", check_str)
+        match = re.match(r"row_count\s*([<>=!]+)\s*(\d+)", check_str)
         if match:
             operator, value = match.groups()
+            if operator == "==":
+                operator = "="
             return (
                 "row_count",
                 f"SELECT COUNT(*) FROM {table_name}",
@@ -118,10 +123,12 @@ def parse_check_string(check_str: str, table_name: str,
 
     # 2. missing_count (nulls)
     if "missing_count" in check_str:
-        match = re.match(r"missing_count\(([\w\-\"']+)\)\s*([<>=]+)\s*(\d+)", check_str)
+        match = re.match(r"missing_count\(([\w\-\"']+)\)\s*([<>=!]+)\s*(\d+)", check_str)
         if match:
             col_name, operator, value = match.groups()
             col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
             return (
                 "null_check",
                 f'SELECT COUNT(*) FROM {table_name} WHERE "{col_name}" IS NULL',
@@ -130,10 +137,12 @@ def parse_check_string(check_str: str, table_name: str,
 
     # 3. invalid_count (enum/categorical)
     if "invalid_count" in check_str:
-        match = re.match(r"invalid_count\(([\w\-\"']+)\)\s*([<>=]+)\s*(\d+)", check_str)
+        match = re.match(r"invalid_count\(([\w\-\"']+)\)\s*([<>=!]+)\s*(\d+)", check_str)
         if match:
             col_name, operator, value = match.groups()
             col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
 
             if valid_values:
                 escaped = [str(v).replace("'", "''") for v in valid_values]
@@ -149,13 +158,15 @@ def parse_check_string(check_str: str, table_name: str,
 
     # 4. duplicate_count
     if "duplicate_count" in check_str:
-        match = re.match(r"duplicate_count\(([\w\-\"',\s]+)\)\s*([<>=]+)\s*(\d+)", check_str)
+        match = re.match(r"duplicate_count\(([\w\-\"',\s]+)\)\s*([<>=!]+)\s*(\d+)", check_str)
         if match:
             cols_str, operator, value = match.groups()
             cols = [c.strip().strip('"\'') for c in cols_str.split(',')]
             cols_quoted = ', '.join([f'"{c}"' for c in cols])
             null_filter = " AND ".join([f'"{c}" IS NOT NULL' for c in cols])
             where_clause = f"WHERE {null_filter}" if null_filter else ""
+            if operator == "==":
+                operator = "="
             return (
                 "duplicate_count",
                 f"SELECT COUNT(*) - COUNT(DISTINCT ({cols_quoted})) FROM {table_name} {where_clause}",
@@ -164,10 +175,12 @@ def parse_check_string(check_str: str, table_name: str,
 
     # 5. min_length / max_length
     if "min_length" in check_str:
-        match = re.match(r"min_length\(([\w\-\"']+)\)\s*([<>=]+)\s*(\d+)", check_str)
+        match = re.match(r"min_length\(([\w\-\"']+)\)\s*([<>=!]+)\s*(\d+)", check_str)
         if match:
             col_name, operator, value = match.groups()
             col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
             return (
                 "min_length",
                 f'SELECT MIN(LENGTH(CAST("{col_name}" AS VARCHAR))) FROM {table_name}',
@@ -175,10 +188,12 @@ def parse_check_string(check_str: str, table_name: str,
             )
 
     if "max_length" in check_str:
-        match = re.match(r"max_length\(([\w\-\"']+)\)\s*([<>=]+)\s*(\d+)", check_str)
+        match = re.match(r"max_length\(([\w\-\"']+)\)\s*([<>=!]+)\s*(\d+)", check_str)
         if match:
             col_name, operator, value = match.groups()
             col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
             return (
                 "max_length",
                 f'SELECT MAX(LENGTH(CAST("{col_name}" AS VARCHAR))) FROM {table_name}',
@@ -187,10 +202,12 @@ def parse_check_string(check_str: str, table_name: str,
 
     # 6. min/max (numeric or date range)
     if re.search(r"min\(", check_str):
-        match = re.match(r"min\(([\w\-\"']+)\)\s*([<>=]+)\s*([\w\-\.: ]+)", check_str)
+        match = re.match(r"min\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.: ]+)", check_str)
         if match:
             col_name, operator, value = match.groups()
             col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
             return (
                 "min_check",
                 f'SELECT MIN("{col_name}") FROM {table_name}',
@@ -198,10 +215,12 @@ def parse_check_string(check_str: str, table_name: str,
             )
 
     if re.search(r"max\(", check_str):
-        match = re.match(r"max\(([\w\-\"']+)\)\s*([<>=]+)\s*([\w\-\.: ]+)", check_str)
+        match = re.match(r"max\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.: ]+)", check_str)
         if match:
             col_name, operator, value = match.groups()
             col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
             return (
                 "max_check",
                 f'SELECT MAX("{col_name}") FROM {table_name}',
@@ -214,6 +233,18 @@ def parse_check_string(check_str: str, table_name: str,
         if fail_query:
             # Clean up the query
             fail_query = fail_query.strip()
+            fail_query = re.sub(
+                r"\bFROM\s+dataset\b",
+                f"FROM {table_name}",
+                fail_query,
+                flags=re.IGNORECASE,
+            )
+            fail_query = re.sub(
+                r"\bFROM\s+dataset\b",
+                f"FROM {table_name}",
+                fail_query,
+                flags=re.IGNORECASE,
+            )
             # DuckDB does not support "NOT REGEXP"; translate common pattern syntax.
             fail_query = re.sub(
                 r"\bREGEXP_LIKE\s*\(",
@@ -393,7 +424,6 @@ def run_soda_checks_from_yaml(db_file: str, yaml_path: str, table_name: str) -> 
     """
     End-to-end: load YAML → parse checks → execute → return results.
     """
-
     yaml_content = load_soda_yaml(yaml_path)
     checks = parse_soda_checks(yaml_content, table_name)
 
