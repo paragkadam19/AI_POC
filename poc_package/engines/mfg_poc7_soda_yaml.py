@@ -125,6 +125,8 @@ All `name` values must be safe YAML plain scalars or quoted strings.
 Do not include unquoted colons (`:`), line breaks, or YAML-like key/value
 text inside names. If a description needs a colon or extra explanation,
 put it in a quoted string or move it into the SQL fail query comment-free.
+If any `name`, `summary`, or other text contains a colon, quote the entire
+string so the YAML stays valid.
 
 16. Conditional / Dependency Checks (Column-Controlled Mandatory Fields)
 
