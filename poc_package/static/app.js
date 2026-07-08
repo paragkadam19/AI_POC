@@ -142,12 +142,12 @@ function renderSchema(d) {
         </div>`;
 
     html += `
-        <h3>Schema Columns <span style="font-size:12px;font-weight:400;color:#94A3B8">(edit type, meaning or rule inline, then Approve)</span></h3>
+        <h3>Schema Columns <span style="font-size:12px;font-weight:400;color:#94A3B8">(edit type, description or rule inline, then Approve)</span></h3>
         <div class="table-wrap"><table>
             <thead><tr>
-                <th>Column</th><th>Type</th><th>Business Meaning</th>
+                <th>Column</th><th>Type</th><th>Column Description</th>
                 <th>Validation Rule</th><th>Nulls</th>
-                <th>Sample Values</th><th>Distribution</th>
+                <th>Sample Values</th>
             </tr></thead><tbody>`;
 
     (d.schema || []).forEach((col, i) => {
@@ -155,11 +155,20 @@ function renderSchema(d) {
             ? `<span class="badge ${col.null_count > 10 ? 'high' : 'medium'}">${col.null_count} (${col.null_pct}%)</span>`
             : `<span class="badge none">0</span>`;
 
-        const sampleVals = (col.sample_values || [])
+        const columnDescription = (col.business_meaning || col.description || col.column_description || col.businessDescription || "").trim();
+
+        const sampleVals = (col.sample_values || col.categorical_values || [])
             .filter(v => v !== null && v !== undefined)
-            .slice(0, 3)
+            .slice(0, 5)
             .map(v => `<code style="font-size:11px">${v}</code>`)
             .join(" ");
+
+        const sampleFallback = col.value_distribution && Object.keys(col.value_distribution).length > 0
+            ? Object.entries(col.value_distribution)
+                .slice(0, 5)
+                .map(([k, v]) => `<code style="font-size:11px">${k}</code> <span style="color:#64748B">(${v})</span>`)
+                .join("<br>")
+            : '<span style="color:#94A3B8;font-size:11px">No sample values available</span>';
 
         const distribution = col.value_distribution && Object.keys(col.value_distribution).length > 0
             ? Object.entries(col.value_distribution)
@@ -172,11 +181,13 @@ function renderSchema(d) {
         html += `<tr>
             <td>
                 <strong>${col.column}</strong>
-                <br><span style="font-size:11px;color:#94A3B8">${col.nullable ? "nullable" : "required"} · ${col.unique_count} distinct</span>
+                <br><span style="font-size:11px;color:#475569;display:block;max-width:220px;line-height:1.35;margin-top:4px">
+                    ${columnDescription || '<span style="color:#94A3B8">No description</span>'}
+                </span>
             </td>
             <td>
                 <select id="type_${i}" onchange="updatePendingSchema(${i}, 'data_type', this.value)"
-                    style="font-size:12px;border:1px solid #E2E8F0;border-radius:4px;padding:3px">
+                    style="width:100%;font:inherit;font-size:12px;line-height:1.4;border:1px solid #E2E8F0;border-radius:4px;padding:8px 10px;min-width:120px;background:#fff">
                     ${["VARCHAR","BIGINT","INTEGER","DOUBLE","DATE","BOOLEAN","FLOAT","TIMESTAMP"]
                         .map(t => `<option ${col.data_type === t ? 'selected' : ''}>${t}</option>`)
                         .join('')}
@@ -184,19 +195,19 @@ function renderSchema(d) {
             </td>
             <td>
                 <input type="text" id="meaning_${i}"
-                    value="${(col.business_meaning || '').replace(/"/g, '&quot;')}"
-                    style="width:100%;font-size:12px;border:1px solid #E2E8F0;border-radius:4px;padding:4px"
+                    value="${columnDescription.replace(/"/g, '&quot;')}"
+                    placeholder="Add column description"
+                    style="width:100%;font-size:13px;border:1px solid #E2E8F0;border-radius:4px;padding:8px 10px;min-width:240px"
                     onchange="updatePendingSchema(${i}, 'business_meaning', this.value)"/>
             </td>
             <td>
                 <input type="text" id="rule_${i}"
                     value="${(col.validation_rule || '').replace(/"/g, '&quot;')}"
-                    style="width:100%;font-size:12px;border:1px solid #E2E8F0;border-radius:4px;padding:4px"
+                    style="width:100%;font-size:13px;border:1px solid #E2E8F0;border-radius:4px;padding:8px 10px;min-width:220px"
                     onchange="updatePendingSchema(${i}, 'validation_rule', this.value)"/>
             </td>
             <td>${nullBadge}</td>
-            <td>${sampleVals || '<span style="color:#94A3B8">—</span>'}</td>
-            <td>${distribution}</td>
+            <td>${sampleVals || sampleFallback}</td>
         </tr>`;
     });
 
@@ -389,7 +400,7 @@ function renderSoda(d) {
       <button class="btn sm" onclick="resetYaml()" style="margin-left:4px;color:#94A3B8">Reset to AI version</button>
     </h3>
     <textarea id="yamlEditor"
-      style="width:100%;min-height:400px;font-family:'SF Mono',Consolas,monospace;font-size:12px;
+      style="width:100%;min-height:560px;font-family:'SF Mono',Consolas,monospace;font-size:13px;
              background:#1C2B3A;color:#A8D8A8;padding:18px;border-radius:8px;border:none;
              resize:vertical;line-height:1.6;margin-top:10px;outline:none;"
       spellcheck="false">${escapeHtml(d.yaml)}</textarea>
