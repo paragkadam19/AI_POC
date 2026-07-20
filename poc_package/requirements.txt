@@ -9,3 +9,5 @@ flask-cors>=4.0.0
 polars>=0.19.0
 duckdb>=0.8.0
 pyyaml>=6.0
+langfuse>=3.0.0
+python-dotenv>=1.0.0

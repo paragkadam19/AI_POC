@@ -245,26 +245,7 @@ def parse_check_string(check_str: str, table_name: str,
                 fail_query,
                 flags=re.IGNORECASE,
             )
-            # DuckDB does not support "NOT REGEXP"; translate common pattern syntax.
-            fail_query = re.sub(
-                r"\bREGEXP_LIKE\s*\(",
-                "regexp_matches(",
-                fail_query,
-                flags=re.IGNORECASE,
-            )
-            regex_match = re.search(
-                r"WHERE\s+(\w+)\s+NOT\s+REGEXP\s+'([^']+)'",
-                fail_query,
-                flags=re.IGNORECASE,
-            )
-            if regex_match:
-                col_name, pattern = regex_match.groups()
-                fail_query = re.sub(
-                    r"WHERE\s+\w+\s+NOT\s+REGEXP\s+'[^']+'",
-                    f"WHERE NOT regexp_matches({col_name}, '{pattern}')",
-                    fail_query,
-                    flags=re.IGNORECASE,
-                )
+            fail_query = _normalize_duckdb_regex(fail_query)
             return (
                 "failed_rows",
                 fail_query,
@@ -272,6 +253,51 @@ def parse_check_string(check_str: str, table_name: str,
             )
 
     return ("unknown", "", check_str)
+
+
+def _normalize_duckdb_regex(sql: str) -> str:
+    """
+    Rewrite Soda-style REGEXP operators into DuckDB-compatible regexp_matches()
+    calls so failed-rows queries can actually execute.
+    """
+    sql = re.sub(r"\bREGEXP_LIKE\s*\(", "regexp_matches(", sql, flags=re.IGNORECASE)
+
+    # Rewrite the most common Soda pattern:
+    #   WHERE col NOT REGEXP '...'
+    # into DuckDB:
+    #   WHERE NOT regexp_matches(col, '...')
+    sql = re.sub(
+        r"\bWHERE\s+([^\n;]+?)\s+NOT\s+REGEXP\s+'([^']+)'",
+        lambda m: f"WHERE NOT regexp_matches({m.group(1).strip()}, '{m.group(2)}')",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    # Rewrite clauses inside AND/OR blocks:
+    #   AND col NOT REGEXP '...'
+    sql = re.sub(
+        r"\bAND\s+([^\n;]+?)\s+NOT\s+REGEXP\s+'([^']+)'",
+        lambda m: f"AND NOT regexp_matches({m.group(1).strip()}, '{m.group(2)}')",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    # Positive regex form, if it appears:
+    #   WHERE col REGEXP '...'
+    sql = re.sub(
+        r"\bWHERE\s+([^\n;]+?)\s+REGEXP\s+'([^']+)'",
+        lambda m: f"WHERE regexp_matches({m.group(1).strip()}, '{m.group(2)}')",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    sql = re.sub(
+        r"\bAND\s+([^\n;]+?)\s+REGEXP\s+'([^']+)'",
+        lambda m: f"AND regexp_matches({m.group(1).strip()}, '{m.group(2)}')",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    return sql
 
 
 def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) -> Dict[str, Any]:

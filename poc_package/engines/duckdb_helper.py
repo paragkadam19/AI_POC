@@ -30,9 +30,9 @@ DUCKDB_CONFIG = {
     "preserve_insertion_order":  False,
 }
 
-SAMPLE_ROWS_SCHEMA = 30
+SAMPLE_ROWS_SCHEMA = 10
 
-LOW_CARDINALITY_THRESHOLD = 20
+LOW_CARDINALITY_THRESHOLD = 10
 
 
 def _connect(db_file: str, read_only: bool = False):

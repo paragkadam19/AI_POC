@@ -14,6 +14,11 @@ from datetime import datetime
 
 from logger_config import setup_logging, get_logger
 
+try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
+
 setup_logging()
 logger = get_logger(__name__)
 
@@ -26,6 +31,21 @@ CONTRACTS_DIR = os.path.join(STORAGE_DIR, "contracts")
 os.environ["STORAGE_DIR"] = STORAGE_DIR
 for d in (STORAGE_DIR, OUTPUTS_DIR, UPLOADS_DIR, CONTRACTS_DIR):
     os.makedirs(d, exist_ok=True)
+
+if load_dotenv:
+    root_env = os.path.join(os.path.dirname(BASE_DIR), ".env")
+    pkg_env  = os.path.join(BASE_DIR, ".env")
+    loaded = False
+    if os.path.exists(root_env):
+        loaded = bool(load_dotenv(root_env, override=False)) or loaded
+        logger.info(f"[env] loaded .env from {root_env}")
+    if os.path.exists(pkg_env):
+        loaded = bool(load_dotenv(pkg_env, override=False)) or loaded
+        logger.info(f"[env] loaded .env from {pkg_env}")
+    if not loaded:
+        logger.info("[env] no .env file found in project root or poc_package/")
+else:
+    logger.info("[env] python-dotenv not installed; .env file will not be loaded automatically")
 
 sys.path.insert(0, BASE_DIR)
 sys.path.insert(0, ENGINES_DIR)

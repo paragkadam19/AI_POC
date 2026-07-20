@@ -70,14 +70,15 @@ poc_package/
 4. **Security credentials** → **Create access key** → **Local code**
 5. Download the CSV — you need Access Key ID and Secret Access Key
 
-### Step 3 — Configure AWS CLI
+### Step 3 — Add AWS Credentials to `.env`
 
-```bash
-aws configure
-# AWS Access Key ID:     [from IAM]
-# AWS Secret Access Key: [from IAM]
-# Default region name:   us-east-1
-# Default output format: json
+Create or update `.env` in the project root or `poc_package/`:
+
+```env
+AWS_ACCESS_KEY_ID=your_access_key_id
+AWS_SECRET_ACCESS_KEY=your_secret_access_key
+AWS_SESSION_TOKEN=your_session_token_optional
+AWS_REGION=us-east-1
 ```
 
 ### Step 4 — Run Setup Script
@@ -91,7 +92,7 @@ This will:
 - Create a Python virtual environment
 - Install all packages from `requirements.txt`
   (boto3, flask, duckdb, polars, soda-core-duckdb, pyyaml, etc.)
-- Verify AWS credentials
+- Verify AWS credentials from `.env`
 - Test a live Bedrock API call
 
 ### Step 5 — Configure SODA (for running checks against DuckDB)
@@ -187,7 +188,7 @@ Schema snapshots enable drift detection:
 | Error | Fix |
 |-------|-----|
 | `AccessDeniedException` | Enable model access in Bedrock console (Step 1) |
-| `NoCredentialsError` | Run `aws configure` |
+| `NoCredentialsError` | Add `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` to `.env` |
 | `IO Error: Could not set lock on DuckDB file` | Close DBeaver — DuckDB allows only one connection |
 | `JSONDecodeError` | Claude returned non-JSON — usually throttle; retry |
 | `ThrottlingException` | Wait 5s between calls — already handled by `bedrock_client.py` |

@@ -187,24 +187,23 @@ function renderSchema(d) {
             </td>
             <td>
                 <select id="type_${i}" onchange="updatePendingSchema(${i}, 'data_type', this.value)"
-                    style="width:100%;font:inherit;font-size:12px;line-height:1.4;border:1px solid #E2E8F0;border-radius:4px;padding:8px 10px;min-width:120px;background:#fff">
+                    style="width:100%;font:inherit;font-size:10px;line-height:1.3;border:1px solid #E2E8F0;border-radius:4px;padding:6px 8px;min-width:120px;background:#fff">
                     ${["VARCHAR","BIGINT","INTEGER","DOUBLE","DATE","BOOLEAN","FLOAT","TIMESTAMP"]
                         .map(t => `<option ${col.data_type === t ? 'selected' : ''}>${t}</option>`)
                         .join('')}
                 </select>
             </td>
             <td>
-                <input type="text" id="meaning_${i}"
-                    value="${columnDescription.replace(/"/g, '&quot;')}"
+                <textarea id="meaning_${i}" rows="2" wrap="soft"
+                    spellcheck="false"
                     placeholder="Add column description"
-                    style="width:100%;font-size:13px;border:1px solid #E2E8F0;border-radius:4px;padding:8px 10px;min-width:240px"
-                    onchange="updatePendingSchema(${i}, 'business_meaning', this.value)"/>
+                    style="width:100%;font:inherit;font-size:11px;line-height:1.3;border:1px solid #E2E8F0;border-radius:4px;padding:9px 10px;min-width:240px;resize:vertical;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere"
+                    onchange="updatePendingSchema(${i}, 'business_meaning', this.value)">${escapeHtml(columnDescription)}</textarea>
             </td>
             <td>
-                <input type="text" id="rule_${i}"
-                    value="${(col.validation_rule || '').replace(/"/g, '&quot;')}"
-                    style="width:100%;font-size:13px;border:1px solid #E2E8F0;border-radius:4px;padding:8px 10px;min-width:220px"
-                    onchange="updatePendingSchema(${i}, 'validation_rule', this.value)"/>
+                <textarea id="rule_${i}" rows="2" wrap="soft"
+                    style="width:100%;font:inherit;font-size:11px;line-height:1.3;border:1px solid #E2E8F0;border-radius:4px;padding:9px 10px;min-width:220px;resize:vertical;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere"
+                    onchange="updatePendingSchema(${i}, 'validation_rule', this.value)">${escapeHtml(col.validation_rule || '')}</textarea>
             </td>
             <td>${nullBadge}</td>
             <td>${sampleVals || sampleFallback}</td>

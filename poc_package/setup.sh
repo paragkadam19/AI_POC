@@ -45,25 +45,28 @@ echo "  Installed packages:"
 pip show boto3 flask duckdb polars | grep -E "^(Name|Version)"
 echo "  All dependencies installed."
 
-# ── Check AWS credentials ─────────────────────────────────────
+# ── Check AWS credentials from .env ───────────────────────────
 echo ""
-echo "Step 5: Checking AWS credentials..."
-if aws sts get-caller-identity > /dev/null 2>&1; then
-    ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-    REGION=$(aws configure get region || echo "us-east-1")
-    echo "  AWS account : $ACCOUNT"
-    echo "  Region      : $REGION"
-    if [ "$REGION" != "us-east-1" ]; then
-        echo "  WARNING: Bedrock Claude models have broadest availability in us-east-1"
-        echo "           If you get AccessDeniedException, change region to us-east-1:"
-        echo "           aws configure set region us-east-1"
-    fi
+echo "Step 5: Checking AWS credentials from .env..."
+if [ -f ".env" ]; then
+    set -a
+    source .env
+    set +a
+fi
+
+if [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ]; then
+    REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
+    echo "  AWS access key : present"
+    echo "  Region         : $REGION"
 else
     echo ""
-    echo "  AWS credentials NOT found."
-    echo "  Run the following and enter your IAM Access Key + Secret:"
+    echo "  AWS credentials NOT found in .env."
+    echo "  Add the following to .env:"
     echo ""
-    echo "      aws configure"
+    echo "      AWS_ACCESS_KEY_ID=..."
+    echo "      AWS_SECRET_ACCESS_KEY=..."
+    echo "      AWS_SESSION_TOKEN=...   # optional"
+    echo "      AWS_REGION=us-east-1"
     echo ""
     echo "  Then re-run:  bash setup.sh"
     exit 1
@@ -73,9 +76,15 @@ fi
 echo ""
 echo "Step 6: Testing Bedrock access..."
 python3 - << 'PYEOF'
-import boto3, json, sys
+import os, json, sys, boto3
 
-client = boto3.client("bedrock-runtime", region_name="us-east-1")
+client = boto3.client(
+    "bedrock-runtime",
+    region_name=os.getenv("AWS_REGION", "us-east-1"),
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
+)
 try:
     resp = client.invoke_model(
         modelId     = "us.anthropic.claude-haiku-4-5-20251001-v1:0",

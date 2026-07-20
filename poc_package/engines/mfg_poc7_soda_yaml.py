@@ -78,12 +78,13 @@ Use observed values.
 7. PATTERN CHECKS
 Detect IDs, Emails, Phone Numbers, ZIP codes.
 Use invalid_count checks for known allowed-value lists.
-Avoid regex-based checks entirely.
-If a pattern is absolutely necessary, prefer a simple failed rows check only when it can be expressed with DuckDB-safe operators like `LIKE`, `SUBSTR`, `LEFT`, `RIGHT`, `LENGTH`, `regexp_matches`, or direct comparisons.
-For PAN specifically, always enforce the government format exactly:
-5 uppercase letters + 4 digits + 1 uppercase letter.
+For strict format validations, it is acceptable and preferred to use failed rows checks with DuckDB-safe regex via `REGEXP` / `regexp_matches`.
+Examples:
+  - PAN: exactly 5 uppercase letters + 4 digits + 1 uppercase letter
+  - Mobile: exactly 10 digits
+  - PIN code: exactly 6 digits
 Do not describe PAN as just "alphanumeric 10 characters".
-If generating a PAN rule, use a strict check based on the exact structure and name it as government format validation.
+If generating a PAN rule, use a strict regex-based check and name it as government format validation.
 
 8. LOW CARDINALITY CHECKS
 If low-cardinality values provided, generate:

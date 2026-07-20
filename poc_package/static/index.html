@@ -27,6 +27,7 @@
   <button class="tab" data-tab="dq">             <span class="num">4</span> Data Quality</button>
   <button class="tab" data-tab="validate">       <span class="num">5</span> Schema Validation</button>
   <button class="tab" data-tab="changes">        <span class="num">6</span> Schema Changes</button>
+  <button class="tab" data-tab="kb">             <span class="num">7</span> KB Builder</button>
 </nav>
 
 <main>
@@ -106,6 +107,41 @@
       <button class="btn primary" id="runChangesBtn">Detect Schema Changes</button>
       <div class="loader hidden" id="changesLoader"><span class="spin"></span> Comparing against previous snapshot…</div>
       <div id="changesResult" class="result hidden"></div>
+    </div>
+  </section>
+
+  <!-- TAB 7: KB BUILDER -->
+  <section class="panel" id="panel-kb">
+    <div class="card">
+      <h2>Knowledge Base Builder</h2>
+      <p class="hint">Builds a searchable metadata layer from many tables so the AI can generate join-aware DuckDB queries without loading the full database schema every time.</p>
+      <div class="summary-strip">
+        <div class="kpi teal"><div class="v">KB</div><div class="l">metadata store</div></div>
+        <div class="kpi amber"><div class="v">Graph</div><div class="l">join relations</div></div>
+        <div class="kpi green"><div class="v">AI</div><div class="l">query generator</div></div>
+      </div>
+      <div class="card-list">
+        <div class="ev-card">
+          <div class="obs">1. Catalog tables and columns</div>
+          <div class="sig">Store table names, descriptions, data types, sample values, null counts, and business meaning.</div>
+        </div>
+        <div class="ev-card">
+          <div class="obs">2. Capture relationships</div>
+          <div class="sig">Track primary keys, foreign keys, and likely join paths between related tables.</div>
+        </div>
+        <div class="ev-card">
+          <div class="obs">3. Retrieve only relevant context</div>
+          <div class="sig">When generating a query, fetch the top matching tables and join paths instead of passing all schemas to the model.</div>
+        </div>
+        <div class="ev-card">
+          <div class="obs">4. Generate DuckDB SQL</div>
+          <div class="sig">Use the KB context to build safe, join-aware SQL for the selected business rule or validation scenario.</div>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn" disabled>Build KB</button>
+        <button class="btn primary" disabled>Generate Query</button>
+      </div>
     </div>
   </section>
 
