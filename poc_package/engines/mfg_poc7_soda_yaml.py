@@ -33,6 +33,21 @@ Use the FULL context:
 - sample_values: Actual data seen (shows real patterns)
 - quality_concerns: Issues flagged (high nulls, duplicates, etc.)
 - null_count / null_pct: ACTUAL null stats (not just 0 or all)
+
+Important: the ingest pipeline adds these audit columns to every table:
+- created_date
+- is_active
+- file_name
+The schema may also contain source columns with similar names; the exact
+column name is the source of truth. If a column named `is_active` is the
+ingest-added audit field, treat it as metadata only unless the schema
+profile explicitly marks it as a business/source column.
+
+Treat those as system metadata only. Do not use them as business fields,
+do not compare them against source columns, and do not generate dependency
+checks that claim they represent applicant state. If a check mentions
+"active applicants", only generate it when the source schema contains a
+real business status column that actually filters active/inactive rows.
 """
 
 PROMPT = """RULE GENERATION PRIORITY
@@ -96,6 +111,9 @@ Include ALL known allowed values.
 
 9. UNIQUE VALUE CHECKS
 If 100% distinct or ID column → Generate duplicate_count(column)=0
+Only scope uniqueness to "active applicants" or similar subsets if the
+schema has a real source active/inactive column and the query explicitly
+filters on that source column. Never use ingest-added is_active for this.
 
 10. REFERENTIAL / MAPPING RELATIONSHIP CHECKS
 Infer relationships: State->Country, City->State, Product->Category, etc.
@@ -122,10 +140,11 @@ Validate: integer, decimal, date, timestamp, boolean, string using Soda syntax.
 
 15. DATA QUALITY NAMES
 EVERY check must have: name: DQ-### Description
-All `name` values must be safe YAML plain scalars or quoted strings.
+All `name` values must be safe YAML plain scalars or single-quoted strings.
+Never include double quotes inside `name`.
 Do not include unquoted colons (`:`), line breaks, or YAML-like key/value
 text inside names. If a description needs a colon or extra explanation,
-put it in a quoted string or move it into the SQL fail query comment-free.
+use a single-quoted string and escape inner single quotes by doubling them.
 If any `name`, `summary`, or other text contains a colon, quote the entire
 string so the YAML stays valid.
 
@@ -152,6 +171,12 @@ Generate failed rows checks for these dependencies.
 
 Generate BOTH directions of the rule where applicable:
 the presence rule (value MUST exist) and the absence rule (value must NOT exist).
+Do not compare source fields to ingest-added audit columns such as
+is_active, created_date, or file_name.
+Never generate "active applicants" wording unless the filter is applied
+to a real source status column from the schema profile. If only the audit
+column `is_active` exists, do not use it to qualify duplicate or dependency
+checks.
 
 Examples
 
@@ -196,6 +221,9 @@ Inactive records must have End_Date.
 Generate these rules ONLY when supported by metadata, sample records, or
 validation rules.
 Never invent business rules that are not supported by the provided inputs.
+If a proposed dependency or consistency rule compares two status columns,
+ensure both are present in the source schema and neither is an ingest-only
+audit field.
 Assign a descriptive name to every conditional check.
 
 SCHEMA DISCOVERY PROFILE
@@ -226,6 +254,11 @@ No explanations.
 No comments.
 No prose.
 Use exact column names when writing SQL
+
+Before you return the YAML, verify every `name:` value is single-quoted if it
+contains any colon, quotes, or punctuation that could be misread by YAML.
+For `min(...)` / `max(...)` values, use simple date literals like
+`YYYY-MM-DD` without embedded times unless absolutely required.
 
 Start directly with: checks for {table}:
 """

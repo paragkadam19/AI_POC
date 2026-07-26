@@ -17,12 +17,9 @@ poc_package/
 ├── duckdb_helper.py             ← DuckDB ingest + sampling (no Polars)
 ├── data_loader.py               ← Polars CSV reader (CLI POCs only)
 ├── ingest_to_duckdb.py          ← Standalone DuckDB ingestion script
-├── soda_config.yml              ← SODA datasource config (points to DuckDB)
 ├── requirements.txt             ← All Python dependencies
 │
 ├── engines/                     ← All POC logic
-│   ├── mfg_poc1_schema.py       ← Schema Discovery & Column Profiling
-│   ├── mfg_poc2_quality.py      ← Data Quality + Batch Analysis
 │   ├── mfg_poc3a_drift.py       ← Schema Validation (hardcoded contract)
 │   ├── mfg_poc3b_drift.py       ← Schema Change Discovery (snapshots)
 │   ├── mfg_poc7_soda_yaml.py    ← SODA YAML Generator
@@ -95,19 +92,7 @@ This will:
 - Verify AWS credentials from `.env`
 - Test a live Bedrock API call
 
-### Step 5 — Configure SODA (for running checks against DuckDB)
-
-```bash
-cat > soda_config.yml << 'EOF'
-data_source manufacturing:
-  type: duckdb
-  path: /full/path/to/poc_package/ai_poc_dq.duckdb
-EOF
-```
-
-Replace the path with your actual `poc_package` folder path.
-
-### Step 6 — Run the Web UI
+### Step 5 — Run the Web UI
 
 ```bash
 source venv/bin/activate
@@ -115,7 +100,7 @@ python app.py
 # Open: http://localhost:5000
 ```
 
-### Step 7 — Run CLI POCs (optional, no UI)
+### Step 6 — Run CLI POCs (optional, no UI)
 
 ```bash
 source venv/bin/activate
@@ -140,15 +125,6 @@ python run_manufacturing.py --poc 1 3
 | 4 Data Quality | POC 2 | AI designs + runs DQ checks, scores batches | DuckDB 1000-row SAMPLE |
 | 5 Schema Validation | POC 3a | Compares schema against locked contract | POC 1 JSON only |
 | 6 Schema Changes | POC 3b | Compares current vs previous upload snapshot | POC 1 snapshots only |
-
----
-
-## Running SODA Scan (after Tab 3)
-
-```bash
-# Close DBeaver first — DuckDB allows only one connection at a time
-soda scan -d manufacturing -c soda_config.yml outputs/<dataset_id>/soda_latest.yaml
-```
 
 ---
 

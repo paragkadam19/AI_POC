@@ -35,6 +35,46 @@ def load_soda_yaml(yaml_path: str) -> Dict[str, Any]:
             raise ValueError(f"Invalid YAML in {yaml_path}: {e}") from e
 
 
+def sanitize_soda_yaml_text(yaml_text: str) -> str:
+    """
+    Best-effort cleanup for common YAML issues produced by the LLM.
+    """
+    lines = (yaml_text or "").splitlines()
+    out = []
+
+    def quote_scalar(value: str) -> str:
+        value = value.strip()
+        if value.startswith("'") and value.endswith("'"):
+            return value
+        if value.startswith('"') and value.endswith('"'):
+            return value
+        return "'" + value.replace("'", "''") + "'"
+
+    for line in lines:
+        stripped = line.lstrip()
+        indent = line[: len(line) - len(stripped)]
+
+        if stripped.startswith("name:"):
+            raw = stripped[len("name:"):].strip()
+            if raw and not (raw.startswith("'") and raw.endswith("'")):
+                if ":" in raw or '"' in raw or any(ch in raw for ch in ["<", ">", "=", "(", ")", "/"]):
+                    stripped = "name: " + quote_scalar(raw)
+                    line = indent + stripped
+
+        if stripped.startswith("fail query:"):
+            out.append(line)
+            continue
+
+        if re.match(r"^(min|max)\([^)]+\)\s*[<>=!]+\s*.+$", stripped):
+            left, right = stripped.split(":", 1) if ":" in stripped else (None, None)
+            # no-op here; the invalid YAML usually comes from name values
+            pass
+
+        out.append(line)
+
+    return "\n".join(out)
+
+
 def parse_soda_checks(yaml_content: Dict[str, Any], table_name: str) -> List[Dict[str, Any]]:
     """Extract check definitions from SODA YAML."""
     checks = []
@@ -262,6 +302,17 @@ def _normalize_duckdb_regex(sql: str) -> str:
     """
     sql = re.sub(r"\bREGEXP_LIKE\s*\(", "regexp_matches(", sql, flags=re.IGNORECASE)
 
+    # Rewrite infix REGEXP expressions:
+    #   col REGEXP 'pattern'
+    #   NOT col REGEXP 'pattern'
+    # into DuckDB's regexp_matches(col, 'pattern').
+    sql = re.sub(
+        r"(?<!\w)([A-Za-z_][\w\.]*)\s+REGEXP\s+'([^']+)'",
+        lambda m: f"regexp_matches({m.group(1)}, '{m.group(2)}')",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
     # Rewrite the most common Soda pattern:
     #   WHERE col NOT REGEXP '...'
     # into DuckDB:
@@ -296,6 +347,8 @@ def _normalize_duckdb_regex(sql: str) -> str:
         sql,
         flags=re.IGNORECASE,
     )
+
+    sql = re.sub(r"\bNOT\s+regexp_matches\(", "NOT regexp_matches(", sql, flags=re.IGNORECASE)
 
     return sql
 

@@ -27,7 +27,7 @@
   <button class="tab" data-tab="dq">             <span class="num">4</span> Data Quality</button>
   <button class="tab" data-tab="validate">       <span class="num">5</span> Schema Validation</button>
   <button class="tab" data-tab="changes">        <span class="num">6</span> Schema Changes</button>
-  <button class="tab" data-tab="kb">             <span class="num">7</span> KB Builder</button>
+  <button class="tab" data-tab="kb">             <span class="num">7</span> NL → SQL</button>
 </nav>
 
 <main>
@@ -113,35 +113,42 @@
   <!-- TAB 7: KB BUILDER -->
   <section class="panel" id="panel-kb">
     <div class="card">
-      <h2>Knowledge Base Builder</h2>
-      <p class="hint">Builds a searchable metadata layer from many tables so the AI can generate join-aware DuckDB queries without loading the full database schema every time.</p>
+      <h2>Natural Language to SQL</h2>
+      <p class="hint">Ask for data in plain English. The backend retrieves the most relevant schema slice, expands any bridge tables, then generates and validates DuckDB SQL.</p>
+      <div class="query-box">
+        <label for="nlQuery" style="display:block;font-size:13px;font-weight:600;margin-bottom:8px;color:#0F172A">Your question</label>
+        <textarea id="nlQuery" rows="3" placeholder="Example: Give me the total count of order in india"
+          style="width:100%;font:inherit;font-size:14px;line-height:1.5;border:1px solid #CBD5E1;border-radius:10px;padding:12px 14px;resize:vertical;min-height:90px"></textarea>
+      </div>
       <div class="summary-strip">
-        <div class="kpi teal"><div class="v">KB</div><div class="l">metadata store</div></div>
-        <div class="kpi amber"><div class="v">Graph</div><div class="l">join relations</div></div>
-        <div class="kpi green"><div class="v">AI</div><div class="l">query generator</div></div>
+        <div class="kpi teal"><div class="v">RAG</div><div class="l">schema retrieval</div></div>
+        <div class="kpi amber"><div class="v">Graph</div><div class="l">join bridge</div></div>
+        <div class="kpi green"><div class="v">SQL</div><div class="l">validated output</div></div>
       </div>
       <div class="card-list">
         <div class="ev-card">
-          <div class="obs">1. Catalog tables and columns</div>
-          <div class="sig">Store table names, descriptions, data types, sample values, null counts, and business meaning.</div>
+          <div class="obs">1. Retrieve relevant tables</div>
+          <div class="sig">Hybrid semantic and keyword scoring finds the schema slice most likely to answer the question.</div>
         </div>
         <div class="ev-card">
-          <div class="obs">2. Capture relationships</div>
-          <div class="sig">Track primary keys, foreign keys, and likely join paths between related tables.</div>
+          <div class="obs">2. Expand bridge tables</div>
+          <div class="sig">Join-graph search adds missing tables needed to connect the retrieved tables safely.</div>
         </div>
         <div class="ev-card">
-          <div class="obs">3. Retrieve only relevant context</div>
-          <div class="sig">When generating a query, fetch the top matching tables and join paths instead of passing all schemas to the model.</div>
+          <div class="obs">3. Generate SQL</div>
+          <div class="sig">The LLM receives only the relevant schema slice and returns a DuckDB query.</div>
         </div>
         <div class="ev-card">
-          <div class="obs">4. Generate DuckDB SQL</div>
-          <div class="sig">Use the KB context to build safe, join-aware SQL for the selected business rule or validation scenario.</div>
+          <div class="obs">4. Validate the result</div>
+          <div class="sig">The generated SQL is checked with EXPLAIN and a preview query before showing it to the user.</div>
         </div>
       </div>
       <div class="actions">
-        <button class="btn" disabled>Build KB</button>
-        <button class="btn primary" disabled>Generate Query</button>
+        <button class="btn" id="clearQueryBtn">Clear</button>
+        <button class="btn primary" id="runQueryBtn">Generate SQL</button>
       </div>
+      <div id="queryLoader" class="loader hidden"><span class="spin"></span> Retrieving schema and generating SQL…</div>
+      <div id="queryResult" class="result hidden"></div>
     </div>
   </section>
 

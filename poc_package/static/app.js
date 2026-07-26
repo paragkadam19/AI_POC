@@ -28,6 +28,11 @@ async function api(path, opts = {}) {
 function show(id) { $(id).classList.remove("hidden"); }
 function hide(id) { $(id).classList.add("hidden"); }
 function fmt(v)   { return (v === null || v === undefined || v === "") ? '<span style="color:#94A3B8">∅</span>' : v; }
+function asArray(v) {
+  if (Array.isArray(v)) return v;
+  if (v === null || v === undefined || v === "") return [];
+  return [v];
+}
 
 (async () => {
   try {
@@ -496,6 +501,114 @@ function rejectSoda() {
   if (confirm("Re-generate YAML? This will discard your current edits.")) {
     $("runSodaBtn").click();
   }
+}
+
+/* ═══════════════════════════════════════════════════════
+   TAB 7 — NL → SQL
+═══════════════════════════════════════════════════════ */
+const nlQuery = $("nlQuery");
+const runQueryBtn = $("runQueryBtn");
+const clearQueryBtn = $("clearQueryBtn");
+
+if (clearQueryBtn && nlQuery) {
+  clearQueryBtn.addEventListener("click", () => {
+    nlQuery.value = "";
+    $("queryResult").classList.add("hidden");
+    $("queryResult").innerHTML = "";
+  });
+}
+
+if (runQueryBtn) {
+  runQueryBtn.addEventListener("click", async () => {
+    const question = (nlQuery?.value || "").trim();
+    if (!question) {
+      alert("Please enter a natural-language question.");
+      return;
+    }
+
+    show("queryLoader"); hide("queryResult");
+    runQueryBtn.disabled = true;
+
+    try {
+      const data = await api("/api/poc8/query", {
+        method: "POST",
+        body: JSON.stringify({ question }),
+      });
+      renderQuery(data);
+    } catch (e) {
+      $("queryResult").classList.remove("hidden");
+      $("queryResult").innerHTML = `<div class="banner error">✗ ${e.message}</div>`;
+    }
+
+    hide("queryLoader");
+    runQueryBtn.disabled = false;
+  });
+}
+
+function renderQuery(d) {
+  const el = $("queryResult");
+  el.classList.remove("hidden");
+
+  if (!d.ok) {
+    const warnings = asArray(d.warnings).map(w => `<li>${escapeHtml(String(w))}</li>`).join("");
+    el.innerHTML = `
+      <div class="banner error">✗ Could not generate a safe query</div>
+      <div class="card-list">
+        <div class="ev-card"><div class="obs">Question</div><div class="sig">${escapeHtml(d.question || "")}</div></div>
+        <div class="ev-card"><div class="obs">Warnings</div><div class="sig"><ul style="margin:0;padding-left:18px">${warnings || "<li>No SQL returned</li>"}</ul></div></div>
+      </div>`;
+    return;
+  }
+
+  const tables = (d.tables || []).map(t => `<code style="margin-right:6px">${t}</code>`).join("");
+  const joins = (d.join_paths || []).map(j => `<li><code>${j.left}</code> ↔ <code>${j.right}</code> via <code>${j.join_column}</code></li>`).join("");
+  const previewRows = (d.preview && d.preview.rows) || [];
+  const previewCols = (d.preview && d.preview.columns) || [];
+
+  let previewHtml = "<div style='color:#94A3B8;font-size:12px'>No preview rows returned.</div>";
+  if (previewRows.length && previewCols.length) {
+    previewHtml = `
+      <div class="table-wrap"><table>
+        <thead><tr>${previewCols.map(c => `<th>${c}</th>`).join("")}</tr></thead>
+        <tbody>
+          ${previewRows.map(row => `<tr>${previewCols.map(c => `<td>${fmt(row[c])}</td>`).join("")}</tr>`).join("")}
+        </tbody>
+      </table></div>`;
+  }
+
+  const warningsList = asArray(d.warnings);
+  const warnings = warningsList.length
+    ? `<div class="banner info">Warnings: ${warningsList.map((w) => escapeHtml(String(w))).join(" · ")}</div>`
+    : "";
+
+  el.innerHTML = `
+    <div class="banner ok">✓ SQL generated and validated against DuckDB</div>
+    ${warnings}
+    <div class="summary-strip">
+      <div class="kpi teal"><div class="v">${(d.tables || []).length}</div><div class="l">retrieved tables</div></div>
+      <div class="kpi amber"><div class="v">${(d.bridges_added || []).length}</div><div class="l">bridge tables</div></div>
+      <div class="kpi green"><div class="v">${previewRows.length}</div><div class="l">preview rows</div></div>
+    </div>
+    <div class="card-list">
+      <div class="ev-card">
+        <div class="obs">Question</div>
+        <div class="sig">${escapeHtml(d.question || "")}</div>
+      </div>
+      <div class="ev-card">
+        <div class="obs">Retrieved tables</div>
+        <div class="sig">${tables || "<span style='color:#94A3B8'>None</span>"}</div>
+      </div>
+      <div class="ev-card">
+        <div class="obs">Join paths</div>
+        <div class="sig"><ul style="margin:0;padding-left:18px">${joins || "<li>None needed</li>"}</ul></div>
+      </div>
+    </div>
+    <h3>Generated SQL</h3>
+    <textarea readonly style="width:100%;min-height:180px;font-family:'SF Mono',Consolas,monospace;font-size:13px;
+      background:#0F172A;color:#E2E8F0;padding:16px;border-radius:8px;border:none;resize:vertical;line-height:1.6">${escapeHtml(d.sql || "")}</textarea>
+    <h3>Preview</h3>
+    ${previewHtml}
+  `;
 }
 
 /* ═══════════════════════════════════════════════════════

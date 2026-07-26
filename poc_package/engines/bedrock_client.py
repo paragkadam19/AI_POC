@@ -8,6 +8,7 @@ from logger_config import get_logger
 logger = get_logger(__name__)
 
 MODEL_HAIKU = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+MODEL_TITAN_EMBED = "amazon.titan-embed-text-v2:0"
 REGION      = "us-east-1"
 
 _client = None
@@ -209,34 +210,92 @@ def ask_json(prompt: str,
              max_tokens: int = 16000,
              verbose: bool = True) -> dict:
     full_system = (system + "\n\n" if system else "") + \
-                  "CRITICAL: Return ONLY valid JSON. No markdown fences, no explanation, no preamble. Use double quotes only, never apostrophes inside strings."
+                  "CRITICAL: Return ONLY valid JSON. No markdown fences, no explanation, no preamble. Use double quotes only. Keep the JSON compact."
+
+    def _clean_raw(text: str) -> str:
+        text = (text or "").strip()
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```\s*$', '', text)
+        text = text.strip()
+        start = len(text)
+        if text.find('{') != -1:
+            start = min(start, text.find('{'))
+        if text.find('[') != -1:
+            start = min(start, text.find('['))
+        end = max(text.rfind('}'), text.rfind(']')) + 1
+        if 0 <= start < end:
+            text = text[start:end]
+        return text.strip()
+
+    def _repair_common_json_issues(text: str) -> str:
+        text = text.strip()
+        # Remove trailing commas before closing containers.
+        text = re.sub(r",\s*([}\]])", r"\1", text)
+        # Normalize single-line control characters inside strings only as a
+        # last resort for model output that inserted stray CR/LF pairs.
+        text = text.replace("\r\n", "\n")
+        return text
+
+    def _attempt_parse(text: str):
+        cleaned = _repair_common_json_issues(_clean_raw(text))
+        return json.loads(cleaned), cleaned
+
+    def _repair_json(bad_json: str, error_msg: str) -> str:
+        repair_prompt = f"""
+Fix the following invalid JSON and return ONLY valid JSON.
+Do not add markdown or commentary.
+
+JSON error:
+{error_msg}
+
+Broken JSON:
+{bad_json}
+"""
+        return ask(repair_prompt, system=full_system, model=model, max_tokens=4000, verbose=verbose)
 
     t0 = time.time()
     raw = ask(prompt, system=full_system, model=model, max_tokens=max_tokens, verbose=verbose)
     logger.info(f"[ask_json] ask() total (network+generation+read): {time.time()-t0:.3f}s")
 
-    t0 = time.time()
-    raw = raw.strip()
-    raw = re.sub(r'^```(?:json)?\s*', '', raw)
-    raw = re.sub(r'\s*```\s*$', '', raw)
-    raw = raw.strip()
-
-    start = len(raw)
-    if raw.find('{') != -1:
-        start = min(start, raw.find('{'))
-    if raw.find('[') != -1:
-        start = min(start, raw.find('['))
-    end = max(raw.rfind('}'), raw.rfind(']')) + 1
-    if 0 <= start < end:
-        raw = raw[start:end]
-
     try:
-        parsed = json.loads(raw)
-        logger.info(f"[ask_json] cleanup + json.loads parse: {time.time()-t0:.3f}s")
+        t_parse = time.time()
+        parsed, cleaned = _attempt_parse(raw)
+        logger.info(f"[ask_json] cleanup + json.loads parse: {time.time()-t_parse:.3f}s")
         return parsed
     except json.JSONDecodeError as e:
         logger.error(f"JSON parse failed: {e} | raw (first 500 chars): {raw[:500]}")
-        raise
+        raw = _repair_json(_clean_raw(raw), str(e))
+        t_parse = time.time()
+        try:
+            parsed, cleaned = _attempt_parse(raw)
+            logger.info(f"[ask_json] repair + json.loads parse: {time.time()-t_parse:.3f}s")
+            return parsed
+        except json.JSONDecodeError as e2:
+            logger.error(f"JSON repair failed: {e2} | repaired raw (first 500 chars): {raw[:500]}")
+            raise ValueError(
+                "Model returned invalid JSON twice. "
+                "Try rerunning with a smaller prompt or lower output scope."
+            ) from e2
+
+
+def embed_text(text: str, model: str = None) -> list:
+    """
+    Generate a semantic embedding using Amazon Titan embeddings on Bedrock.
+    Returns a plain list[float].
+    """
+    model = model or MODEL_TITAN_EMBED
+    body = {"inputText": text or ""}
+    resp = get_client().invoke_model(
+        modelId=model,
+        body=json.dumps(body),
+        contentType="application/json",
+        accept="application/json",
+    )
+    result = json.loads(resp["body"].read())
+    embedding = result.get("embedding") or result.get("embeddings")
+    if isinstance(embedding, list):
+        return embedding
+    raise ValueError("Bedrock embedding response did not contain an embedding vector.")
 
 
 def print_separator(title: str = "", char: str = "─", width: int = 65):

@@ -22,10 +22,10 @@ import duckdb
 from datetime import date
 
 DUCKDB_CONFIG = {
-    "memory_limit":              "2GB",
-    "max_memory":                "2GB",
+    "memory_limit":              "3GB",
+    "max_memory":                "3GB",
     "temp_directory":            "/tmp",
-    "max_temp_directory_size":   "10GB",
+    "max_temp_directory_size":   "20GB",
     "threads":                   4,
     "preserve_insertion_order":  False,
 }
@@ -33,6 +33,7 @@ DUCKDB_CONFIG = {
 SAMPLE_ROWS_SCHEMA = 10
 
 LOW_CARDINALITY_THRESHOLD = 10
+CSV_AUTODETECT_SAMPLE_SIZE = 500
 
 
 def _connect(db_file: str, read_only: bool = False):
@@ -65,7 +66,7 @@ def ingest_csv(csv_file: str, db_file: str, table: str, original_filename: str =
                 DATE '{today}'  AS created_date,
                 true            AS is_active,
                 '{file_name}'   AS file_name
-            FROM read_csv_auto('{csv_file}', sample_size=10000, nullstr='')
+            FROM read_csv_auto('{csv_file}', sample_size={CSV_AUTODETECT_SAMPLE_SIZE}, nullstr='')
         """)
 
         row_count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -200,30 +201,6 @@ def get_sample_rows(db_file: str, table: str, n_rows: int, row_count: int = None
     rows = cur.fetchall()
     conn.close()
     return [dict(zip(cols, row)) for row in rows]
-
-
-# ── Stratified sample as CSV string ───────────────────────────────────────────
-def get_sample_csv(db_file: str, table: str, n_rows: int, row_count: int = None) -> str:
-    conn = _connect(db_file, read_only=True)
-    if row_count is None:
-        row_count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-
-    if row_count <= n_rows:
-        cur = conn.execute(f"SELECT * FROM {table}")
-    else:
-        cur = conn.execute(f"SELECT * FROM {table} USING SAMPLE {n_rows} ROWS")
-
-    cols = [d[0] for d in cur.description]
-    rows = cur.fetchall()
-    conn.close()
-
-    lines = [",".join(str(c) for c in cols)]
-    for row in rows:
-        lines.append(",".join(
-            "" if v is None else str(v).replace(",", ";")
-            for v in row
-        ))
-    return "\n".join(lines)
 
 
 # ── Combined metadata, shaped for prompt_builder.py ────────────────────────────

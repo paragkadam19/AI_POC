@@ -7,6 +7,15 @@ repeated prose so the model gets the same facts with fewer tokens.
 import json
 
 
+def _compact_value(value, limit: int = 80):
+    if value is None:
+        return None
+    text = str(value)
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return value
+
+
 def build_schema_discovery_prompt(metadata: dict) -> tuple:
     filename = metadata.get("filename", "unknown.csv")
     file_size_mb = metadata.get("file_size_mb", 0)
@@ -57,7 +66,13 @@ TASK
             }
             for col in columns
         ],
-        "sample_rows": sample_rows,
+        "sample_rows": [
+            {
+                key: _compact_value(value)
+                for key, value in row.items()
+            }
+            for row in sample_rows[:3]
+        ],
     }
 
     instructions_section = """
@@ -116,9 +131,16 @@ RETURN JSON:
 }
 """
 
+    metadata_json = json.dumps(
+        metadata_payload,
+        separators=(',', ':'),
+        default=str,
+        ensure_ascii=True
+    )
+
     user_prompt = (
         "CSV_METADATA=\n"
-        f"{json.dumps(metadata_payload, separators=(',', ':'), default=str)}\n"
+        f"{metadata_json}\n"
         f"{instructions_section}"
     )
 
