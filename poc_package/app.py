@@ -4,14 +4,20 @@ app.py — Flask backend for Data Quality POC Console
 Flow: Upload CSV → DuckDB ingest → Schema Discovery → SODA YAML →
       Data Quality → Schema Validation → Schema Changes
 
-Tab 4 (Data Quality) now runs real SODA checks directly against
-DuckDB via soda_executor.py — no Bedrock calls, no CSV sampling
-sent over the network. 100% of Tab 4's AI cost is gone.
+Human-in-the-loop:
+- Tab 2: AI result shown for review/edit → user clicks Approve → saved
+- Tab 3: AI YAML shown for review/edit → user clicks Approve → saved
+- Tab 4: Runs real SODA checks directly against DuckDB (no AI call)
 """
 import os, sys, json, re, time, shutil
 from datetime import datetime
 
 from logger_config import setup_logging, get_logger
+
+try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
 
 setup_logging()
 logger = get_logger(__name__)
@@ -26,6 +32,21 @@ os.environ["STORAGE_DIR"] = STORAGE_DIR
 for d in (STORAGE_DIR, OUTPUTS_DIR, UPLOADS_DIR, CONTRACTS_DIR):
     os.makedirs(d, exist_ok=True)
 
+if load_dotenv:
+    root_env = os.path.join(os.path.dirname(BASE_DIR), ".env")
+    pkg_env  = os.path.join(BASE_DIR, ".env")
+    loaded = False
+    if os.path.exists(root_env):
+        loaded = bool(load_dotenv(root_env, override=False)) or loaded
+        logger.info(f"[env] loaded .env from {root_env}")
+    if os.path.exists(pkg_env):
+        loaded = bool(load_dotenv(pkg_env, override=False)) or loaded
+        logger.info(f"[env] loaded .env from {pkg_env}")
+    if not loaded:
+        logger.info("[env] no .env file found in project root or poc_package/")
+else:
+    logger.info("[env] python-dotenv not installed; .env file will not be loaded automatically")
+
 sys.path.insert(0, BASE_DIR)
 sys.path.insert(0, ENGINES_DIR)
 
@@ -33,8 +54,6 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 import mfg_poc7_soda_yaml as poc7
-import mfg_poc3a_drift    as poc3a
-import mfg_poc3b_drift    as poc3b
 from bedrock_client import ask_json, ask
 from prompt_builder import build_schema_discovery_prompt
 from soda_executor import run_soda_checks_from_yaml
@@ -114,6 +133,170 @@ def table_name(dataset_id: str) -> str:
     return f"tbl_{dataset_id}"
 
 
+def _schema_map(schema_profile: dict) -> dict:
+    return {
+        col.get("column"): col.get("data_type")
+        for col in (schema_profile or {}).get("schema", [])
+        if col.get("column")
+    }
+
+
+def compare_contract_to_schema(contract: dict, current_schema: dict) -> dict:
+    contract = contract or {}
+    current  = _schema_map(current_schema)
+
+    contract_cols = set(contract.keys())
+    current_cols  = set(current.keys())
+
+    missing_columns = sorted(contract_cols - current_cols)
+    extra_columns   = sorted(current_cols - contract_cols)
+
+    type_mismatches = []
+    null_issues = []
+    for col in sorted(contract_cols & current_cols):
+        if str(contract.get(col)).lower() != str(current.get(col)).lower():
+            type_mismatches.append({
+                "column": col,
+                "expected_type": contract.get(col),
+                "actual_type": current.get(col),
+            })
+
+    for col in (current_schema or {}).get("schema", []):
+        if col.get("null_count", 0) > 0 and col.get("column") in contract_cols:
+            null_issues.append({
+                "column": col.get("column"),
+                "null_count": col.get("null_count", 0),
+                "recommendation": "Review nulls for contract-required column",
+            })
+
+    severity = "none"
+    can_pipeline_proceed = True
+    validation_passed = True
+
+    if missing_columns:
+        severity = "critical"
+        can_pipeline_proceed = False
+        validation_passed = False
+    elif type_mismatches:
+        severity = "high"
+        can_pipeline_proceed = False
+        validation_passed = False
+    elif extra_columns:
+        severity = "medium"
+
+    summary = "Schema matches the contract."
+    if missing_columns:
+        summary = f"Missing contract columns: {', '.join(missing_columns)}."
+    elif type_mismatches:
+        summary = f"Type mismatches found for {len(type_mismatches)} column(s)."
+    elif extra_columns:
+        summary = f"Extra columns found: {', '.join(extra_columns)}."
+
+    recommended_actions = []
+    if missing_columns:
+        recommended_actions.append("Add the missing contract columns or reject the upload.")
+    if type_mismatches:
+        recommended_actions.append("Fix the data types to match the locked contract.")
+    if extra_columns:
+        recommended_actions.append("Review whether extra columns should be added to the contract.")
+    if null_issues:
+        recommended_actions.append("Review null-heavy contract columns before proceeding.")
+
+    return {
+        "validation_passed": validation_passed,
+        "severity": severity,
+        "can_pipeline_proceed": can_pipeline_proceed,
+        "summary": summary,
+        "missing_columns": missing_columns,
+        "extra_columns": extra_columns,
+        "type_mismatches": type_mismatches,
+        "null_issues": null_issues,
+        "recommended_actions": recommended_actions,
+    }
+
+
+def compare_schema_snapshots(previous_schema: dict, current_schema: dict, previous_file: str = None) -> dict:
+    previous_cols = previous_schema.get("schema", []) if previous_schema else []
+    current_cols  = current_schema.get("schema", []) if current_schema else []
+
+    prev_map = {c.get("column"): c.get("data_type") for c in previous_cols if c.get("column")}
+    curr_map = {c.get("column"): c.get("data_type") for c in current_cols if c.get("column")}
+
+    prev_names = list(prev_map.keys())
+    curr_names = list(curr_map.keys())
+
+    new_columns = sorted(set(curr_names) - set(prev_names))
+    dropped_columns = sorted(set(prev_names) - set(curr_names))
+
+    type_changes = []
+    for col in sorted(set(prev_names) & set(curr_names)):
+        if str(prev_map.get(col)).lower() != str(curr_map.get(col)).lower():
+            type_changes.append({
+                "column": col,
+                "old_type": prev_map.get(col),
+                "new_type": curr_map.get(col),
+            })
+
+    reordered = prev_names != curr_names and set(prev_names) == set(curr_names)
+
+    possible_renames = []
+    if len(previous_cols) == len(current_cols):
+        for i, (prev_col, curr_col) in enumerate(zip(previous_cols, current_cols)):
+            prev_name = prev_col.get("column")
+            curr_name = curr_col.get("column")
+            if prev_name != curr_name and prev_name not in curr_names and curr_name not in prev_names:
+                confidence = "medium"
+                if str(prev_col.get("data_type")).lower() == str(curr_col.get("data_type")).lower():
+                    confidence = "high"
+                possible_renames.append({
+                    "position": i,
+                    "old_name": prev_name,
+                    "new_name": curr_name,
+                    "confidence": confidence,
+                })
+
+    change_detected = bool(new_columns or dropped_columns or type_changes or reordered or possible_renames)
+    summary = "No schema changes detected."
+    if change_detected:
+        parts = []
+        if new_columns:
+            parts.append(f"new columns: {', '.join(new_columns)}")
+        if dropped_columns:
+            parts.append(f"dropped columns: {', '.join(dropped_columns)}")
+        if type_changes:
+            parts.append(f"type changes in {len(type_changes)} column(s)")
+        if reordered:
+            parts.append("column order changed")
+        if possible_renames:
+            parts.append(f"possible renames: {len(possible_renames)}")
+        summary = "; ".join(parts).capitalize() + "."
+
+    recommended_actions = []
+    if new_columns:
+        recommended_actions.append("Review whether the new columns should be added to the downstream contract.")
+    if dropped_columns:
+        recommended_actions.append("Check whether the dropped columns were intentionally removed.")
+    if type_changes:
+        recommended_actions.append("Validate type changes before loading downstream systems.")
+    if reordered:
+        recommended_actions.append("Confirm the reorder is expected and does not affect positional consumers.")
+    if possible_renames:
+        recommended_actions.append("Review possible renames manually before approving schema drift.")
+
+    return {
+        "change_detected": change_detected,
+        "summary": summary,
+        "new_columns": new_columns,
+        "dropped_columns": dropped_columns,
+        "possible_renames": possible_renames,
+        "type_changes": type_changes,
+        "reordered": reordered,
+        "recommended_actions": recommended_actions,
+        "compared_against": previous_file,
+        "is_first_run": False,
+    }
+
+
 # ── static UI ─────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
@@ -153,23 +336,17 @@ def upload():
     dataset_id   = None
     content_type = request.content_type or ""
 
-    # ── Preferred path: raw streamed body ────────────────────────────────────
-    # The browser sends the file as the raw request body (no multipart
-    # envelope). Flask's form-parser never touches it, so the bytes hit
-    # disk exactly once instead of twice.
     if content_type.startswith("application/octet-stream"):
         filename   = request.args.get("filename", filename)
         dataset_id = make_dataset_id(filename)
         udir       = os.path.join(UPLOADS_DIR, dataset_id)
         os.makedirs(udir, exist_ok=True)
         csv_path   = os.path.join(udir, f"{ts()}.csv")
-
         t0 = time.time()
         with open(csv_path, "wb") as out:
             shutil.copyfileobj(request.stream, out, length=16 * 1024 * 1024)
         logger.info(f"upload streamed to disk in {time.time()-t0:.2f}s | file={filename}")
 
-    # ── Fallback: classic multipart form upload ──────────────────────────────
     elif "file" in request.files:
         f          = request.files["file"]
         filename   = f.filename or filename
@@ -181,7 +358,6 @@ def upload():
         f.save(csv_path)
         logger.info(f"upload saved to disk (multipart) in {time.time()-t0:.2f}s | file={filename}")
 
-    # ── Fallback: pasted CSV text as JSON ─────────────────────────────────────
     else:
         body = request.get_json(silent=True)
         if body and "csv_text" in body:
@@ -227,6 +403,9 @@ def upload():
 
 
 # ── Tab 2: Schema Discovery (POC 1) ───────────────────────────────────────────
+# HUMAN IN THE LOOP: run_poc1 returns result for review only.
+# Nothing is saved until user clicks Approve → /api/poc1/approve
+
 @app.route("/api/poc1/run", methods=["POST"])
 def run_poc1():
     ds       = STATE["dataset_id"]
@@ -236,53 +415,71 @@ def run_poc1():
     try:
         t_start = time.time()
 
-        # ── Step 1: get file size ────────────────────────────────────────────
         t0 = time.time()
         file_size_bytes = os.path.getsize(csv_path)
         tbl             = table_name(ds)
         logger.info(f"[poc1] STEP 1 - getsize: {time.time()-t0:.3f}s")
 
-        # ── Step 2: fetch metadata from DuckDB (SUMMARIZE + histogram + sample) ─
-        t0 = time.time()
+        t0       = time.time()
         metadata = get_full_metadata_for_ai(DB_FILE, tbl, STATE["filename"], file_size_bytes, SAMPLE_ROWS_SCHEMA)
         logger.info(f"[poc1] STEP 2 - get_full_metadata_for_ai (DuckDB): {time.time()-t0:.3f}s")
 
-        # ── Step 3: build the prompt strings ─────────────────────────────────
-        t0 = time.time()
+        t0                         = time.time()
         system_prompt, user_prompt = build_schema_discovery_prompt(metadata)
-        prompt_len_chars = len(system_prompt) + len(user_prompt)
+        prompt_len_chars           = len(system_prompt) + len(user_prompt)
         logger.info(f"[poc1] STEP 3 - build_schema_discovery_prompt: {time.time()-t0:.3f}s | prompt_chars={prompt_len_chars}")
-        logger.info(f"[poc1] USER PROMPT:\n{user_prompt}")  
-        # ── Step 4: the actual Bedrock call (network + model generation) ────
-        t0 = time.time()
+        logger.info(f"[poc1] USER PROMPT:\n{user_prompt}")
+
+        t0     = time.time()
         result = ask_json(user_prompt, system_prompt)
-        logger.info(f"[poc1] STEP 4 - ask_json (Bedrock call, incl. JSON parse): {time.time()-t0:.3f}s")
+        logger.info(f"[poc1] STEP 4 - ask_json (Bedrock call): {time.time()-t0:.3f}s")
 
-        # ── Step 5: save result to disk ───────────────────────────────────────
-        t0 = time.time()
+        # ── NOT saving here — user must review and approve first ─────────────
+        result["_dataset_id"] = ds
+        logger.info(f"[poc1] TOTAL route time (AI only, not saved yet): {time.time()-t_start:.3f}s")
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"Schema discovery (poc1) failed for dataset={ds}: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/poc1/approve", methods=["POST"])
+def approve_poc1():
+    """
+    Human-in-the-loop approval for Tab 2.
+    User reviews/edits the schema in the UI, then clicks Approve.
+    Only then does the result get saved to disk and contract locked.
+    """
+    ds = STATE["dataset_id"]
+    if not ds:
+        return jsonify({"error": "No active dataset"}), 400
+    try:
+        result = request.get_json()
+        if not result:
+            return jsonify({"error": "No schema data received"}), 400
+
+        # Save approved (possibly edited) schema
         versioned_name = save_versioned(ds, "poc1", result)
-        logger.info(f"[poc1] STEP 5 - save_versioned: {time.time()-t0:.3f}s")
+        logger.info(f"[poc1] schema approved and saved | dataset={ds} | file={versioned_name}")
 
-        # ── Step 6: contract creation (first run only) ───────────────────────
-        t0 = time.time()
+        # Lock the contract from this approved schema (first approval only)
         cpath           = contract_path(ds)
         is_new_contract = not os.path.exists(cpath)
         if is_new_contract:
             contract = {col["column"]: col["data_type"] for col in result.get("schema", [])}
             with open(cpath, "w") as f:
                 json.dump(contract, f, indent=2)
-        logger.info(f"[poc1] STEP 6 - contract write: {time.time()-t0:.3f}s | new_contract={is_new_contract}")
+            logger.info(f"[poc1] contract locked from approved schema | dataset={ds}")
 
         result["_dataset_id"]       = ds
         result["_version_file"]     = versioned_name
         result["_contract_created"] = is_new_contract
-
-        logger.info(f"[poc1] TOTAL route time: {time.time()-t_start:.3f}s")
-        return jsonify(result)
+        return jsonify({"success": True, "version_file": versioned_name, "contract_created": is_new_contract})
     except Exception as e:
-        logger.error(f"Schema discovery (poc1) failed for dataset={ds}: {e}", exc_info=True)
+        logger.error(f"Schema approval (poc1) failed for dataset={ds}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
-    
+
 
 @app.route("/api/poc1/versions")
 def poc1_versions():
@@ -293,19 +490,31 @@ def poc1_versions():
 
 
 # ── Tab 3: SODA YAML (POC 7) ──────────────────────────────────────────────────
+# HUMAN IN THE LOOP: run_poc7 returns YAML for review only.
+# Nothing is saved until user clicks Approve → /api/poc7/approve
+
 @app.route("/api/poc7/run", methods=["POST"])
 def run_poc7():
-    ds             = STATE["dataset_id"]
-    schema_profile = ds and load_latest(ds, "poc1")
+    ds = STATE["dataset_id"]
+    if not ds:
+        return jsonify({"error": "Upload a CSV first"}), 400
+
+    # STRICT GATE: only approved schema (saved poc1_latest.json) is accepted
+    # pending/unapproved AI output is never used here
+    schema_profile = load_latest(ds, "poc1")
     if not schema_profile:
-        return jsonify({"error": "Run Schema Discovery (Tab 2) first"}), 400
+        return jsonify({
+            "error": "Schema Discovery must be approved first. Run Tab 2 and click 'Approve & Save' before generating YAML."
+        }), 400
+
     try:
-        # FIX: Use safe string replacement instead of .format()
         schema_json = json.dumps(schema_profile, indent=2)
         prompt = poc7.PROMPT.replace("{table}", table_name(ds)).replace(
             "{schema_profile}", schema_json
         )
-        logger.info(f"SODA YAML Prompt (first 500 chars):\n{prompt[:500]}")
+        logger.info(f"[poc7] using approved poc1_latest.json | dataset={ds}")
+        logger.info(f"[poc7] Prompt (first 500 chars):\n{prompt[:500]}")
+
         yaml_output = ask(prompt, poc7.SYSTEM).strip()
         if yaml_output.startswith("```"):
             yaml_output = "\n".join(yaml_output.split("\n")[1:])
@@ -313,18 +522,52 @@ def run_poc7():
             yaml_output = "\n".join(yaml_output.split("\n")[:-1])
         yaml_output = yaml_output.strip()
 
-        save_versioned(ds, "soda", yaml_output, ext="yaml")
+        # NOT saving here — user must approve in Tab 3 first
         check_count = sum(
             1 for line in yaml_output.split("\n")
             if line.strip().startswith("- ") and not line.strip().startswith("- value")
         )
+        logger.info(f"[poc7] YAML generated (not saved yet) | checks={check_count}")
         return jsonify({"yaml": yaml_output, "check_count": check_count, "dataset_id": ds})
+
     except Exception as e:
         logger.error(f"DQ YAML generation (poc7) failed for dataset={ds}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
-# ── Tab 4: Data Quality (now runs real SODA checks via DuckDB — no AI) ───────
+@app.route("/api/poc7/approve", methods=["POST"])
+def approve_poc7():
+    """
+    Human-in-the-loop approval for Tab 3.
+    User reviews/edits the YAML in the textarea, then clicks Approve.
+    Only then does the YAML get saved to disk for Tab 4 to use.
+    """
+    ds = STATE["dataset_id"]
+    if not ds:
+        return jsonify({"error": "No active dataset"}), 400
+    try:
+        body = request.get_json()
+        if not body or "yaml" not in body:
+            return jsonify({"error": "No YAML data received"}), 400
+
+        yaml_text = body["yaml"].strip()
+        if not yaml_text:
+            return jsonify({"error": "YAML content is empty"}), 400
+
+        versioned_name = save_versioned(ds, "soda", yaml_text, ext="yaml")
+        logger.info(f"[poc7] YAML approved and saved | dataset={ds} | file={versioned_name}")
+
+        check_count = sum(
+            1 for line in yaml_text.split("\n")
+            if line.strip().startswith("- ") and not line.strip().startswith("- value")
+        )
+        return jsonify({"success": True, "version_file": versioned_name, "check_count": check_count})
+    except Exception as e:
+        logger.error(f"YAML approval (poc7) failed for dataset={ds}: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+# ── Tab 4: Data Quality (real SODA checks via DuckDB — no AI) ────────────────
 @app.route("/api/poc2/run", methods=["POST"])
 def run_poc2():
     ds = STATE["dataset_id"]
@@ -333,7 +576,7 @@ def run_poc2():
 
     yaml_path = os.path.join(dataset_dir(ds), "soda_latest.yaml")
     if not os.path.exists(yaml_path):
-        return jsonify({"error": "Generate the Quality Checks YAML (Tab 3) first"}), 400
+        return jsonify({"error": "Generate and approve Quality Checks YAML (Tab 3) first"}), 400
 
     try:
         tbl    = table_name(ds)
@@ -362,13 +605,9 @@ def run_poc3a():
         with open(cpath) as f:
             contract = json.load(f)
 
-        prompt = poc3a.PROMPT.format(
-            contract    = json.dumps(contract, indent=2),
-            poc1_schema = json.dumps(poc1_schema, indent=2)
-        )
-        result                   = ask_json(prompt, poc3a.SYSTEM)
-        result["_dataset_id"]    = ds
-        result["_contract_file"] = os.path.basename(cpath)
+        result                   = compare_contract_to_schema(contract, poc1_schema)
+        result["_dataset_id"]     = ds
+        result["_contract_file"]  = os.path.basename(cpath)
         save_versioned(ds, "poc3a", result)
         return jsonify(result)
     except Exception as e:
@@ -405,15 +644,8 @@ def run_poc3b():
                             for c in previous_schema.get("schema", [])]
         current_columns  = [{"column": c["column"], "data_type": c["data_type"]}
                             for c in current_schema.get("schema", [])]
-
-        prompt = poc3b.PROMPT.format(
-            previous_columns = json.dumps(previous_columns, indent=2),
-            current_columns  = json.dumps(current_columns, indent=2)
-        )
-        result                     = ask_json(prompt, poc3b.SYSTEM)
-        result["is_first_run"]     = False
-        result["compared_against"] = previous_file
-        result["_dataset_id"]      = ds
+        result = compare_schema_snapshots(previous_schema, current_schema, previous_file=previous_file)
+        result["_dataset_id"] = ds
 
         save_versioned(ds, "poc3b", result)
         return jsonify(result)

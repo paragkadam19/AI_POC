@@ -78,8 +78,13 @@ Use observed values.
 7. PATTERN CHECKS
 Detect IDs, Emails, Phone Numbers, ZIP codes.
 Use invalid_count checks for known allowed-value lists.
-Avoid regex-based checks entirely.
-If a pattern is absolutely necessary, prefer a simple failed rows check only when it can be expressed with DuckDB-safe operators like `LIKE`, `SUBSTR`, `LEFT`, `RIGHT`, `LENGTH`, `regexp_matches`, or direct comparisons.
+For strict format validations, it is acceptable and preferred to use failed rows checks with DuckDB-safe regex via `REGEXP` / `regexp_matches`.
+Examples:
+  - PAN: exactly 5 uppercase letters + 4 digits + 1 uppercase letter
+  - Mobile: exactly 10 digits
+  - PIN code: exactly 6 digits
+Do not describe PAN as just "alphanumeric 10 characters".
+If generating a PAN rule, use a strict regex-based check and name it as government format validation.
 
 8. LOW CARDINALITY CHECKS
 If low-cardinality values provided, generate:
@@ -117,6 +122,12 @@ Validate: integer, decimal, date, timestamp, boolean, string using Soda syntax.
 
 15. DATA QUALITY NAMES
 EVERY check must have: name: DQ-### Description
+All `name` values must be safe YAML plain scalars or quoted strings.
+Do not include unquoted colons (`:`), line breaks, or YAML-like key/value
+text inside names. If a description needs a colon or extra explanation,
+put it in a quoted string or move it into the SQL fail query comment-free.
+If any `name`, `summary`, or other text contains a colon, quote the entire
+string so the YAML stays valid.
 
 16. Conditional / Dependency Checks (Column-Controlled Mandatory Fields)
 

@@ -3,6 +3,5 @@ __pycache__/
 *.pyc
 .env
 venv/
-*.ducdb
-*.log
 storage/
+*.duckdb/
