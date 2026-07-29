@@ -39,10 +39,10 @@ if load_dotenv:
     pkg_env  = os.path.join(BASE_DIR, ".env")
     loaded = False
     if os.path.exists(root_env):
-        loaded = bool(load_dotenv(root_env, override=False)) or loaded
+        loaded = bool(load_dotenv(root_env, override=True)) or loaded
         logger.info(f"[env] loaded .env from {root_env}")
     if os.path.exists(pkg_env):
-        loaded = bool(load_dotenv(pkg_env, override=False)) or loaded
+        loaded = bool(load_dotenv(pkg_env, override=True)) or loaded
         logger.info(f"[env] loaded .env from {pkg_env}")
     if not loaded:
         logger.info("[env] no .env file found in project root or poc_package/")
@@ -60,13 +60,31 @@ import mfg_poc8_nl_sql as poc8
 from bedrock_client import ask_json, ask
 from prompt_builder import build_schema_discovery_prompt
 from soda_executor import run_soda_checks_from_yaml, sanitize_soda_yaml_text
-from kb_manager import (
-    # class-based API (new)
-    init_kb_manager, get_kb_manager,
-    # function-based API (existing — still used by persist_kb etc.)
-    persist_kb, refresh_kb_from_duckdb, should_refresh_kb,
-    upsert_example_pair, upsert_join_edges,
-)
+# Class-based KB API (new KBManager — may live in engines/kb_manager.py)
+from kb_manager import init_kb_manager, get_kb_manager
+
+# Function-based KB API (original file-store helpers).
+# Try to import; fall back to no-op stubs if the new kb_manager doesn't have them.
+try:
+    from kb_manager import (
+        persist_kb, refresh_kb_from_duckdb, should_refresh_kb,
+        upsert_example_pair, upsert_join_edges,
+    )
+except ImportError:
+    def persist_kb(storage_dir, dataset_id, schema_profile, table_name=None):
+        return {"documents_written": 0, "join_edges": 0}
+
+    def refresh_kb_from_duckdb(db_file, storage_dir):
+        return {"tables_indexed": 0, "join_edges": 0}
+
+    def should_refresh_kb(storage_dir):
+        return False
+
+    def upsert_example_pair(storage_dir, dataset_id, question, sql, tables, tags=None):
+        return {"success": False}
+
+    def upsert_join_edges(storage_dir, edges):
+        return {"success": False}
 from duckdb_helper import (
     ingest_csv, get_preview, get_full_metadata_for_ai,
     SAMPLE_ROWS_SCHEMA,
@@ -169,7 +187,63 @@ def contract_path(dataset_id: str) -> str:
     return os.path.join(CONTRACTS_DIR, f"{dataset_id}_contract.json")
 
 def table_name(dataset_id: str) -> str:
-    return dataset_id
+    name = re.sub(r"[^a-zA-Z0-9_]", "_", dataset_id or "").strip("_")
+    if not name:
+        name = "dataset"
+    if not re.match(r"^[A-Za-z_]", name):
+        name = f"t_{name}"
+    return name
+
+
+AUDIT_COLUMN_NAMES = {"sys_date", "sys_active", "file_path"}
+
+
+def strip_audit_columns(schema_profile: dict) -> dict:
+    if not isinstance(schema_profile, dict):
+        return schema_profile
+    cleaned = json.loads(json.dumps(schema_profile))
+    schema = cleaned.get("schema")
+    if isinstance(schema, list):
+        cleaned["schema"] = [
+            col for col in schema
+            if str(col.get("column", "")).strip().lower() not in AUDIT_COLUMN_NAMES
+        ]
+        cleaned["total_columns"] = len(cleaned["schema"])
+    return cleaned
+
+
+def remove_audit_checks_from_yaml(yaml_text: str) -> str:
+    if not yaml_text:
+        return yaml_text
+
+    lines = yaml_text.splitlines()
+    out = []
+    skip = False
+    current_indent = 0
+
+    for line in lines:
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        lower = stripped.lower()
+        mentions_audit = any(name in lower for name in AUDIT_COLUMN_NAMES)
+
+        if stripped.startswith("- ") and mentions_audit:
+            skip = True
+            current_indent = indent
+            continue
+
+        if skip:
+            if stripped.startswith("- ") and indent <= current_indent:
+                skip = False
+            elif stripped and indent > current_indent:
+                continue
+            else:
+                skip = False
+
+        if not skip:
+            out.append(line)
+
+    return "\n".join(out)
 
 def maybe_refresh_kb() -> None:
     if should_refresh_kb(STORAGE_DIR):
@@ -504,6 +578,7 @@ def run_poc7():
         return jsonify({"error": "Schema Discovery must be approved first (Tab 2 → Approve & Save)."}), 400
 
     try:
+        schema_profile = strip_audit_columns(schema_profile)
         schema_json = json.dumps(schema_profile, indent=2)
         prompt = poc7.PROMPT.replace("{table}", table_name(ds)).replace("{schema_profile}", schema_json)
         logger.info(f"[poc7] using approved poc1_latest.json | dataset={ds}")
@@ -514,6 +589,7 @@ def run_poc7():
         if yaml_output.endswith("```"):
             yaml_output = "\n".join(yaml_output.split("\n")[:-1])
         yaml_output = yaml_output.strip()
+        yaml_output = remove_audit_checks_from_yaml(yaml_output)
 
         check_count = sum(
             1 for line in yaml_output.split("\n")

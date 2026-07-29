@@ -297,59 +297,11 @@ def parse_check_string(check_str: str, table_name: str,
 
 def _normalize_duckdb_regex(sql: str) -> str:
     """
-    Rewrite Soda-style REGEXP operators into DuckDB-compatible regexp_matches()
-    calls so failed-rows queries can actually execute.
+    Best-effort cleanup for regex expressions.
+
+    The prompt should already generate DuckDB-safe regex syntax. This helper
+    now only performs light normalization for legacy inputs.
     """
-    sql = re.sub(r"\bREGEXP_LIKE\s*\(", "regexp_matches(", sql, flags=re.IGNORECASE)
-
-    # Rewrite infix REGEXP expressions:
-    #   col REGEXP 'pattern'
-    #   NOT col REGEXP 'pattern'
-    # into DuckDB's regexp_matches(col, 'pattern').
-    sql = re.sub(
-        r"(?<!\w)([A-Za-z_][\w\.]*)\s+REGEXP\s+'([^']+)'",
-        lambda m: f"regexp_matches({m.group(1)}, '{m.group(2)}')",
-        sql,
-        flags=re.IGNORECASE,
-    )
-
-    # Rewrite the most common Soda pattern:
-    #   WHERE col NOT REGEXP '...'
-    # into DuckDB:
-    #   WHERE NOT regexp_matches(col, '...')
-    sql = re.sub(
-        r"\bWHERE\s+([^\n;]+?)\s+NOT\s+REGEXP\s+'([^']+)'",
-        lambda m: f"WHERE NOT regexp_matches({m.group(1).strip()}, '{m.group(2)}')",
-        sql,
-        flags=re.IGNORECASE,
-    )
-
-    # Rewrite clauses inside AND/OR blocks:
-    #   AND col NOT REGEXP '...'
-    sql = re.sub(
-        r"\bAND\s+([^\n;]+?)\s+NOT\s+REGEXP\s+'([^']+)'",
-        lambda m: f"AND NOT regexp_matches({m.group(1).strip()}, '{m.group(2)}')",
-        sql,
-        flags=re.IGNORECASE,
-    )
-
-    # Positive regex form, if it appears:
-    #   WHERE col REGEXP '...'
-    sql = re.sub(
-        r"\bWHERE\s+([^\n;]+?)\s+REGEXP\s+'([^']+)'",
-        lambda m: f"WHERE regexp_matches({m.group(1).strip()}, '{m.group(2)}')",
-        sql,
-        flags=re.IGNORECASE,
-    )
-    sql = re.sub(
-        r"\bAND\s+([^\n;]+?)\s+REGEXP\s+'([^']+)'",
-        lambda m: f"AND regexp_matches({m.group(1).strip()}, '{m.group(2)}')",
-        sql,
-        flags=re.IGNORECASE,
-    )
-
-    sql = re.sub(r"\bNOT\s+regexp_matches\(", "NOT regexp_matches(", sql, flags=re.IGNORECASE)
-
     return sql
 
 
@@ -372,6 +324,10 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
         expected = check["expected"]
 
         try:
+            logger.info(
+                f"[soda] executing check | id={check_id} name={check_name} type={check_type} "
+                f"sql={sql_query} expected={expected}"
+            )
             result = conn.execute(sql_query).fetchall()
             
             if check_type == "failed_rows":
@@ -392,10 +348,18 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
                             error_msg += f"  ... and {len(result) - 3} more rows"
                 else:
                     error_msg = None
+                logger.info(
+                    f"[soda] failed_rows result | id={check_id} rows={actual_value} "
+                    f"status={'PASS' if passed else 'FAIL'}"
+                )
             else:
                 # For other checks: evaluate the result
                 actual_value = result[0][0] if result else None
                 passed, error_msg = evaluate_check(actual_value, expected, check_type)
+                logger.info(
+                    f"[soda] check result | id={check_id} actual={actual_value} "
+                    f"expected={expected} status={'PASS' if passed else 'FAIL'}"
+                )
 
             if passed:
                 passed_count += 1
@@ -415,6 +379,11 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
 
         except Exception as e:
             failed_count += 1
+            logger.error(
+                f"[soda] check execution failed | id={check_id} name={check_name} "
+                f"type={check_type} sql={sql_query} error={e}",
+                exc_info=True,
+            )
             results.append({
                 "check_id": check_id,
                 "check_name": check_name,

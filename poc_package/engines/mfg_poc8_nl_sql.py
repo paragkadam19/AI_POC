@@ -1,756 +1,472 @@
 """
-Tab 8: NL→SQL Query Builder (POC 8)
-====================================
+mfg_poc8_nl_sql.py — Natural Language → SQL Query Builder
+===========================================================
+Tab 8: Convert natural language questions into DuckDB SQL.
 
-FULLY DYNAMIC - No hardcoding
-Fully integrated with KB Manager
+Flow:
+  1. Retrieve relevant tables using KB Manager (vector semantic search)
+  2. Expand via join graph to connect tables
+  3. Build schema context from retrieved tables
+  4. Send to Claude with few-shot examples
+  5. Claude generates SQL
+  6. Execute and return results + metadata
 
-Features:
-- Dynamic catalog loading from KB
-- Few-shot learning from kb_examples
-- Business context from kb_glossary
-- Join discovery from kb_joins
-- Dynamic parameters (no hardcoding)
+Key change: Now uses kb_manager.retrieve_by_vector() for semantic retrieval
+instead of bag-of-words. This means real vector similarity search powered by
+Bedrock Titan embeddings and DuckDB VSS HNSW index.
 """
 
 import json
-import math
-import os
 import re
-from collections import defaultdict, deque
+from collections import defaultdict
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
 import duckdb
+
 from logger_config import get_logger
 
 logger = get_logger(__name__)
 
+# Global KB Manager ref (wired in by app.py via set_kb_manager)
+_KB_MANAGER: Optional[Any] = None
+
+
+def set_kb_manager(kb_manager):
+    """Called by app.py to wire in the KB Manager singleton."""
+    global _KB_MANAGER
+    _KB_MANAGER = kb_manager
+    logger.info("[poc8] KB Manager wired in")
+
+
 # ============================================================================
-# IMPORTS: KB Manager (will be injected from app.py)
+# RETRIEVAL: Vector semantic search via KB Manager
 # ============================================================================
 
-KB_MANAGER = None  # Will be set by app.py after import
-
-def set_kb_manager(kb_mgr):
-    """Set KB Manager instance."""
-    global KB_MANAGER
-    KB_MANAGER = kb_mgr
-    logger.info("[poc8] KB Manager attached")
-
-# ============================================================================
-# SECTION 1: DYNAMIC INFERENCE FUNCTIONS
-# ============================================================================
-
-def infer_join_keys_from_kb() -> Set[str]:
-    """Get join keys from KB Manager."""
-    if KB_MANAGER:
-        return KB_MANAGER.infer_join_keys()
-    return set()
-
-def infer_max_hops_from_graph(join_graph: Dict[str, List]) -> int:
+def retrieve_tables_vector(question: str, top_k: int = 15) -> Tuple[List[str], List[str]]:
     """
-    Infer optimal max_hops from actual graph structure.
-    
-    Minimum of 4, maximum of 8.
+    Use KB Manager's vector semantic search to find relevant tables.
+    Returns (table_names, warnings).
+
+    Retrieves documents (columns or tables) most similar to the question
+    using DuckDB VSS HNSW cosine search over Titan embeddings.
     """
-    if not join_graph:
-        return 4
-    
-    all_nodes = set(join_graph.keys())
-    if len(all_nodes) < 2:
-        return 2
-    
-    max_path_length = 1
-    sample_size = min(10, len(all_nodes))
-    
-    # Sample paths to estimate diameter
-    for start in list(all_nodes)[:sample_size]:
-        for goal in list(all_nodes)[:sample_size]:
-            if start != goal:
-                path = _shortest_path(start, goal, join_graph, max_hops=10)
-                if path:
-                    max_path_length = max(max_path_length, len(path) - 1)
-    
-    # Return: diameter + 1, min 4, max 8
-    recommended = max(4, min(max_path_length + 1, 8))
-    logger.info(f"[poc8] Inferred max_hops={recommended} from graph diameter")
-    return recommended
+    warnings = []
 
-def infer_rrf_constant(rank_lists: List[List[Tuple]]) -> int:
-    """Infer optimal RRF constant from ranking distributions."""
-    if not rank_lists or all(not rl for rl in rank_lists):
-        return 60
-    
-    ranges = []
-    for ranked in rank_lists:
-        if len(ranked) > 1:
-            scores = [score for _, score in ranked]
-            score_range = max(scores) - min(scores)
-            ranges.append(score_range)
-    
-    if not ranges:
-        return 60
-    
-    avg_range = sum(ranges) / len(ranges)
-    
-    if avg_range < 1:
-        k = 40  # Close scores, emphasize position
-    elif avg_range > 10:
-        k = 80  # Spread scores, emphasize magnitude
-    else:
-        k = 60  # Balanced
-    
-    logger.debug(f"[poc8] Inferred RRF constant k={k}")
-    return k
+    if not _KB_MANAGER:
+        logger.warning("[poc8] KB Manager not available — no semantic retrieval")
+        return [], ["KB Manager not initialized"]
 
-# ============================================================================
-# SECTION 2: TOKENIZATION & EMBEDDING
-# ============================================================================
-
-def _tokenize(text: str) -> List[str]:
-    """Tokenize text to words."""
-    return re.findall(r"[a-z0-9]+", (text or "").lower())
-
-def _embed_text(text: str) -> Dict[str, float]:
-    """Convert text to bag-of-words vector (normalized)."""
-    tokens = _tokenize(text)
-    vec = defaultdict(float)
-    for token in tokens:
-        vec[token] += 1.0
-    
-    norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
-    return {k: v / norm for k, v in vec.items()}
-
-def _cosine_sim(a: Dict[str, float], b: Dict[str, float]) -> float:
-    """Calculate cosine similarity between vectors."""
-    return sum(a.get(k, 0.0) * v for k, v in b.items())
-
-def _build_document(table_name: str, table_meta: Dict[str, Any]) -> str:
-    """Build searchable document from table metadata."""
-    cols = table_meta.get("columns", [])
-    parts = [table_name]
-    
-    if table_meta.get("description"):
-        parts.append(table_meta["description"])
-    
-    for col in cols:
-        col_parts = [
-            col.get("column") or col.get("name") or "",
-            col.get("data_type") or "",
-            col.get("business_meaning") or ""
-        ]
-        parts.append(" ".join([str(p) for p in col_parts if p]))
-    
-    return " | ".join(parts)
-
-# ============================================================================
-# SECTION 3: RETRIEVAL & RANKING
-# ============================================================================
-
-def _reciprocal_rank_fusion(rank_lists: List[List[Tuple]], k: Optional[int] = None) -> Dict[str, float]:
-    """Combine multiple rankings using RRF."""
-    if k is None:
-        k = infer_rrf_constant(rank_lists)
-    
-    fused = defaultdict(float)
-    for ranked in rank_lists:
-        for rank, (item, _score) in enumerate(ranked, start=1):
-            fused[item] += 1.0 / (k + rank)
-    
-    return fused
-
-def hybrid_retrieve_tables(question: str, catalog: Dict[str, Dict], top_k: int = 5) -> List[str]:
-    """
-    Retrieve relevant tables using hybrid search.
-    
-    Combines:
-    1. Semantic search (meaning-based)
-    2. Keyword search (word overlap)
-    3. RRF fusion (ranking combination)
-    """
-    q_vec = _embed_text(question)
-    q_tokens = set(_tokenize(question))
-    
-    semantic_results = []
-    keyword_results = []
-    
-    for table, meta in catalog.items():
-        # Semantic search
-        doc = _build_document(table, meta)
-        doc_vec = _embed_text(doc)
-        semantic_sim = _cosine_sim(q_vec, doc_vec)
-        semantic_results.append((table, semantic_sim))
-        
-        # Keyword search
-        doc_tokens = set(_tokenize(doc))
-        token_overlap = len(doc_tokens & q_tokens)
-        keyword_results.append((table, float(token_overlap)))
-    
-    # Sort by score
-    semantic_results.sort(key=lambda x: x[1], reverse=True)
-    keyword_results.sort(key=lambda x: x[1], reverse=True)
-    
-    # RRF fusion
-    fused = _reciprocal_rank_fusion([semantic_results[:50], keyword_results[:50]])
-    ranked = sorted(fused.items(), key=lambda x: x[1], reverse=True)
-    
-    result = [table for table, _score in ranked[:top_k]]
-    logger.debug(f"[poc8] Retrieved {len(result)} tables: {result}")
-    return result
-
-# ============================================================================
-# SECTION 4: JOIN GRAPH
-# ============================================================================
-
-def _safe_ident(name: str) -> str:
-    """Escape SQL identifier."""
-    return '"' + name.replace('"', '""') + '"'
-
-def _fetch_table_metadata(conn: duckdb.DuckDBPyConnection, table_name: str) -> Dict[str, Any]:
-    """Fetch metadata for a table from DuckDB."""
     try:
-        describe_rows = conn.execute(f"DESCRIBE {_safe_ident(table_name)}").fetchall()
-        row_count = conn.execute(f"SELECT COUNT(*) FROM {_safe_ident(table_name)}").fetchone()[0]
-    except Exception as e:
-        logger.warning(f"[poc8] Failed to describe {table_name}: {e}")
-        return {}
-    
-    columns = []
-    for col_name, col_type, *_rest in describe_rows:
-        columns.append({
-            "column": col_name,
-            "data_type": col_type,
-        })
-    
-    return {
-        "table_name": table_name,
-        "description": f"{table_name} ({row_count} rows)",
-        "row_count": int(row_count),
-        "columns": columns,
-    }
+        # Real vector retrieval via kb_manager
+        results = _KB_MANAGER.retrieve_by_vector(question, top_k=top_k)
 
-def build_join_graph(catalog: Dict[str, Dict], db_file: Optional[str] = None) -> Dict[str, List[Tuple[str, str]]]:
-    """
-    Build join graph from FK relationships.
-    
-    Tries in order:
-    1. Declared FKs from DuckDB
-    2. Heuristic discovery from column names
-    """
-    graph = defaultdict(list)
-    table_names = list(catalog.keys())
-    
-    # Get join keys (dynamic)
-    join_keys = infer_join_keys_from_kb()
-    if not join_keys:
-        # Fallback: learn from column names
-        all_columns = []
-        for table, meta in catalog.items():
-            for col in meta.get("columns", []):
-                col_name = col.get("column", "").lower()
-                if col_name:
-                    all_columns.append(col_name)
-        
-        pattern_scores = defaultdict(int)
-        for col_name in all_columns:
-            if col_name == "id" or col_name.endswith("_id") or col_name.endswith("_key"):
-                pattern_scores[col_name] += 10
-        
-        join_keys = {col for col, score in pattern_scores.items() if score >= 6}
-    
-    # Try 1: Query kb_joins from DuckDB (if available)
-    if db_file:
-        try:
-            conn = duckdb.connect(db_file, read_only=True)
-            
-            # Check if kb_joins table exists
-            table_check = conn.execute("""
-                SELECT COUNT(*) FROM information_schema.tables 
-                WHERE table_name = 'kb_joins'
-            """).fetchone()[0]
-            
-            if table_check > 0:
-                fk_rows = conn.execute("""
-                    SELECT table1, column1, table2, column2
-                    FROM kb_joins
-                """).fetchall()
-                
-                for table1, col1, table2, col2 in fk_rows:
-                    if table1 in catalog and table2 in catalog:
-                        graph[table1].append((table2, f"{col1}->{col2}"))
-                        graph[table2].append((table1, f"{col2}<-{col1}"))
-                
-                if fk_rows:
-                    logger.info(f"[poc8] Loaded {len(fk_rows)} joins from kb_joins")
-            
-            conn.close()
-        except Exception as e:
-            logger.debug(f"[poc8] kb_joins load failed: {e}")
-    
-    # Try 2: Heuristic discovery from column names
-    for left in table_names:
-        left_cols = set(c.get("column", "").lower() for c in catalog[left].get("columns", []))
-        
-        for right in table_names:
-            if left == right:
+        if not results:
+            logger.warning("[poc8] VSS returned no results — KB may be empty")
+            return [], ["No matching tables found in KB"]
+
+        # Keep the best score per table and drop only near-zero matches.
+        table_scores: Dict[str, float] = {}
+        for doc in results:
+            tname = doc.get("table_name")
+            score = float(doc.get("score", 0.0) or 0.0)
+            if not tname:
                 continue
-            
-            right_cols = set(c.get("column", "").lower() for c in catalog[right].get("columns", []))
-            
-            # Find shared columns that look like join keys
-            shared = {col for col in (left_cols & right_cols) if col in join_keys}
-            
-            for col in sorted(shared):
-                # Only add if not already discovered
-                if right not in [n for n, _ in graph[left]]:
-                    graph[left].append((right, col))
-    
-    logger.info(f"[poc8] Built join graph: {len(graph)} source tables, "
-               f"{sum(len(v) for v in graph.values())} relationships")
-    return dict(graph)
+            if score < 0.05:
+                continue
+            if tname not in table_scores or score > table_scores[tname]:
+                table_scores[tname] = score
+            logger.debug(
+                f"[poc8] Vector retrieved: {tname} "
+                f"(doc_type={doc.get('doc_type')}, "
+                f"score={score:.3f})"
+            )
+
+        tables = [t for t, _ in sorted(table_scores.items(), key=lambda item: item[1], reverse=True)]
+        if not tables:
+            warnings.append("Vector search found documents but no table names extracted")
+            return [], warnings
+
+        logger.info(f"[poc8] Vector retrieval found {len(tables)} tables from {len(results)} documents")
+        return tables, warnings
+
+    except Exception as e:
+        msg = f"Vector retrieval failed, falling back to keyword search: {e}"
+        logger.warning(f"[poc8] {msg}")
+        warnings.append(msg)
+        return [], warnings
+
 
 # ============================================================================
-# SECTION 5: GRAPH ALGORITHMS
+# JOIN GRAPH: Confidence-aware expansion
 # ============================================================================
 
-def _connected_components(nodes: set, graph: Dict[str, List]) -> List[set]:
-    """Find connected components in join graph."""
-    visited = set()
-    components = []
-    
+def _shortest_path(
+    start: str,
+    goal: str,
+    graph: Dict[str, List[Tuple[str, str]]],
+    max_hops: int = 5,
+    min_confidence: float = 0.65,
+    edge_confidence: Dict[Tuple[str, str], float] = None,
+) -> Optional[List[str]]:
+    """
+    BFS shortest path through edges with confidence >= min_confidence.
+    Low-confidence edges (heuristics) are blocked by default.
+    """
+    from collections import deque
+
+    edge_confidence = edge_confidence or {}
+    queue = deque([(start, [start])])
+    seen = {start}
+
+    while queue:
+        node, path = queue.popleft()
+        if len(path) - 1 > max_hops:
+            continue
+        if node == goal:
+            return path
+
+        for neighbor, _col in graph.get(node, []):
+            if neighbor in seen:
+                continue
+            conf = edge_confidence.get((node, neighbor), 0.0)
+            if conf < min_confidence:
+                continue
+            seen.add(neighbor)
+            queue.append((neighbor, path + [neighbor]))
+
+    return None
+
+
+def _connected_components(nodes: set, graph: Dict) -> List[set]:
+    """Find connected components in an undirected graph."""
+    from collections import deque
+
+    visited, components = set(), []
     for start in nodes:
         if start in visited:
             continue
-        
-        comp = set()
-        queue = deque([start])
+        comp, queue = set(), deque([start])
         visited.add(start)
-        
         while queue:
             node = queue.popleft()
             comp.add(node)
-            
             for neighbor, _col in graph.get(node, []):
                 if neighbor in nodes and neighbor not in visited:
                     visited.add(neighbor)
                     queue.append(neighbor)
-        
         components.append(comp)
-    
     return components
 
-def _shortest_path(start: str, goal: str, graph: Dict[str, List], max_hops: int = 4) -> Optional[List[str]]:
-    """Find shortest path between tables using BFS."""
-    queue = deque([(start, [start])])
-    seen = {start}
-    
-    while queue:
-        node, path = queue.popleft()
-        
-        if len(path) - 1 > max_hops:
-            continue
-        
-        if node == goal:
-            return path
-        
-        for neighbor, _col in graph.get(node, []):
-            if neighbor not in seen:
-                seen.add(neighbor)
-                queue.append((neighbor, path + [neighbor]))
-    
-    return None
 
-def expand_via_join_graph(candidate_tables: List[str], join_graph: Dict[str, List], 
-                         max_hops: Optional[int] = None) -> Dict[str, Any]:
+def expand_via_join_graph(
+    candidate_tables: List[str],
+    join_graph: Dict[str, List[Tuple[str, str]]],
+    edge_confidence: Dict[Tuple[str, str], float] = None,
+    max_hops: int = 5,
+    min_bridge_confidence: float = 0.65,
+) -> Dict[str, Any]:
     """
-    Expand tables with bridge tables and join paths.
-    
-    Uses dynamic max_hops if not provided.
+    Bridge disconnected table components ONLY through high-confidence edges.
+    Returns {tables, bridges_added, join_paths, unresolved_components}.
     """
-    if max_hops is None:
-        max_hops = infer_max_hops_from_graph(join_graph)
-    
     candidates = set(candidate_tables)
+    edge_confidence = edge_confidence or {}
+
     if not candidates:
-        return {"tables": [], "bridges_added": [], "join_paths": []}
-    
-    # Find connected components
+        return {
+            "tables": [],
+            "bridges_added": [],
+            "join_paths": [],
+            "unresolved_components": [],
+        }
+
     components = _connected_components(candidates, join_graph)
     bridges_added = set()
-    
-    # If disconnected, add bridges
+    unresolved_components: List[List[str]] = []
+
     if len(components) > 1:
         merged = set(components[0])
         for component in components[1:]:
+            bridge_found = False
             for left in merged:
                 for right in component:
-                    path = _shortest_path(left, right, join_graph, max_hops=max_hops)
-                    if path and len(path) > 2:
+                    path = _shortest_path(
+                        left, right, join_graph,
+                        max_hops=max_hops,
+                        min_confidence=min_bridge_confidence,
+                        edge_confidence=edge_confidence,
+                    )
+                    if path:
                         for bridge_table in path[1:-1]:
                             bridges_added.add(bridge_table)
+                        bridge_found = True
                         break
+                if bridge_found:
+                    break
+
+            if bridge_found:
+                merged |= component
+            else:
+                # No confident path — report it, don't guess
+                unresolved_components.append(sorted(component))
     else:
         merged = set(candidates)
-    
-    # Final tables
+
     final_tables = sorted(candidates | bridges_added)
-    
-    # Build join paths
     path_edges = []
+    seen_pairs = set()
+
     for t in final_tables:
         for neighbor, join_col in join_graph.get(t, []):
             if neighbor in final_tables:
-                path_edges.append({
-                    "left": t,
-                    "right": neighbor,
-                    "join_column": join_col
-                })
-    
-    logger.info(f"[poc8] Expanded: {len(final_tables)} tables, "
-               f"{len(bridges_added)} bridges, {len(path_edges)} joins")
-    
+                pair = tuple(sorted([t, neighbor]))
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    path_edges.append({
+                        "left": t,
+                        "right": neighbor,
+                        "join_column": join_col,
+                        "confidence": edge_confidence.get((t, neighbor), 0.0),
+                    })
+
     return {
         "tables": final_tables,
         "bridges_added": sorted(bridges_added),
         "join_paths": path_edges,
+        "unresolved_components": unresolved_components,
     }
 
+
 # ============================================================================
-# SECTION 6: CATALOG LOADING (Using KB)
+# SCHEMA CONTEXT BUILDING
 # ============================================================================
 
-def load_catalog(db_file: str, storage_dir: str, ds: Optional[str] = None) -> Dict[str, Dict]:
+def _build_document(table_meta: dict) -> str:
     """
-    Load catalog from KB Manager or fallback sources.
-    
-    Priority:
-    1. KB Manager (kb_catalog + kb_documents tables)
-    2. kb_catalog.json file
-    3. DuckDB introspection
-    4. Approved schema (Tab 2)
+    Build a rich text document from table metadata for schema context.
+    Includes table name, column names, types, meanings, samples.
     """
-    # Try 1: KB Manager
-    if KB_MANAGER:
-        try:
-            catalog = KB_MANAGER.load_catalog()
-            if catalog:
-                logger.info(f"[poc8] Loaded catalog from KB Manager ({len(catalog)} tables)")
-                return catalog
-        except Exception as e:
-            logger.warning(f"[poc8] KB Manager load failed: {e}")
-    
-    # Try 2: kb_catalog.json file
-    catalog_path = os.path.join(storage_dir, "kb_catalog.json")
-    if os.path.exists(catalog_path):
-        try:
-            with open(catalog_path) as f:
-                data = json.load(f)
-            if isinstance(data, dict) and data:
-                logger.info(f"[poc8] Loaded catalog from {catalog_path}")
-                return data
-        except Exception as e:
-            logger.warning(f"[poc8] kb_catalog.json load failed: {e}")
-    
-    # Try 3: DuckDB introspection
+    tname = table_meta.get("table_name", "unknown")
+    cols = table_meta.get("columns", [])
+
+    lines = [f"TABLE: {tname}"]
+    for col in cols:
+        cname = col.get("column", "")
+        ctype = col.get("data_type", "")
+        meaning = col.get("business_meaning", "")
+        sample = " | ".join(str(v) for v in (col.get("sample_values") or [])[:2])
+
+        parts = [cname, ctype]
+        if meaning:
+            parts.append(f"({meaning})")
+        if sample:
+            parts.append(f"e.g. {sample}")
+
+        lines.append("  " + " ".join(parts))
+
+    return "\n".join(lines)
+
+
+def _build_schema_context(catalog: Dict[str, Any], tables: List[str]) -> str:
+    """Build schema context string from catalog for specified tables."""
+    docs = []
+    for tname in sorted(tables):
+        if tname in catalog:
+            docs.append(_build_document(catalog[tname]))
+
+    return "\n\n".join(docs) if docs else "(No schema found for selected tables)"
+
+
+# ============================================================================
+# MAIN QUESTION → SQL FLOW
+# ============================================================================
+
+def question_to_sql(
+    db_file: str,
+    ds: str,
+    storage_dir: str,
+    question: str,
+    ask_json_fn=None,
+) -> Dict[str, Any]:
+    """
+    Convert a natural language question into SQL using KB-aware retrieval.
+
+    Returns {ok, sql, tables, join_paths, warnings, error, ...}
+    """
+    if not ask_json_fn:
+        from bedrock_client import ask_json
+        ask_json_fn = ask_json
+
+    warnings = []
+    tables = []
+    join_paths = []
+
     try:
-        conn = duckdb.connect(db_file, read_only=True)
-        
-        rows = conn.execute("""
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = 'main'
-              AND table_type = 'BASE TABLE'
-            ORDER BY table_name
-        """).fetchall()
-        
-        catalog = {}
-        for (table_name,) in rows:
-            meta = _fetch_table_metadata(conn, table_name)
-            if meta:
-                catalog[table_name] = meta
-        
-        conn.close()
-        
-        if catalog:
-            logger.info(f"[poc8] Loaded catalog from DuckDB introspection ({len(catalog)} tables)")
-            return catalog
+        # 1. RETRIEVE: Vector semantic search via KB Manager
+        logger.info(f"[poc8] Starting vector retrieval for: {question[:60]}...")
+        retrieved, retrieval_warnings = retrieve_tables_vector(question, top_k=15)
+        warnings.extend(retrieval_warnings)
+
+        if not retrieved:
+            logger.warning("[poc8] Vector retrieval returned no tables")
+            return {
+                "ok": False,
+                "error": "No relevant tables found for your question. "
+                         "Try uploading data or rephrasing.",
+                "tables": [],
+                "warnings": warnings,
+            }
+
+        tables = retrieved
+        logger.info(f"[poc8] Retrieved {len(tables)} tables: {tables}")
+
+        # 2. EXPAND: Load KB and join graph
+        if not _KB_MANAGER:
+            logger.warning("[poc8] KB Manager missing — cannot load catalog/joins")
+            return {
+                "ok": False,
+                "error": "KB Manager not initialized",
+                "tables": tables,
+                "warnings": warnings,
+            }
+
+        catalog = _KB_MANAGER.load_catalog(force_refresh=False)
+        joins_raw = _KB_MANAGER.load_joins(force_refresh=False)
+
+        # Build join graph + edge confidence from kb_manager's data
+        join_graph: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+        edge_confidence: Dict[Tuple[str, str], float] = {}
+
+        for src_table, targets in (joins_raw or {}).items():
+            for tgt_table, join_col in targets:
+                join_graph[src_table].append((tgt_table, join_col))
+                # Default confidence for KB-loaded edges
+                edge_confidence[(src_table, tgt_table)] = 0.85
+
+        # Expand via joins with confidence filtering
+        expanded = expand_via_join_graph(
+            tables,
+            join_graph,
+            edge_confidence=edge_confidence,
+            min_bridge_confidence=0.65,
+        )
+
+        final_tables = expanded.get("tables", [])
+        join_paths = expanded.get("join_paths", [])
+        unresolved = expanded.get("unresolved_components", [])
+
+        for comp in unresolved:
+            warnings.append(
+                f"Tables {comp} could not be confidently joined. "
+                f"No high-confidence join path exists."
+            )
+
+        logger.info(
+            f"[poc8] Expanded to {len(final_tables)} tables "
+            f"({len(expanded.get('bridges_added', []))} bridges added)"
+        )
+
+        # 3. BUILD CONTEXT: Schema for Claude
+        schema_context = _build_schema_context(catalog, final_tables)
+
+        # 4. LOAD EXAMPLES: Few-shot pairs
+        examples = _KB_MANAGER.load_examples(min_quality=0.80, limit=3)
+
+        # 5. PROMPT: Few-shot NL→SQL
+        few_shot = "\n\n".join(
+            f"Q: {ex['question']}\nA: {ex['sql']}"
+            for ex in examples
+        )
+
+        system_prompt = """You are an expert SQL engineer.
+Convert natural language questions into DuckDB SQL.
+- Only SELECT, WITH, or EXPLAIN queries
+- No INSERT/UPDATE/DELETE
+- No schema modifications
+- Use DuckDB syntax only
+- Return ONLY JSON with a SQL field, for example {"sql":"SELECT ..."}
+- If you prefer, you may also return {"query":"SELECT ..."}"""
+
+        user_prompt = f"""
+SCHEMA:
+{schema_context}
+
+EXAMPLES:
+{few_shot if few_shot else "(No examples yet)"}
+
+QUESTION: {question}
+
+Generate the SQL query."""
+
+        logger.info(f"[poc8] Calling Claude with {len(final_tables)} tables in context...")
+        response = ask_json_fn(user_prompt, system_prompt)
+
+        if not response:
+            return {
+                "ok": False,
+                "error": "Claude returned empty response",
+                "tables": final_tables,
+                "warnings": warnings,
+            }
+
+        sql = (
+            response.get("sql")
+            or response.get("query")
+            or response.get("answer")
+            or ""
+        ).strip()
+
+        if not sql or not sql.upper().startswith(("SELECT", "WITH", "EXPLAIN")):
+            return {
+                "ok": False,
+                "error": f"Invalid SQL generated: {sql[:100]}",
+                "detail": f"Model response keys: {list(response.keys())}",
+                "tables": final_tables,
+                "warnings": warnings,
+            }
+
+        logger.info(f"[poc8] SQL generated: {sql[:80]}...")
+
+        # 6. EXECUTE
+        try:
+            conn = duckdb.connect(db_file, read_only=True)
+            result_rows = conn.execute(sql).fetchall()
+            result_cols = [d[0] for d in conn.description] if conn.description else []
+            conn.close()
+
+            # Convert to dicts
+            results = [dict(zip(result_cols, row)) for row in result_rows]
+
+            return {
+                "ok": True,
+                "sql": sql,
+                "tables": final_tables,
+                "join_paths": join_paths,
+                "rows": results,
+                "row_count": len(results),
+                "columns": result_cols,
+                "warnings": warnings,
+                "retrieval_method": "vector_semantic_search",
+            }
+
+        except Exception as exec_err:
+            logger.error(f"[poc8] SQL execution failed: {exec_err}")
+            return {
+                "ok": False,
+                "sql": sql,
+                "error": f"SQL execution failed: {str(exec_err)}",
+                "detail": str(exec_err),
+                "tables": final_tables,
+                "join_paths": join_paths,
+                "warnings": warnings,
+            }
+
     except Exception as e:
-        logger.warning(f"[poc8] DuckDB introspection failed: {e}")
-    
-    # Try 4: Approved schema (Tab 2)
-    if ds:
-        try:
-            approved_path = os.path.join(storage_dir, "outputs", ds, "poc1_latest.json")
-            if os.path.exists(approved_path):
-                with open(approved_path) as f:
-                    schema_profile = json.load(f)
-                
-                catalog = {
-                    f"tbl_{ds}": {
-                        "table_name": f"tbl_{ds}",
-                        "description": schema_profile.get("table_name", ds),
-                        "row_count": schema_profile.get("total_rows", 0),
-                        "columns": schema_profile.get("schema", []),
-                    }
-                }
-                
-                logger.info(f"[poc8] Loaded catalog from approved schema: {ds}")
-                return catalog
-        except Exception as e:
-            logger.warning(f"[poc8] Approved schema load failed: {e}")
-    
-    logger.error("[poc8] Could not load catalog from any source")
-    return {}
-
-# ============================================================================
-# SECTION 7: SQL GENERATION PROMPT BUILDING
-# ============================================================================
-
-def build_sql_generation_prompt(question: str, context: Dict[str, Any], 
-                               db_file: Optional[str] = None) -> Tuple[str, str]:
-    """
-    Build Claude prompt for SQL generation.
-    
-    Includes:
-    1. System prompt with rules
-    2. Few-shot examples from kb_examples
-    3. Business glossary from kb_glossary
-    4. Table/schema context
-    5. Join paths
-    """
-    system = """You are an expert analytics engineer generating DuckDB SQL queries.
-
-IMPORTANT RULES:
-- Return ONLY valid JSON with keys: sql, rationale, warnings
-- Use ONLY tables and columns provided in the context
-- Prefer explicit JOINs over subqueries
-- Use exact column names and table names from context
-- Add LIMIT 100 unless user asks for aggregate or full results
-- If the question is ambiguous or you cannot answer, return sql as empty string and explain in warnings
-- No markdown fences, no extra text - ONLY JSON
-
-RESPONSE FORMAT (REQUIRED):
-{
-  "sql": "SELECT ...",
-  "rationale": "Why this SQL answers the question",
-  "warnings": []
-}
-"""
-    
-    # Add few-shot examples from KB
-    if db_file and KB_MANAGER:
-        try:
-            examples = KB_MANAGER.load_examples(min_quality=0.80, limit=3)
-            
-            if examples:
-                system += "\n\n" + "="*70
-                system += "\nREFERENCE EXAMPLES (similar queries):\n"
-                system += "="*70
-                
-                for i, ex in enumerate(examples, 1):
-                    system += f"\nExample {i} ({ex.get('category', 'general')}):"
-                    system += f"\n  Q: {ex.get('question', '')}"
-                    system += f"\n  SQL: {ex.get('sql', '')}\n"
-        except Exception as e:
-            logger.debug(f"[poc8] Could not load examples: {e}")
-    
-    # Add glossary from KB
-    tables = context.get("tables", [])
-    if db_file and KB_MANAGER and tables:
-        try:
-            glossary = KB_MANAGER.load_glossary(tables=tables, limit=15)
-            
-            if glossary:
-                system += "\n\n" + "="*70
-                system += "\nBUSINESS GLOSSARY (column definitions):\n"
-                system += "="*70
-                
-                for entry in glossary:
-                    col_ref = entry.get("column_reference", "")
-                    definition = entry.get("definition", "")
-                    system += f"\n- {col_ref}: {definition}"
-        except Exception as e:
-            logger.debug(f"[poc8] Could not load glossary: {e}")
-    
-    # Add schema context
-    system += "\n\n" + "="*70
-    system += "\nAVAILABLE TABLES & SCHEMA:\n"
-    system += "="*70
-    
-    user_data = {
-        "question": question,
-        "tables": context.get("tables", []),
-        "join_paths": context.get("join_paths", []),
-        "schema_context": context.get("schema_context", {}),
-    }
-    
-    return system, json.dumps(user_data, indent=2)
-
-# ============================================================================
-# SECTION 8: SQL VALIDATION & EXECUTION
-# ============================================================================
-
-def _is_safe_select(sql: str) -> bool:
-    """Check if SQL is safe (SELECT/WITH only)."""
-    normalized = sql.strip().lower()
-    return normalized.startswith("select") or normalized.startswith("with")
-
-def _sanitize_sql(sql: str) -> str:
-    """Clean up SQL (remove markdown, trim)."""
-    sql = (sql or "").strip().rstrip(";")
-    sql = re.sub(r"^```(?:sql|json)?\s*", "", sql, flags=re.IGNORECASE)
-    sql = re.sub(r"\s*```$", "", sql)
-    return sql.strip()
-
-def _normalize_warnings(warnings) -> List[str]:
-    """Normalize warnings to list of strings."""
-    if isinstance(warnings, list):
-        return [str(w) for w in warnings if w]
-    return []
-
-def execute_sql_preview(db_file: str, sql: str, max_rows: int = 5) -> Dict[str, Any]:
-    """
-    Execute SQL and return preview.
-    
-    Safety checks:
-    1. Only allows SELECT/WITH
-    2. Validates syntax with EXPLAIN
-    3. Returns first N rows
-    """
-    sql = _sanitize_sql(sql)
-    
-    if not _is_safe_select(sql):
-        return {"ok": False, "error": "Only SELECT/WITH queries are allowed"}
-    
-    conn = duckdb.connect(db_file, read_only=True)
-    try:
-        # Validate syntax
-        conn.execute(f"EXPLAIN {sql}")
-        
-        # Add LIMIT if not present
-        if not re.search(r"\blimit\b", sql, flags=re.IGNORECASE):
-            sql = f"SELECT * FROM ({sql}) AS q LIMIT {max_rows}"
-        
-        # Execute
-        cur = conn.execute(sql)
-        cols = [d[0] for d in cur.description]
-        rows = cur.fetchall()
-        
-        return {
-            "ok": True,
-            "columns": cols,
-            "rows": [dict(zip(cols, row)) for row in rows],
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    finally:
-        conn.close()
-
-# ============================================================================
-# SECTION 9: MAIN FUNCTION
-# ============================================================================
-
-def question_to_sql(db_file: str, ds: str, storage_dir: str, question: str,
-                    ask_json_fn, model_hint: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Convert natural language question to SQL query.
-    
-    FULLY DYNAMIC:
-    - All parameters inferred from data
-    - All KB features integrated
-    - No hardcoding
-    
-    Steps:
-    1. Load catalog (from KB or fallback)
-    2. Build join graph (from kb_joins or heuristics)
-    3. Retrieve relevant tables (hybrid search)
-    4. Expand with bridge tables
-    5. Build prompt (with examples + glossary)
-    6. Call Claude
-    7. Validate and preview SQL
-    """
-    warnings: List[str] = []
-    
-    logger.info(f"[poc8] Processing question: {question[:50]}...")
-    
-    # Step 1: Load catalog
-    catalog = load_catalog(db_file, storage_dir, ds=ds)
-    if not catalog:
+        logger.error(f"[poc8] question_to_sql failed: {e}", exc_info=True)
         return {
             "ok": False,
-            "question": question,
-            "error": "No catalog found",
-            "warnings": ["Could not load table metadata"]
-        }
-    
-    # Step 2: Build join graph
-    join_graph = build_join_graph(catalog, db_file=db_file)
-    
-    # Step 3: Retrieve tables
-    retrieved = hybrid_retrieve_tables(question, catalog, 
-                                      top_k=min(5, max(1, len(catalog))))
-    logger.info(f"[poc8] Retrieved tables: {retrieved}")
-    
-    # Step 4: Expand via join graph (with dynamic max_hops)
-    max_hops = infer_max_hops_from_graph(join_graph)
-    expanded = expand_via_join_graph(retrieved, join_graph, max_hops=max_hops)
-    
-    # Step 5: Build schema context
-    schema_context = {
-        table: {
-            "description": catalog[table].get("description"),
-            "columns": catalog[table].get("columns", []),
-        }
-        for table in expanded["tables"]
-        if table in catalog
-    }
-    
-    # Step 6: Build prompt (with KB integration)
-    system, prompt = build_sql_generation_prompt(
-        question,
-        {
-            "tables": expanded["tables"],
-            "join_paths": expanded["join_paths"],
-            "schema_context": schema_context,
-        },
-        db_file=db_file
-    )
-    
-    # Step 7: Call Claude
-    raw = ask_json_fn(prompt, system, model=model_hint) if model_hint else ask_json_fn(prompt, system)
-    
-    # Step 8: Extract SQL
-    sql = _sanitize_sql(raw.get("sql", "")) if isinstance(raw, dict) else ""
-    if isinstance(raw, dict):
-        warnings.extend(_normalize_warnings(raw.get("warnings")))
-    
-    if not sql:
-        warnings.append("Model returned no SQL")
-        return {
-            "ok": False,
-            "question": question,
-            "tables": expanded["tables"],
-            "bridges_added": expanded["bridges_added"],
-            "join_paths": expanded["join_paths"],
+            "error": f"Query generation failed: {str(e)}",
+            "tables": tables,
             "warnings": warnings,
         }
-    
-    # Step 9: Execute preview
-    preview = execute_sql_preview(db_file, sql)
-    
-    # Step 10: Return result
-    return {
-        "ok": preview.get("ok", False),
-        "question": question,
-        "sql": sql,
-        "tables": expanded["tables"],
-        "bridges_added": expanded["bridges_added"],
-        "join_paths": expanded["join_paths"],
-        "warnings": warnings,
-        "preview": preview,
-        "model_output": raw,
-        "_parameters": {
-            "max_hops": max_hops,
-            "rrf_constant": 60,  # Calculated at runtime
-        }
-    }

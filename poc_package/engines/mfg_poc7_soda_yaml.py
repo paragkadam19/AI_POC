@@ -33,27 +33,19 @@ Use the FULL context:
 - sample_values: Actual data seen (shows real patterns)
 - quality_concerns: Issues flagged (high nulls, duplicates, etc.)
 - null_count / null_pct: ACTUAL null stats (not just 0 or all)
-
-Important: the ingest pipeline adds these audit columns to every table:
-- created_date
-- is_active
-- file_name
-The schema may also contain source columns with similar names; the exact
-column name is the source of truth. If a column named `is_active` is the
-ingest-added audit field, treat it as metadata only unless the schema
-profile explicitly marks it as a business/source column.
-
-Treat those as system metadata only. Do not use them as business fields,
-do not compare them against source columns, and do not generate dependency
-checks that claim they represent applicant state. If a check mentions
-"active applicants", only generate it when the source schema contains a
-real business status column that actually filters active/inactive rows.
 """
 
 PROMPT = """RULE GENERATION PRIORITY
+Use only checks that are valid in DuckDB SQL.
+DO NOT use invalid or non-DuckDB syntax or generic like-based pattern rules.
+For pattern validations, use DuckDB-compatible SQL with regexp_matches(...) inside failed rows queries.
+Eg: row_count, missing_count, duplicate_count, min(), max(), min_length(), max_length(), invalid_count, failed rows
 
-DO NOT use: alert, warn, valid_format, regex, regexp_like, RLIKE, like-based pattern rules
-ONLY use: row_count, missing_count, duplicate_count, min(), max(), min_length(), max_length(), invalid_count, failed rows
+DuckDB regex rule:
+- When you need a pattern check, write DuckDB-compatible SQL using `regexp_matches(...)`
+- For invalid rows, use `NOT regexp_matches(column, 'pattern')`
+- Do not use `column NOT REGEXP 'pattern'`
+- Keep the SQL valid DuckDB syntax inside `fail query`
 
 1. TABLE LEVEL CHECKS
 Always include checks for <table_name>:
@@ -93,13 +85,21 @@ Use observed values.
 7. PATTERN CHECKS
 Detect IDs, Emails, Phone Numbers, ZIP codes.
 Use invalid_count checks for known allowed-value lists.
-For strict format validations, it is acceptable and preferred to use failed rows checks with DuckDB-safe regex via `REGEXP` / `regexp_matches`.
+For strict format validations, use failed rows checks with DuckDB-safe regex via `regexp_matches(...)`.
 Examples:
   - PAN: exactly 5 uppercase letters + 4 digits + 1 uppercase letter
   - Mobile: exactly 10 digits
   - PIN code: exactly 6 digits
 Do not describe PAN as just "alphanumeric 10 characters".
 If generating a PAN rule, use a strict regex-based check and name it as government format validation.
+
+Example DuckDB failed-rows check:
+  failed rows:
+    name: 'DQ-101 Record ID format validation'
+    fail query: |
+      SELECT *
+      FROM <table_name>
+      WHERE NOT regexp_matches(record_id, '^BT-[0-9]{5}$')
 
 8. LOW CARDINALITY CHECKS
 If low-cardinality values provided, generate:
@@ -111,9 +111,6 @@ Include ALL known allowed values.
 
 9. UNIQUE VALUE CHECKS
 If 100% distinct or ID column → Generate duplicate_count(column)=0
-Only scope uniqueness to "active applicants" or similar subsets if the
-schema has a real source active/inactive column and the query explicitly
-filters on that source column. Never use ingest-added is_active for this.
 
 10. REFERENTIAL / MAPPING RELATIONSHIP CHECKS
 Infer relationships: State->Country, City->State, Product->Category, etc.
@@ -171,12 +168,6 @@ Generate failed rows checks for these dependencies.
 
 Generate BOTH directions of the rule where applicable:
 the presence rule (value MUST exist) and the absence rule (value must NOT exist).
-Do not compare source fields to ingest-added audit columns such as
-is_active, created_date, or file_name.
-Never generate "active applicants" wording unless the filter is applied
-to a real source status column from the schema profile. If only the audit
-column `is_active` exists, do not use it to qualify duplicate or dependency
-checks.
 
 Examples
 

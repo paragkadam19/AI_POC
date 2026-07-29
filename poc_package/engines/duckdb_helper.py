@@ -15,7 +15,7 @@ Low-cardinality columns get value_counts (not just distinct values)
 via DuckDB's histogram() aggregate, in a single combined query/scan.
 
 Every ingested table gets 3 audit columns added in the same single
-CREATE TABLE AS SELECT pass: created_date, is_active, file_name.
+CREATE TABLE AS SELECT pass: sys_date, sys_active, file_path.
 """
 import os
 import duckdb
@@ -40,37 +40,42 @@ def _connect(db_file: str, read_only: bool = False):
     return duckdb.connect(db_file, read_only=read_only, config=DUCKDB_CONFIG)
 
 
+def _quote_ident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
 # ── Ingest ─────────────────────────────────────────────────────────────────────
 def ingest_csv(csv_file: str, db_file: str, table: str, original_filename: str = None) -> dict:
     """
     Ingest CSV into DuckDB, adding 3 audit/control columns to every table
     in the same single CREATE TABLE AS SELECT pass (no extra scan needed):
 
-      - created_date : today's date, set at ingest time
-      - is_active    : boolean, true for every row by default
-      - file_name    : the original uploaded filename
+      - sys_date   : today's date, set at ingest time
+      - sys_active : boolean, true for every row by default
+      - file_path  : the local file path of the uploaded CSV
     """
     try:
         file_size_bytes = os.path.getsize(csv_file)
         conn = duckdb.connect(db_file, config=DUCKDB_CONFIG)
 
-        conn.execute(f"DROP TABLE IF EXISTS {table}")
+        qtable = _quote_ident(table)
+        conn.execute(f"DROP TABLE IF EXISTS {qtable}")
 
-        today     = date.today().isoformat()
-        file_name = (original_filename or os.path.basename(csv_file)).replace("'", "''")
+        today = date.today().isoformat()
+        local_file_path = os.path.abspath(csv_file).replace("'", "''")
 
         conn.execute(f"""
-            CREATE TABLE {table} AS
+            CREATE TABLE {qtable} AS
             SELECT
                 *,
-                DATE '{today}'  AS created_date,
-                true            AS is_active,
-                '{file_name}'   AS file_name
+                DATE '{today}'  AS sys_date,
+                true            AS sys_active,
+                '{local_file_path}' AS file_path
             FROM read_csv_auto('{csv_file}', sample_size={CSV_AUTODETECT_SAMPLE_SIZE}, nullstr='')
         """)
 
-        row_count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        cols      = conn.execute(f"DESCRIBE {table}").fetchall()
+        row_count = conn.execute(f"SELECT COUNT(*) FROM {qtable}").fetchone()[0]
+        cols      = conn.execute(f"DESCRIBE {qtable}").fetchall()
         conn.close()
 
         return {
@@ -88,12 +93,27 @@ def ingest_csv(csv_file: str, db_file: str, table: str, original_filename: str =
 # ── Preview (8 rows for UI table) ─────────────────────────────────────────────
 def get_preview(db_file: str, table: str, n: int = 8, row_count: int = None) -> tuple:
     conn = _connect(db_file, read_only=True)
-    cols = [c[0] for c in conn.execute(f"DESCRIBE {table}").fetchall()]
-    rows = conn.execute(f"SELECT * FROM {table} LIMIT {n}").fetchall()
-    if row_count is None:
-        row_count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-    conn.close()
-    return [dict(zip(cols, row)) for row in rows], cols, row_count
+    try:
+        qtable = _quote_ident(table)
+        cols = [c[0] for c in conn.execute(f"DESCRIBE {qtable}").fetchall()]
+        rows = conn.execute(f"SELECT * FROM {qtable} LIMIT {n}").fetchall()
+        if row_count is None:
+            row_count = conn.execute(f"SELECT COUNT(*) FROM {qtable}").fetchone()[0]
+        conn.close()
+        return [dict(zip(cols, row)) for row in rows], cols, row_count
+    except Exception:
+        # Fallback: cast everything to VARCHAR so preview does not fail on
+        # timezone-aware timestamps or other Python conversion issues.
+        try:
+            qtable = _quote_ident(table)
+            cols = [c[0] for c in conn.execute(f"DESCRIBE {qtable}").fetchall()]
+            safe_select = ", ".join([f'CAST("{c}" AS VARCHAR) AS "{c}"' for c in cols])
+            rows = conn.execute(f"SELECT {safe_select} FROM {qtable} LIMIT {n}").fetchall()
+            if row_count is None:
+                row_count = conn.execute(f"SELECT COUNT(*) FROM {qtable}").fetchone()[0]
+            return [dict(zip(cols, row)) for row in rows], cols, row_count
+        finally:
+            conn.close()
 
 
 # ── Full metadata via SUMMARIZE + single-pass value-count extraction ─────────
@@ -108,12 +128,13 @@ def get_metadata(db_file: str, table: str) -> dict:
     """
     conn = _connect(db_file, read_only=True)
 
-    row_count  = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-    describe_rows = conn.execute(f"DESCRIBE {table}").fetchall()
+    qtable = _quote_ident(table)
+    row_count  = conn.execute(f"SELECT COUNT(*) FROM {qtable}").fetchone()[0]
+    describe_rows = conn.execute(f"DESCRIBE {qtable}").fetchall()
     total_cols = len(describe_rows)
     col_names = [c[0] for c in describe_rows]
 
-    cur          = conn.execute(f"SUMMARIZE {table}")
+    cur          = conn.execute(f"SUMMARIZE {qtable}")
     summary_cols = [d[0] for d in cur.description]
     summary_rows = cur.fetchall()
 
@@ -123,7 +144,7 @@ def get_metadata(db_file: str, table: str) -> dict:
             f'COUNT(DISTINCT "{c}") AS "{c}__distinct"' for c in col_names
         )
         try:
-            distinct_row = conn.execute(f"SELECT {distinct_select} FROM {table}").fetchone()
+            distinct_row = conn.execute(f"SELECT {distinct_select} FROM {qtable}").fetchone()
             exact_distinct_map = {
                 c: int(distinct_row[i]) if distinct_row[i] is not None else 0
                 for i, c in enumerate(col_names)
@@ -147,7 +168,7 @@ def get_metadata(db_file: str, table: str) -> dict:
             f'histogram("{c}") AS "{c}__hist"' for c in candidates
         )
         try:
-            combined = conn.execute(f"SELECT {select_parts} FROM {table}").fetchone()
+            combined = conn.execute(f"SELECT {select_parts} FROM {qtable}").fetchone()
             for i, c in enumerate(candidates):
                 hist = combined[i] or {}
                 sorted_items = sorted(hist.items(), key=lambda kv: kv[1], reverse=True)

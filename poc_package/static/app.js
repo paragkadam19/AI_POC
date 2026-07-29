@@ -18,6 +18,43 @@ function markDone(name) {
   if (t) t.classList.add("done");
 }
 
+function clearTabState(tabName) {
+  const panel = $(`panel-${tabName}`);
+  if (!panel) return;
+  const result = panel.querySelector(".result");
+  if (result) {
+    result.classList.add("hidden");
+    result.innerHTML = "";
+  }
+  const loader = panel.querySelector(".loader");
+  if (loader) loader.classList.add("hidden");
+  const button = panel.querySelector(".btn.primary");
+  if (button && button.id) button.disabled = false;
+}
+
+function resetWorkflowAfterUpload(data) {
+  window._schemaApproved = false;
+  window._pendingSchema = null;
+  window._originalYaml = null;
+
+  ["schema", "soda", "dq", "validate", "changes", "kb"].forEach((name) => {
+    const tab = document.querySelector(`.tab[data-tab="${name}"]`);
+    if (tab) tab.classList.remove("done");
+  });
+
+  ["schema", "soda", "dq", "validate", "changes", "kb"].forEach(clearTabState);
+
+  const schemaBanner = $("schemaResult");
+  if (schemaBanner) schemaBanner.classList.add("hidden");
+
+  const b = $("statusBadge");
+  if (b) {
+    b.textContent = `CSV Ready · ${data.row_count} rows`;
+    b.classList.add("ok");
+    b.classList.remove("err");
+  }
+}
+
 async function api(path, opts = {}) {
   const res  = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
   const data = await res.json().catch(() => ({}));
@@ -71,6 +108,7 @@ async function uploadFile(file) {
     });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
+    resetWorkflowAfterUpload(data);
     renderUpload(data);
   } catch (e) {
     alert("Upload failed: " + e.message);
@@ -166,7 +204,7 @@ function renderSchema(d) {
             .filter(v => v !== null && v !== undefined)
             .slice(0, 5)
             .map(v => `<code style="font-size:11px">${v}</code>`)
-            .join(" ");
+            .join(" <span style=\"color:#94A3B8\">|</span> ");
 
         const sampleFallback = col.value_distribution && Object.keys(col.value_distribution).length > 0
             ? Object.entries(col.value_distribution)
@@ -179,16 +217,13 @@ function renderSchema(d) {
             ? Object.entries(col.value_distribution)
                 .map(([k, v]) => `<span style="font-size:11px"><code>${k}</code>: ${v}</span>`)
                 .join("<br>")
-            : (col.categorical_values && col.categorical_values.length > 0
-                ? col.categorical_values.map(v => `<code style="font-size:11px">${v}</code>`).join(" ")
+                : (col.categorical_values && col.categorical_values.length > 0
+                ? col.categorical_values.map(v => `<code style="font-size:11px">${v}</code>`).join(" <span style=\"color:#94A3B8\">|</span> ")
                 : '<span style="color:#94A3B8;font-size:11px">—</span>');
 
         html += `<tr>
             <td>
                 <strong>${col.column}</strong>
-                <br><span style="font-size:11px;color:#475569;display:block;max-width:220px;line-height:1.35;margin-top:4px">
-                    ${columnDescription || '<span style="color:#94A3B8">No description</span>'}
-                </span>
             </td>
             <td>
                 <select id="type_${i}" onchange="updatePendingSchema(${i}, 'data_type', this.value)"
@@ -551,19 +586,21 @@ function renderQuery(d) {
 
   if (!d.ok) {
     const warnings = asArray(d.warnings).map(w => `<li>${escapeHtml(String(w))}</li>`).join("");
+    const detail = d.detail ? `<div class="ev-card"><div class="obs">Detail</div><div class="sig">${escapeHtml(String(d.detail))}</div></div>` : "";
     el.innerHTML = `
-      <div class="banner error">✗ Could not generate a safe query</div>
+      <div class="banner error">✗ ${escapeHtml(d.error || "Query failed")}</div>
       <div class="card-list">
         <div class="ev-card"><div class="obs">Question</div><div class="sig">${escapeHtml(d.question || "")}</div></div>
         <div class="ev-card"><div class="obs">Warnings</div><div class="sig"><ul style="margin:0;padding-left:18px">${warnings || "<li>No SQL returned</li>"}</ul></div></div>
+        ${detail}
       </div>`;
     return;
   }
 
   const tables = (d.tables || []).map(t => `<code style="margin-right:6px">${t}</code>`).join("");
   const joins = (d.join_paths || []).map(j => `<li><code>${j.left}</code> ↔ <code>${j.right}</code> via <code>${j.join_column}</code></li>`).join("");
-  const previewRows = (d.preview && d.preview.rows) || [];
-  const previewCols = (d.preview && d.preview.columns) || [];
+  const previewRows = (d.preview && d.preview.rows) || d.rows || [];
+  const previewCols = (d.preview && d.preview.columns) || d.columns || [];
 
   let previewHtml = "<div style='color:#94A3B8;font-size:12px'>No preview rows returned.</div>";
   if (previewRows.length && previewCols.length) {

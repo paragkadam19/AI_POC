@@ -45,7 +45,7 @@ def _init_langfuse():
 
     public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
     secret_key = os.getenv("LANGFUSE_SECRET_KEY")
-    base_url   = os.getenv("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
+    base_url   = os.getenv("LANGFUSE_BASE_URL", "https://us.cloud.langfuse.com/")
 
     if not public_key or not secret_key:
         logger.info("[langfuse] disabled (missing LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY)")
@@ -97,11 +97,16 @@ def print_token_usage(input_tokens=0, output_tokens=0, total=0):
     _token_stats["total_tokens"]  += total
     _token_stats["requests"]      += 1
 
-    ... # existing box-drawing print() calls ...
-
-    logger.info(                                       # ← THEN log, after increment
-        f"bedrock call | input_tokens={input_tokens} output_tokens={output_tokens} "
-        f"total={total} session_total={_token_stats['total_tokens']} requests={_token_stats['requests']}"
+    logger.info(
+        "\n"
+        + "=" * 72
+        + "\nBEDROCK TOKEN USAGE\n"
+        + f"  input_tokens : {input_tokens}\n"
+        + f"  output_tokens: {output_tokens}\n"
+        + f"  total_tokens : {total}\n"
+        + f"  session_total : {_token_stats['total_tokens']}\n"
+        + f"  requests      : {_token_stats['requests']}\n"
+        + "=" * 72
     )
 
 
@@ -130,6 +135,17 @@ def ask(prompt: str,
     for attempt in range(retries):
         try:
             t0 = time.time()
+            logger.info(
+                "\n"
+                + "=" * 72
+                + "\nBEDROCK REQUEST\n"
+                + f"MODEL: {model}\n"
+                + "SYSTEM:\n"
+                + f"{system or '(empty)'}\n"
+                + "PROMPT:\n"
+                + f"{prompt or '(empty)'}\n"
+                + "=" * 72
+            )
             if lf:
                 with lf.start_as_current_observation(
                     name="bedrock.ask",
@@ -149,6 +165,14 @@ def ask(prompt: str,
                     t0 = time.time()
                     result = json.loads(resp["body"].read())
                     logger.info(f"[bedrock] response body read+json.loads: {time.time()-t0:.3f}s")
+                    logger.info(
+                        "\n"
+                        + "=" * 72
+                        + "\nBEDROCK RESPONSE\n"
+                        + json.dumps(result, indent=2, ensure_ascii=False)[:4000]
+                        + "\n"
+                        + "=" * 72
+                    )
 
                     usage = result.get("usage", {})
                     input_tokens = usage.get("input_tokens", 0)
@@ -176,6 +200,14 @@ def ask(prompt: str,
                 t0 = time.time()
                 result = json.loads(resp["body"].read())
                 logger.info(f"[bedrock] response body read+json.loads: {time.time()-t0:.3f}s")
+                logger.info(
+                    "\n"
+                    + "=" * 72
+                    + "\nBEDROCK RESPONSE\n"
+                    + json.dumps(result, indent=2, ensure_ascii=False)[:4000]
+                    + "\n"
+                    + "=" * 72
+                )
 
                 usage = result.get("usage", {})
                 input_tokens = usage.get("input_tokens", 0)
@@ -190,7 +222,6 @@ def ask(prompt: str,
 
             if verbose:
                 print_token_usage(input_tokens, output_tokens, total_tokens)
-
             return result["content"][0]["text"]
 
         except Exception as e:
@@ -256,11 +287,26 @@ Broken JSON:
     t0 = time.time()
     raw = ask(prompt, system=full_system, model=model, max_tokens=max_tokens, verbose=verbose)
     logger.info(f"[ask_json] ask() total (network+generation+read): {time.time()-t0:.3f}s")
+    logger.info(
+        "\n"
+        + "=" * 72
+        + "\nASK_JSON RAW TEXT\n"
+        + f"{raw or '(empty)'}\n"
+        + "=" * 72
+    )
 
     try:
         t_parse = time.time()
         parsed, cleaned = _attempt_parse(raw)
         logger.info(f"[ask_json] cleanup + json.loads parse: {time.time()-t_parse:.3f}s")
+        logger.info(
+            "\n"
+            + "=" * 72
+            + "\nASK_JSON PARSED JSON\n"
+            + json.dumps(parsed, indent=2, ensure_ascii=False)
+            + "\n"
+            + "=" * 72
+        )
         return parsed
     except json.JSONDecodeError as e:
         logger.error(f"JSON parse failed: {e} | raw (first 500 chars): {raw[:500]}")
