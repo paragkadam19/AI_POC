@@ -164,6 +164,34 @@ Loan Status        -> Disbursement Date
 Product Type       -> Product Code
 Country            -> State
 
+
+17. Dialect: Use DuckDB-compatible SQL syntax exclusively. Prefer DuckDB-specific functions where they simplify
+the query (e.g., `date_trunc`, `list_aggregate`, `unnest`, `QUALIFY`, `EXCLUDE`/`REPLACE` in SELECT,
+`read_csv`/`read_parquet` if referencing files directly).
+ 
+18. No SELECT \: Never use `SELECT `. Always explicitly list the columns needed to answer the question,
+using the exact column names/aliases from the schema provided.
+ 
+19. Aggregation correctness: If any aggregate function (`SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, etc.) appears in the
+SELECT list alongside non-aggregated columns, those non-aggregated columns MUST appear in a `GROUP BY` clause.
+Never mix aggregated and non-aggregated columns without a matching GROUP BY.
+ 
+20. Fan-out prevention: When a query joins one-to-many relationships (e.g., an orders table joined to a line-items
+table) and needs an aggregate at the "one" side's grain, use a CTE or subquery to pre-aggregate the "many" side
+BEFORE joining, to avoid double-counting from fan-out. Do not aggregate after a fan-out join unless the fan-out
+is intentional and required by the question.
+ 
+21. CTEs over nested subqueries: Prefer `WITH` CTEs over deeply nested subqueries for readability, especially when
+a fan-out fix, intermediate aggregation, or multi-step transformation is required. Name CTEs descriptively
+(e.g., `order_totals`, `monthly_active_users`).
+ 
+Common DuckDB Syntax Errors to Check For
+- `REGEXP_MATCHES` is a FUNCTION, not an infix operator. It cannot be used as `col NOT REGEXP_MATCHES(pattern)`. Correct usage is:
+  `regexp_matches(column, pattern)` — returns BOOLEAN, used as: `WHERE regexp_matches(record_id, pattern)`
+  To negate: `WHERE NOT regexp_matches(record_id, pattern)`
+- Double-check that string literals for regex patterns are properly escaped/quoted.
+- Ensure column names referenced actually exist in the target table's schema.
+
 Generate failed rows checks for these dependencies.
 
 Generate BOTH directions of the rule where applicable:

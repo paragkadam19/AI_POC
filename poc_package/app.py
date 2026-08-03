@@ -721,16 +721,14 @@ def run_poc3b():
 @app.route("/api/poc8/query", methods=["POST"])
 def run_poc8_query():
     ds = STATE["dataset_id"]
-    if not ds:
-        return jsonify({"error": "Upload a CSV first"}), 400
-
     body     = request.get_json(silent=True) or {}
     question = (body.get("question") or "").strip()
     if not question:
         return jsonify({"error": "Please enter a question"}), 400
 
     try:
-        maybe_refresh_kb()
+        if KB_MANAGER:
+            KB_MANAGER.load_catalog(force_refresh=False)
         result = poc8.question_to_sql(
             db_file=DB_FILE,
             ds=ds,
@@ -742,12 +740,13 @@ def run_poc8_query():
         if result.get("ok") and result.get("sql"):
             # Save successful query as an example pair
             try:
-                upsert_example_pair(
-                    STORAGE_DIR, ds, question,
-                    result.get("sql", ""),
-                    result.get("tables", []) or [],
-                    tags=["poc8", "tab8", "auto_saved"],
-                )
+                if result.get("tables"):
+                    upsert_example_pair(
+                        STORAGE_DIR, ds or "kb", question,
+                        result.get("sql", ""),
+                        result.get("tables", []) or [],
+                        tags=["poc8", "tab8", "auto_saved"],
+                    )
             except Exception as e:
                 logger.warning(f"[poc8] example pair save skipped: {e}")
 
@@ -771,7 +770,7 @@ def run_poc8_query():
             except Exception as e:
                 logger.warning(f"[poc8] join edge save skipped: {e}")
 
-        result["_dataset_id"] = ds
+        result["_dataset_id"] = ds or "kb"
         return jsonify(result)
     except Exception as e:
         logger.error(f"NL→SQL query generation failed for dataset={ds}: {e}", exc_info=True)

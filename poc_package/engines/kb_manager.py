@@ -2,7 +2,7 @@
 KB_MANAGER: Knowledge Base with Vector Semantic Search
 =======================================================
 Stores and retrieves tables/columns using:
-1. kb_vectors table (Titan embeddings via DuckDB VSS HNSW)
+1. kb_metadata table (Titan embeddings via DuckDB VSS HNSW)
 2. Keyword fallback (cosine similarity over text)
 
 If vectors fail to embed, keyword fallback activates silently.
@@ -10,18 +10,24 @@ If vectors fail to embed, keyword fallback activates silently.
 
 import json
 import os
+import re
 from collections import defaultdict
 from datetime import datetime
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import duckdb
 
 from logger_config import get_logger
+from duckdb_helper import SAMPLE_ROWS_SCHEMA, get_full_metadata_for_ai
+from prompt_builder import build_schema_discovery_prompt
+from bedrock_client import ask_json
 
 logger = get_logger(__name__)
 
 VECTOR_DIM       = 1024
 _KB_STATE_FILE   = "kb_state.json"
+_SEMANTIC_LAYER_FILE = "semantic_layer.md"
 _DB_FILE_REF: list = [None]
 _KB_MANAGER_INSTANCE: Optional["KBManager"] = None
 
@@ -63,6 +69,513 @@ def _cosine_similarity(v1: List[float], v2: List[float]) -> float:
     return dot / (mag1 * mag2)
 
 
+def _normalize_join_name(name: str) -> str:
+    name = (name or "").strip().lower()
+    name = re.sub(r"(_id|_code|_key|_nm|_name)$", "", name)
+    name = re.sub(r"[^a-z0-9]+", "_", name).strip("_")
+    return name
+
+
+def _parse_sample_values(raw: str) -> List[str]:
+    if not raw:
+        return []
+    return [v.strip() for v in str(raw).split(" | ") if v and str(v).strip()]
+
+
+def _is_key_like_column(col_name: str, column_type: str = "") -> bool:
+    name = (col_name or "").strip().lower()
+    ctype = (column_type or "").strip().lower()
+    if not name:
+        return False
+    if name in {"id", "code", "key"}:
+        return True
+    if name.endswith(("_id", "_code", "_key")):
+        return True
+    if any(tok in name for tok in ("id", "code", "key", "customer", "product", "region", "country", "type", "status")):
+        return True
+    return ctype in {"varchar", "text", "uuid", "bigint", "integer", "int", "ubigint"}
+
+
+def _detect_join_candidates_from_kb(conn) -> List[dict]:
+    """
+    Find join candidates from stored KB column metadata.
+    Uses column-name similarity plus overlap in sample values when available.
+    """
+    rows = conn.execute("""
+        SELECT table_name, column_name, metadata_json
+        FROM kb_metadata
+        WHERE record_type = 'column'
+        ORDER BY table_name, column_name
+    """).fetchall()
+
+    by_table: Dict[str, List[dict]] = defaultdict(list)
+    for table_name, column_name, metadata_json in rows:
+        meta = json.loads(metadata_json or "{}")
+        by_table[str(table_name)].append({
+            "table_name": str(table_name),
+            "column_name": str(column_name or ""),
+            "column_type": str(meta.get("column_type") or ""),
+            "sample_values": meta.get("sample_values") or [],
+        })
+
+    candidates = []
+    tables = sorted(by_table.keys())
+    for i, left_table in enumerate(tables):
+        left_cols = by_table[left_table]
+        for right_table in tables[i + 1:]:
+            right_cols = by_table[right_table]
+            for lc in left_cols:
+                if not _is_key_like_column(lc["column_name"], lc["column_type"]):
+                    continue
+                left_name_norm = _normalize_join_name(lc["column_name"])
+                left_samples = set(v.lower() for v in lc["sample_values"] if v)
+                for rc in right_cols:
+                    if not _is_key_like_column(rc["column_name"], rc["column_type"]):
+                        continue
+
+                    right_name_norm = _normalize_join_name(rc["column_name"])
+                    name_match = bool(left_name_norm and left_name_norm == right_name_norm)
+                    exact_name_match = lc["column_name"].strip().lower() == rc["column_name"].strip().lower()
+
+                    right_samples = set(v.lower() for v in rc["sample_values"] if v)
+                    shared = left_samples & right_samples
+                    union = left_samples | right_samples
+                    overlap = (len(shared) / len(union)) if union else 0.0
+
+                    if not (name_match or overlap >= 0.15):
+                        continue
+
+                    confidence = round(min(0.95, max(0.55, overlap if overlap > 0 else 0.55)), 3)
+                    candidates.append({
+                        "table1": left_table,
+                        "column1": lc["column_name"],
+                        "table2": right_table,
+                        "column2": rc["column_name"],
+                        "confidence": confidence,
+                        "source": "kb_profile",
+                        "exact_name_match": exact_name_match,
+                        "normalized_name_match": name_match,
+                        "sample_value_overlap": round(overlap, 3),
+                        "shared_values": sorted(list(shared))[:5],
+                    })
+                    candidates.append({
+                        "table1": right_table,
+                        "column1": rc["column_name"],
+                        "table2": left_table,
+                        "column2": lc["column_name"],
+                        "confidence": confidence,
+                        "source": "kb_profile",
+                        "exact_name_match": exact_name_match,
+                        "normalized_name_match": name_match,
+                        "sample_value_overlap": round(overlap, 3),
+                        "shared_values": sorted(list(shared))[:5],
+                    })
+
+    # Deduplicate by join identity, keeping the strongest confidence.
+    dedup = {}
+    for edge in candidates:
+        key = (edge["table1"], edge["column1"], edge["table2"], edge["column2"], edge["source"])
+        prev = dedup.get(key)
+        if not prev or float(edge["confidence"]) > float(prev["confidence"]):
+            dedup[key] = edge
+
+    return sorted(
+        dedup.values(),
+        key=lambda e: (e.get("exact_name_match", False), e.get("sample_value_overlap", 0.0), e.get("confidence", 0.0)),
+        reverse=True,
+    )
+
+
+def _load_real_table_samples(conn, tables: List[str], sample_limit: int = 200) -> Dict[str, Dict[str, dict]]:
+    """
+    Load distinct sample values from actual DuckDB tables for join discovery.
+    Returns {table_name: {column_name: {"column_type": ..., "sample_values": [...]}}}
+    """
+    if not tables:
+        return {}
+
+    result: Dict[str, Dict[str, dict]] = {}
+    try:
+        for table_name in tables:
+            try:
+                cols = conn.execute(f'DESCRIBE "{table_name}"').fetchall()
+            except Exception:
+                continue
+
+            table_map: Dict[str, dict] = {}
+            for col_name, col_type, *_ in cols:
+                if not _is_key_like_column(col_name, col_type):
+                    continue
+                try:
+                    rows = conn.execute(
+                        f'SELECT DISTINCT CAST("{col_name}" AS VARCHAR) AS v '
+                        f'FROM "{table_name}" '
+                        f'WHERE "{col_name}" IS NOT NULL '
+                        f'LIMIT {sample_limit}'
+                    ).fetchall()
+                    values = [str(r[0]).strip() for r in rows if r and r[0] is not None and str(r[0]).strip()]
+                except Exception:
+                    values = []
+                table_map[col_name] = {
+                    "column_type": col_type,
+                    "sample_values": values,
+                }
+            if table_map:
+                result[table_name] = table_map
+        return result
+    finally:
+        conn.close()
+
+
+def _detect_join_candidates_from_real_data(db_file: str, tables: List[str]) -> List[dict]:
+    """
+    Detect joins using actual DuckDB table values. This is stronger than KB-only
+    metadata because it checks real overlap between sampled values.
+    """
+    sampled = _load_real_table_samples(duckdb.connect(db_file), tables)
+    if not sampled:
+        return []
+
+    candidates = []
+    table_names = sorted(sampled.keys())
+    for i, left_table in enumerate(table_names):
+        left_cols = sampled[left_table]
+        for right_table in table_names[i + 1:]:
+            right_cols = sampled[right_table]
+            for left_col, left_meta in left_cols.items():
+                left_norm = _normalize_join_name(left_col)
+                left_values = set(v.lower() for v in left_meta.get("sample_values", []) if v)
+                for right_col, right_meta in right_cols.items():
+                    right_norm = _normalize_join_name(right_col)
+                    name_match = bool(left_norm and left_norm == right_norm)
+                    exact_name_match = left_col.strip().lower() == right_col.strip().lower()
+                    right_values = set(v.lower() for v in right_meta.get("sample_values", []) if v)
+                    if not left_values or not right_values:
+                        continue
+
+                    shared = left_values & right_values
+                    union = left_values | right_values
+                    overlap = (len(shared) / len(union)) if union else 0.0
+
+                    # Keep joins that have either matching names or actual overlap.
+                    if not (name_match or overlap >= 0.15):
+                        continue
+
+                    confidence = round(min(0.98, max(0.6, overlap if overlap > 0 else 0.6)), 3)
+                    candidates.append({
+                        "table1": left_table,
+                        "column1": left_col,
+                        "table2": right_table,
+                        "column2": right_col,
+                        "confidence": confidence,
+                        "source": "real_data",
+                        "exact_name_match": exact_name_match,
+                        "normalized_name_match": name_match,
+                        "sample_value_overlap": round(overlap, 3),
+                        "shared_values": sorted(list(shared))[:5],
+                    })
+                    candidates.append({
+                        "table1": right_table,
+                        "column1": right_col,
+                        "table2": left_table,
+                        "column2": left_col,
+                        "confidence": confidence,
+                        "source": "real_data",
+                        "exact_name_match": exact_name_match,
+                        "normalized_name_match": name_match,
+                        "sample_value_overlap": round(overlap, 3),
+                        "shared_values": sorted(list(shared))[:5],
+                    })
+
+    dedup = {}
+    for edge in candidates:
+        key = (edge["table1"], edge["column1"], edge["table2"], edge["column2"], edge["source"])
+        prev = dedup.get(key)
+        if not prev or float(edge["confidence"]) > float(prev["confidence"]):
+            dedup[key] = edge
+
+    return sorted(
+        dedup.values(),
+        key=lambda e: (e.get("exact_name_match", False), e.get("sample_value_overlap", 0.0), e.get("confidence", 0.0)),
+        reverse=True,
+    )
+
+
+def _refresh_joins_from_real_data(db_file: str, conn, tables: List[str]) -> int:
+    candidates = _detect_join_candidates_from_real_data(db_file, tables)
+    if not candidates:
+        return 0
+
+    conn.execute("DELETE FROM kb_metadata WHERE record_type = 'join' AND json_extract_string(metadata_json, '$.source') = 'real_data'")
+    for e in candidates:
+        _upsert_metadata_record(conn, {
+            "id": f"join:real_data:{e['table1']}:{e['column1']}:{e['table2']}:{e['column2']}",
+            "record_type": "join",
+            "table_name": e["table1"],
+            "related_table": e["table2"],
+            "column_name": e["column1"],
+            "content_text": f"{e['table1']}.{e['column1']} -> {e['table2']}.{e['column2']}",
+            "metadata_json": e,
+            "confidence": float(e["confidence"]),
+        })
+    return len(candidates)
+
+
+def _infer_table_grain(columns: List[dict]) -> str:
+    col_names = [str(c.get("column_name") or "").lower() for c in columns]
+    if any(name in {"sys_date", "date", "created_at", "updated_at"} or "date" in name or "time" in name for name in col_names):
+        return "Likely one row per entity per time period"
+    if any(name.endswith(("_id", "_key")) or name == "id" for name in col_names):
+        return "Likely one row per business entity"
+    return "Grain not explicitly confirmed; likely one row per record"
+
+
+def _infer_primary_key_candidate(columns: List[dict]) -> str:
+    col_names = [str(c.get("column_name") or c.get("column") or "").lower() for c in columns]
+    for name in col_names:
+        if name == "id" or name.endswith("_id") or name.endswith("_key"):
+            return name
+    return "No obvious PK candidate"
+
+
+def _infer_temporal_notes(columns: List[dict]) -> List[str]:
+    notes = []
+    col_names = [str(c.get("column_name") or c.get("column") or "").lower() for c in columns]
+    if any("effective" in n for n in col_names):
+        notes.append("Contains effective-date style columns; prefer latest row by effective date when deduplicating.")
+    if any(n in {"sys_date", "created_at", "updated_at"} or "date" in n or "time" in n for n in col_names):
+        notes.append("Contains temporal columns; use date filters for as-of queries when relevant.")
+    if not notes:
+        notes.append("No strong temporal pattern detected.")
+    return notes
+
+
+def build_semantic_layer_markdown(catalog: Dict[str, Any], joins: Dict[str, List[Tuple[str, str]]]) -> str:
+    lines = []
+    lines.append("## 1. Table Registry")
+    for table_name in sorted(catalog.keys()):
+        meta = catalog[table_name]
+        cols = meta.get("columns", [])
+        lines.append(f"### {table_name}")
+        lines.append(f"- Description: {meta.get('description') or table_name}")
+        lines.append(f"- Row count: {meta.get('row_count', 0)}")
+        lines.append(f"- Column count: {len(cols)}")
+        lines.append(f"- Grain: {_infer_table_grain(cols)}")
+        lines.append(f"- PK candidate: {_infer_primary_key_candidate(cols)}")
+        lines.append("- Columns:")
+        for col in cols:
+            cname = col.get("column", "")
+            ctype = col.get("data_type", "")
+            meaning = col.get("business_meaning", "")
+            nullable = col.get("nullable", True)
+            parts = [f"{cname} ({ctype})"]
+            if meaning:
+                parts.append(f"meaning: {meaning}")
+            parts.append(f"nullable: {nullable}")
+            lines.append(f"  - " + "; ".join(parts))
+        temporal_notes = _infer_temporal_notes(cols)
+        lines.append("- Temporal notes:")
+        for note in temporal_notes:
+            lines.append(f"  - {note}")
+
+    lines.append("")
+    lines.append("## 2. Join Registry")
+    if not joins:
+        lines.append("- No join relationships detected yet.")
+    else:
+        seen = set()
+        for src, targets in sorted(joins.items()):
+            for tgt, join_col in targets:
+                key = (src, tgt, join_col)
+                if key in seen:
+                    continue
+                seen.add(key)
+                lines.append(f"- {src} -> {tgt} on {join_col}")
+
+    lines.append("")
+    lines.append("## 3. Temporal Matching Rules")
+    temporal_rules = []
+    for table_name in sorted(catalog.keys()):
+        cols = catalog[table_name].get("columns", [])
+        col_names = [str(c.get("column") or "").lower() for c in cols]
+        if any("effective" in n for n in col_names):
+            temporal_rules.append(f"- {table_name}: prefer the row with the latest effective date for the requested as-of period.")
+        elif any(n in {"sys_date", "created_at", "updated_at"} or "date" in n or "time" in n for n in col_names):
+            temporal_rules.append(f"- {table_name}: use temporal columns for date-filtered queries and latest-record logic.")
+    if temporal_rules:
+        lines.extend(temporal_rules)
+    else:
+        lines.append("- No explicit temporal matching rules detected.")
+
+    lines.append("")
+    lines.append("## 4. Known Gaps and Fuzzy Matches")
+    fuzzy = []
+    for src, targets in sorted(joins.items()):
+        for tgt, join_col in targets:
+            if "->" in str(join_col):
+                continue
+            fuzzy.append(f"- {src} <-> {tgt} via {join_col}: join is a heuristic unless backed by value overlap.")
+    if fuzzy:
+        lines.extend(fuzzy)
+    else:
+        lines.append("- No known fuzzy matches recorded.")
+
+    lines.append("")
+    lines.append("## 5. Validated Date Coverage")
+    date_tables = []
+    for table_name in sorted(catalog.keys()):
+        cols = catalog[table_name].get("columns", [])
+        if any("date" in str(c.get("column") or "").lower() or "time" in str(c.get("column") or "").lower() for c in cols):
+            date_tables.append(table_name)
+    if date_tables:
+        for table_name in date_tables:
+            lines.append(f"- {table_name}: date/time columns present and available for validation.")
+    else:
+        lines.append("- No date/time coverage validated yet.")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def _build_table_semantic_section(table_name: str, meta: Dict[str, Any], joins: Dict[str, List[Tuple[str, str]]]) -> str:
+    cols = meta.get("columns", [])
+    lines = [f"### {table_name}"]
+    lines.append(f"- Description: {meta.get('description') or table_name}")
+    lines.append(f"- Row count: {meta.get('row_count', 0)}")
+    lines.append(f"- Column count: {len(cols)}")
+    lines.append(f"- Grain: {_infer_table_grain(cols)}")
+    lines.append(f"- PK candidate: {_infer_primary_key_candidate(cols)}")
+    lines.append("- Columns:")
+    for col in cols:
+        cname = col.get("column", "")
+        ctype = col.get("data_type", "")
+        meaning = col.get("business_meaning", "")
+        nullable = col.get("nullable", True)
+        parts = [f"{cname} ({ctype})"]
+        if meaning:
+            parts.append(f"meaning: {meaning}")
+        parts.append(f"nullable: {nullable}")
+        lines.append(f"  - " + "; ".join(parts))
+    lines.append("- Temporal notes:")
+    for note in _infer_temporal_notes(cols):
+        lines.append(f"  - {note}")
+    related = []
+    for src, targets in joins.items():
+        if src == table_name:
+            for tgt, join_col in targets:
+                related.append(f"- {src} -> {tgt} on {join_col}")
+    if related:
+        lines.append("- Join hints:")
+        lines.extend([f"  - {line[2:]}" if line.startswith("- ") else f"  - {line}" for line in related])
+    return "\n".join(lines)
+
+
+def _merge_semantic_layer_markdown(existing: str, catalog: Dict[str, Any], joins: Dict[str, List[Tuple[str, str]]], tables: Optional[List[str]] = None) -> str:
+    if not existing.strip():
+        return build_semantic_layer_markdown(catalog, joins)
+    tables = tables or list(catalog.keys())
+    append_sections = []
+    existing_lower = existing.lower()
+    for table_name in sorted(set(tables)):
+        marker = f"### {table_name}".lower()
+        if marker in existing_lower:
+            continue
+        meta = catalog.get(table_name)
+        if not meta:
+            continue
+        append_sections.append(_build_table_semantic_section(table_name, meta, joins))
+    if not append_sections:
+        return existing
+    return existing.rstrip() + "\n\n## 1b. Incremental Updates\n" + "\n\n".join(append_sections) + "\n"
+
+
+def _merge_kb_state(storage_dir: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+    state = load_kb_state(storage_dir)
+    state.update(updates or {})
+    prev_tables = state.get("tables") or []
+    new_tables = updates.get("tables") or []
+    state["tables"] = sorted(set(prev_tables) | set(new_tables))
+    for key in ("enriched_tables", "skipped_tables"):
+        if key in updates:
+            state[key] = sorted(set((state.get(key) or []) + (updates.get(key) or [])))
+    return state
+
+
+def _save_semantic_layer(storage_dir: str, markdown: str):
+    d = os.path.join(storage_dir, "kb")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, _SEMANTIC_LAYER_FILE), "w") as f:
+        f.write(markdown)
+
+
+def load_semantic_layer(storage_dir: str) -> str:
+    path = os.path.join(storage_dir, "kb", _SEMANTIC_LAYER_FILE)
+    if not os.path.exists(path):
+        return ""
+    with open(path) as f:
+        return f.read()
+
+
+def load_kb_state(storage_dir: str) -> dict:
+    path = _kb_state_path(storage_dir)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _upsert_metadata_record(conn, record: dict):
+    record_id = record["id"]
+    record_type = record["record_type"]
+    table_name = record.get("table_name")
+    related_table = record.get("related_table")
+    column_name = record.get("column_name")
+    content_text = record.get("content_text")
+    metadata_json = json.dumps(record.get("metadata_json") or {}, default=str)
+    confidence = record.get("confidence")
+    category = record.get("category")
+    question = record.get("question")
+    sql = record.get("sql")
+    now = datetime.now().isoformat()
+    embedding = record.get("embedding")
+
+    conn.execute("DELETE FROM kb_metadata WHERE id = ?", [record_id])
+    conn.execute(
+        """
+        INSERT INTO kb_metadata
+        (id, record_type, table_name, related_table, column_name, content_text,
+         metadata_json, confidence, category, question, sql, created_at, updated_at, embedding)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            record_id, record_type, table_name, related_table, column_name, content_text,
+            metadata_json, confidence, category, question, sql, now, now, embedding,
+        ],
+    )
+
+
+def _refresh_joins_from_kb(conn) -> int:
+    candidates = _detect_join_candidates_from_kb(conn)
+    if not candidates:
+        return 0
+
+    conn.execute("DELETE FROM kb_metadata WHERE record_type = 'join' AND json_extract_string(metadata_json, '$.source') = 'kb_profile'")
+    for e in candidates:
+        _upsert_metadata_record(conn, {
+            "id": f"join:kb_profile:{e['table1']}:{e['column1']}:{e['table2']}:{e['column2']}",
+            "record_type": "join",
+            "table_name": e["table1"],
+            "related_table": e["table2"],
+            "column_name": e["column1"],
+            "content_text": f"{e['table1']}.{e['column1']} -> {e['table2']}.{e['column2']}",
+            "metadata_json": e,
+            "confidence": float(e["confidence"]),
+        })
+    return len(candidates)
+
+
 # ============================================================================
 # KBManager
 # ============================================================================
@@ -88,85 +601,34 @@ class KBManager:
         try:
             conn = duckdb.connect(self.db_file)
 
-            # Core KB tables
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS kb_catalog (
-                    table_name   TEXT PRIMARY KEY,
-                    description  TEXT,
-                    row_count    BIGINT,
-                    column_count INTEGER,
-                    created_at   TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS kb_documents (
-                    id               TEXT,
-                    table_name       TEXT,
-                    column_name      TEXT,
-                    data_type        TEXT,
-                    business_meaning TEXT,
-                    nullable         BOOLEAN,
-                    ordinal_position INTEGER,
-                    created_at       TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS kb_schema_fields (
-                    id                TEXT PRIMARY KEY,
-                    dataset_id        TEXT,
-                    table_name        TEXT,
-                    source_file_name  TEXT,
-                    column_name       TEXT,
-                    column_type       TEXT,
-                    column_description TEXT,
-                    validation_rule   TEXT,
-                    null_count        BIGINT,
-                    null_pct          DOUBLE,
-                    sample_values     TEXT,
-                    search_text       TEXT,
-                    created_at        TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS kb_examples (
-                    id            TEXT PRIMARY KEY,
-                    question      TEXT,
-                    sql           TEXT,
-                    category      TEXT,
-                    quality_score DOUBLE,
-                    created_at    TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS kb_glossary (
-                    id               TEXT,
-                    table_name       TEXT,
-                    column_reference TEXT,
-                    definition       TEXT,
-                    confidence       DOUBLE,
-                    created_at       TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS kb_joins (
-                    table1     TEXT,
-                    column1    TEXT,
-                    table2     TEXT,
-                    column2    TEXT,
-                    confidence DOUBLE,
-                    source     TEXT
-                )
-            """)
-            
-            # Vector table
+            # Remove legacy KB tables now that all writes live in kb_metadata.
+            for legacy_table in (
+                "kb_catalog",
+                "kb_documents",
+                "kb_examples",
+                "kb_glossary",
+                "kb_joins",
+                "kb_schema_fields",
+                "kb_vectors",
+            ):
+                conn.execute(f"DROP TABLE IF EXISTS {legacy_table}")
+
             conn.execute(f"""
-                CREATE TABLE IF NOT EXISTS kb_vectors (
-                    id          TEXT PRIMARY KEY,
-                    table_name  TEXT,
-                    doc_type    TEXT,          -- 'table' | 'column'
-                    text        TEXT,
-                    embedding   FLOAT[{VECTOR_DIM}],
-                    created_at  TEXT
+                CREATE TABLE IF NOT EXISTS kb_metadata (
+                    id              TEXT PRIMARY KEY,
+                    record_type     TEXT,   -- table | column | glossary | join | example | semantic_layer
+                    table_name      TEXT,
+                    related_table   TEXT,
+                    column_name     TEXT,
+                    content_text    TEXT,
+                    metadata_json   TEXT,
+                    confidence      DOUBLE,
+                    category        TEXT,
+                    question        TEXT,
+                    sql             TEXT,
+                    created_at      TEXT,
+                    updated_at      TEXT,
+                    embedding       FLOAT[{VECTOR_DIM}]
                 )
             """)
 
@@ -174,8 +636,8 @@ class KBManager:
             try:
                 conn.execute("INSTALL vss; LOAD vss;")
                 conn.execute("""
-                    CREATE INDEX IF NOT EXISTS kb_vectors_hnsw
-                    ON kb_vectors USING HNSW (embedding)
+                    CREATE INDEX IF NOT EXISTS kb_metadata_hnsw
+                    ON kb_metadata USING HNSW (embedding)
                     WITH (metric = 'cosine')
                 """)
                 self._vss_available = True
@@ -184,7 +646,14 @@ class KBManager:
                 self._vss_available = False
                 logger.info(f"[KB] VSS unavailable, using keyword fallback: {vss_err}")
 
+            exists = conn.execute("""
+                SELECT COUNT(*)
+                FROM information_schema.tables
+                WHERE table_schema = 'main' AND table_name = 'kb_metadata'
+            """).fetchone()[0]
             conn.close()
+            if not exists:
+                raise RuntimeError("kb_metadata table was not created")
             logger.info("[KB] Schema verified/created")
         except Exception as e:
             logger.error(f"[KB] Schema creation failed: {e}")
@@ -207,16 +676,17 @@ class KBManager:
                        doc_type: str, text: str):
         """Embed text and store vector. Fails gracefully if embed fails."""
         vector = _embed(text)
-        conn.execute("DELETE FROM kb_vectors WHERE id = ?", [doc_id])
+        conn.execute("DELETE FROM kb_metadata WHERE id = ?", [doc_id])
         if vector:
             logger.debug(f"[KB] storing vector for {doc_id}")
         else:
             logger.debug(f"[KB] no vector produced for {doc_id}, storing zero vector")
         conn.execute(
-            "INSERT INTO kb_vectors (id, table_name, doc_type, text, embedding, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            [doc_id, table_name, doc_type, text, _pad(vector),
-             datetime.now().isoformat()],
+            "INSERT INTO kb_metadata "
+            "(id, record_type, table_name, related_table, column_name, content_text, metadata_json, confidence, category, question, sql, created_at, updated_at, embedding) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [doc_id, "vector", table_name, None, doc_type, text, None, None, None, None, None,
+             datetime.now().isoformat(), datetime.now().isoformat(), _pad(vector)],
         )
 
     # ── vector retrieval (with keyword fallback) ──────────────────────────
@@ -252,10 +722,10 @@ class KBManager:
         try:
             conn.execute("LOAD vss;")
             rows = conn.execute(f"""
-                SELECT id, table_name, doc_type, text,
+                SELECT id, table_name, record_type, content_text,
                        array_cosine_distance(embedding,
                            CAST(? AS FLOAT[{VECTOR_DIM}])) AS dist
-                FROM kb_vectors
+                FROM kb_metadata
                 WHERE embedding IS NOT NULL
                 ORDER BY dist
                 LIMIT ?
@@ -276,12 +746,12 @@ class KBManager:
         try:
             conn = duckdb.connect(self.db_file, read_only=True)
             rows = conn.execute(
-                "SELECT id, table_name, doc_type, text FROM kb_vectors WHERE text IS NOT NULL LIMIT 500"
+                "SELECT id, table_name, record_type, content_text FROM kb_metadata WHERE content_text IS NOT NULL LIMIT 500"
             ).fetchall()
             conn.close()
 
             if not rows:
-                logger.warning("[KB] No documents in kb_vectors table")
+                logger.warning("[KB] No documents in kb_metadata table")
                 return []
 
             # Tokenize question
@@ -317,26 +787,39 @@ class KBManager:
         try:
             conn = duckdb.connect(self.db_file, read_only=True)
             rows = conn.execute(
-                "SELECT table_name, description, row_count, column_count, created_at "
-                "FROM kb_catalog ORDER BY table_name"
+                """
+                SELECT table_name, content_text, metadata_json, created_at
+                FROM kb_metadata
+                WHERE record_type = 'table'
+                ORDER BY table_name
+                """
             ).fetchall()
 
             catalog = {}
-            for tname, desc, rc, cc, cat in rows:
+            for tname, content_text, meta_json, cat in rows:
+                meta = json.loads(meta_json or "{}")
                 col_rows = conn.execute(
-                    "SELECT column_name, data_type, business_meaning, nullable "
-                    "FROM kb_documents WHERE table_name = ? ORDER BY ordinal_position",
+                    """
+                    SELECT column_name, metadata_json
+                    FROM kb_metadata
+                    WHERE record_type = 'column' AND table_name = ?
+                    ORDER BY created_at
+                    """,
                     [tname],
                 ).fetchall()
-
                 catalog[tname] = {
                     "table_name": tname,
-                    "description": desc or tname,
-                    "row_count": rc,
+                    "description": meta.get("description") or content_text or tname,
+                    "row_count": meta.get("row_count", 0),
                     "columns": [
-                        {"column": cn, "data_type": dt,
-                         "business_meaning": bm or "", "nullable": nl}
-                        for cn, dt, bm, nl in col_rows
+                        {
+                            "column": cn,
+                            "data_type": json.loads(mj or "{}").get("data_type", "") if mj else "",
+                            "business_meaning": json.loads(mj or "{}").get("business_meaning", "") if mj else "",
+                            "nullable": json.loads(mj or "{}").get("nullable", True) if mj else True,
+                            "sample_values": json.loads(mj or "{}").get("sample_values", []) if mj else [],
+                        }
+                        for cn, mj in col_rows
                     ],
                     "created_at": cat,
                 }
@@ -357,9 +840,13 @@ class KBManager:
         try:
             conn = duckdb.connect(self.db_file, read_only=True)
             rows = conn.execute(
-                "SELECT question, sql, category, quality_score, created_at "
-                "FROM kb_examples WHERE quality_score >= ? "
-                "ORDER BY quality_score DESC, created_at DESC LIMIT ?",
+                """
+                SELECT question, sql, category, confidence, created_at
+                FROM kb_metadata
+                WHERE record_type = 'example' AND confidence >= ?
+                ORDER BY confidence DESC, created_at DESC
+                LIMIT ?
+                """,
                 [min_quality, limit * 2],
             ).fetchall()
             conn.close()
@@ -384,14 +871,25 @@ class KBManager:
             if tables:
                 ph = ",".join(["?"] * len(tables))
                 rows = conn.execute(
-                    f"SELECT column_reference, definition FROM kb_glossary "
-                    f"WHERE table_name IN ({ph}) ORDER BY confidence DESC LIMIT ?",
+                    f"""
+                    SELECT column_name, content_text
+                    FROM kb_metadata
+                    WHERE record_type = 'glossary' AND table_name IN ({ph})
+                    ORDER BY confidence DESC
+                    LIMIT ?
+                    """,
                     tables + [limit],
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT column_reference, definition FROM kb_glossary "
-                    "ORDER BY confidence DESC LIMIT ?", [limit * 2]
+                    """
+                    SELECT column_name, content_text
+                    FROM kb_metadata
+                    WHERE record_type = 'glossary'
+                    ORDER BY confidence DESC
+                    LIMIT ?
+                    """,
+                    [limit * 2],
                 ).fetchall()
             conn.close()
             result = [{"column_reference": cr, "definition": d} for cr, d in rows]
@@ -410,12 +908,17 @@ class KBManager:
         try:
             conn = duckdb.connect(self.db_file, read_only=True)
             rows = conn.execute(
-                "SELECT table1, column1, table2, column2 FROM kb_joins"
+                """
+                SELECT table_name, column_name, related_table, content_text, metadata_json
+                FROM kb_metadata
+                WHERE record_type = 'join'
+                """
             ).fetchall()
             conn.close()
             joins: Dict[str, List] = defaultdict(list)
-            for t1, c1, t2, c2 in rows:
-                joins[t1].append((t2, f"{c1}->{c2}"))
+            for t1, c1, t2, c2, mj in rows:
+                meta = json.loads(mj or "{}")
+                joins[t1].append((t2, c2 or meta.get("content_text") or f"{c1}->{t2}"))
             self.joins_cache = dict(joins)
             return self.joins_cache
         except Exception as e:
@@ -435,24 +938,8 @@ class KBManager:
                 or schema_profile.get("file_name")
                 or ""
             )
-
-            # kb_catalog
-            conn.execute("DELETE FROM kb_catalog WHERE table_name = ?", [table_name])
-            conn.execute(
-                "INSERT INTO kb_catalog VALUES (?, ?, ?, ?, ?)",
-                [table_name,
-                 schema_profile.get("table_name") or table_name,
-                 schema_profile.get("total_rows") or 0,
-                 schema_profile.get("total_columns") or
-                 len(schema_profile.get("schema", [])),
-                 datetime.now().isoformat()],
-            )
-
-            # Clear old
-            conn.execute("DELETE FROM kb_documents WHERE table_name = ?", [table_name])
-            conn.execute("DELETE FROM kb_glossary  WHERE table_name = ?", [table_name])
-            conn.execute("DELETE FROM kb_vectors   WHERE table_name = ?", [table_name])
-            conn.execute("DELETE FROM kb_schema_fields WHERE table_name = ?", [table_name])
+            # Remove existing KB records for this table from the single metadata table.
+            conn.execute("DELETE FROM kb_metadata WHERE table_name = ? AND record_type IN ('table', 'column', 'glossary', 'vector', 'join', 'semantic_layer')", [table_name])
 
             # Process columns
             schema_cols = schema_profile.get("schema", [])
@@ -460,19 +947,6 @@ class KBManager:
                 cname = col.get("column")
                 if not cname:
                     continue
-
-                # kb_documents
-                conn.execute(
-                    "INSERT INTO kb_documents "
-                    "(id, table_name, column_name, data_type, business_meaning, "
-                    " nullable, ordinal_position, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    [f"{table_name}:{cname}", table_name, cname,
-                     col.get("data_type") or "TEXT",
-                     col.get("business_meaning") or "",
-                     col.get("nullable", True), pos,
-                     datetime.now().isoformat()],
-                )
 
                 sample_values = col.get("sample_values") or col.get("categorical_values") or []
                 sample_values_text = " | ".join(str(v) for v in sample_values[:5] if v is not None)
@@ -488,41 +962,45 @@ class KBManager:
                     validation_rule,
                     sample_values_text,
                 ]))
+                column_meta = {
+                    "id": f"{table_name}:{cname}",
+                    "record_type": "column",
+                    "table_name": table_name,
+                    "related_table": None,
+                    "column_name": cname,
+                    "content_text": search_text,
+                    "metadata_json": {
+                        "dataset_id": dataset_id,
+                        "source_file_name": source_file_name,
+                        "column_type": col.get("data_type") or "TEXT",
+                        "column_description": column_description,
+                        "validation_rule": validation_rule,
+                        "null_count": int(col.get("null_count", 0) or 0),
+                        "null_pct": float(col.get("null_pct", 0) or 0),
+                        "sample_values": sample_values,
+                        "ordinal_position": pos,
+                        "business_meaning": col.get("business_meaning") or column_description,
+                        "nullable": col.get("nullable", True),
+                        "search_text": search_text,
+                    },
+                }
+                _upsert_metadata_record(conn, column_meta)
 
-                conn.execute(
-                    "INSERT OR REPLACE INTO kb_schema_fields "
-                    "(id, dataset_id, table_name, source_file_name, column_name, column_type, "
-                    " column_description, validation_rule, null_count, null_pct, sample_values, "
-                    " search_text, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [f"{table_name}:{cname}",
-                     dataset_id,
-                     table_name,
-                     source_file_name,
-                     cname,
-                     col.get("data_type") or "TEXT",
-                     column_description,
-                     validation_rule,
-                     int(col.get("null_count", 0) or 0),
-                     float(col.get("null_pct", 0) or 0),
-                     sample_values_text,
-                     search_text,
-                     datetime.now().isoformat()],
-                )
+                if column_description:
+                    _upsert_metadata_record(conn, {
+                        "id": f"{table_name}:{cname}:meaning",
+                        "record_type": "glossary",
+                        "table_name": table_name,
+                        "related_table": None,
+                        "column_name": f"{table_name}.{cname}",
+                        "content_text": column_description,
+                        "metadata_json": {
+                            "definition": column_description,
+                            "confidence": 0.9,
+                        },
+                        "confidence": 0.9,
+                    })
 
-                # kb_glossary
-                meaning = column_description
-                if meaning:
-                    conn.execute(
-                        "INSERT INTO kb_glossary "
-                        "(id, table_name, column_reference, definition, "
-                        " confidence, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        [f"{table_name}:{cname}:meaning", table_name,
-                         f"{table_name}.{cname}", meaning, 0.9,
-                         datetime.now().isoformat()],
-                    )
-
-                # kb_vectors — rich column text
                 col_text = " | ".join(filter(None, [
                     table_name, cname,
                     col.get("data_type") or "",
@@ -545,10 +1023,53 @@ class KBManager:
             self._upsert_vector(conn, f"{table_name}:__table__",
                                 table_name, "table", table_text)
 
+            _upsert_metadata_record(conn, {
+                "id": f"{table_name}:__table__",
+                "record_type": "table",
+                "table_name": table_name,
+                "related_table": None,
+                "column_name": None,
+                "content_text": schema_profile.get("table_name") or table_name,
+                "metadata_json": {
+                    "description": schema_profile.get("table_name") or table_name,
+                    "row_count": schema_profile.get("total_rows") or 0,
+                    "column_count": schema_profile.get("total_columns") or len(schema_cols),
+                    "dataset_id": dataset_id,
+                    "source_file_name": source_file_name,
+                },
+            })
+
+            # Rebuild join hints from all KB metadata so NL->SQL gets stronger
+            # join candidates than simple name-based inference alone.
+            kb_join_edges = _refresh_joins_from_kb(conn)
+
+            # Also scan the actual DuckDB tables for value-overlap joins when
+            # the backing DB is available. This is the strongest signal and is
+            # what makes the join registry materially better than name-only rules.
+            real_data_edges = 0
+            try:
+                all_tables = conn.execute("""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'main'
+                      AND table_type = 'BASE TABLE'
+                      AND table_name NOT LIKE 'kb_%'
+                    ORDER BY table_name
+                """).fetchall()
+                real_data_edges = _refresh_joins_from_real_data(
+                    self.db_file,
+                    conn,
+                    [t[0] for t in all_tables],
+                )
+            except Exception as e:
+                logger.warning(f"[KB] real-data join refresh skipped: {e}")
+
             conn.close()
             self.catalog_cache = None
             logger.info(f"[KB] Registered {table_name}: "
-                        f"{len(schema_cols)} columns + {len(schema_cols)*2+1} vectors")
+                        f"{len(schema_cols)} columns + {len(schema_cols)*2+1} vectors"
+                        f" | kb_join_edges={kb_join_edges}"
+                        f" | real_data_edges={real_data_edges}")
             return True
         except Exception as e:
             logger.error(f"[KB] register_table {table_name} failed: {e}")
@@ -562,16 +1083,23 @@ class KBManager:
         if not question or not sql:
             return False
         try:
-            ex_id = (f"{abs(hash(question)) % 10**8}_"
-                     f"{datetime.now().strftime('%Y%m%d%H%M%S')}")
             conn = duckdb.connect(self.db_file)
-            conn.execute("DELETE FROM kb_examples WHERE id = ?", [ex_id])
-            conn.execute(
-                "INSERT INTO kb_examples VALUES (?, ?, ?, ?, ?, ?)",
-                [ex_id, question, sql, category,
-                 max(0.0, min(1.0, float(quality_score))),
-                 datetime.now().isoformat()],
-            )
+            ex_id = f"example:{abs(hash((question, sql))) % 10**10}"
+            _upsert_metadata_record(conn, {
+                "id": ex_id,
+                "record_type": "example",
+                "content_text": question,
+                "metadata_json": {
+                    "question": question,
+                    "sql": sql,
+                    "category": category,
+                    "quality_score": max(0.0, min(1.0, float(quality_score))),
+                },
+                "confidence": max(0.0, min(1.0, float(quality_score))),
+                "category": category,
+                "question": question,
+                "sql": sql,
+            })
             conn.close()
             self.examples_cache = None
             return True
@@ -590,10 +1118,10 @@ class KBManager:
             try:
                 conn      = duckdb.connect(self.db_file, read_only=True)
                 vec_count = conn.execute(
-                    "SELECT COUNT(*) FROM kb_vectors"
+                    "SELECT COUNT(*) FROM kb_metadata"
                 ).fetchone()[0]
                 vec_null_count = conn.execute(
-                    "SELECT COUNT(*) FROM kb_vectors WHERE embedding IS NULL"
+                    "SELECT COUNT(*) FROM kb_metadata WHERE embedding IS NULL"
                 ).fetchone()[0]
                 conn.close()
             except Exception:
@@ -692,23 +1220,65 @@ def persist_kb(storage_dir: str, dataset_id: str, schema_profile: dict,
         edges = _infer_join_edges(catalog, canonical)
         if edges:
             conn = duckdb.connect(kb.db_file)
-            conn.execute("DELETE FROM kb_joins WHERE table1=? OR table2=?",
-                         [canonical, canonical])
+            conn.execute(
+                "DELETE FROM kb_metadata WHERE record_type = 'join' AND (table_name = ? OR related_table = ?)",
+                [canonical, canonical],
+            )
             for e in edges:
-                conn.execute("INSERT INTO kb_joins VALUES (?,?,?,?,?,?)",
-                             [e["table1"], e["column1"], e["table2"],
-                              e["column2"], e["confidence"], e["source"]])
+                _upsert_metadata_record(conn, {
+                    "id": f"join:inferred:{e['table1']}:{e['column1']}:{e['table2']}:{e['column2']}",
+                    "record_type": "join",
+                    "table_name": e["table1"],
+                    "related_table": e["table2"],
+                    "column_name": e["column1"],
+                    "content_text": f"{e['table1']}.{e['column1']} -> {e['table2']}.{e['column2']}",
+                    "metadata_json": e,
+                    "confidence": float(e["confidence"]),
+                })
             conn.close()
             kb.joins_cache = None
             join_edges = len(edges)
     except Exception as ex:
         logger.warning(f"[kb] join inference failed: {ex}")
 
-    _save_kb_state(storage_dir, {
+    try:
+        catalog = kb.load_catalog(force_refresh=True)
+        joins = kb.load_joins(force_refresh=True)
+        existing_md = load_semantic_layer(storage_dir)
+        semantic_md = _merge_semantic_layer_markdown(existing_md, catalog, joins, [canonical])
+        _save_semantic_layer(storage_dir, semantic_md)
+    except Exception as ex:
+        logger.warning(f"[kb] semantic layer build failed: {ex}")
+
+    try:
+        conn = duckdb.connect(kb.db_file)
+        kb_profile_edges = _refresh_joins_from_kb(conn)
+        real_data_edges = 0
+        try:
+            tables = [row[0] for row in conn.execute("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'main'
+                  AND table_type = 'BASE TABLE'
+                  AND table_name NOT LIKE 'kb_%'
+                ORDER BY table_name
+            """).fetchall()]
+            real_data_edges = _refresh_joins_from_real_data(kb.db_file, conn, tables)
+        except Exception as e:
+            logger.warning(f"[kb] real-data join refresh skipped: {e}")
+        conn.close()
+        join_edges += kb_profile_edges + real_data_edges
+        if kb_profile_edges or real_data_edges:
+            kb.joins_cache = None
+    except Exception as ex:
+        logger.warning(f"[kb] kb-profile join refresh failed: {ex}")
+
+    state = _merge_kb_state(storage_dir, {
         "last_dataset_id": dataset_id,
         "tables": list(kb.load_catalog().keys()),
         "join_edges": join_edges,
     })
+    _save_kb_state(storage_dir, state)
     return {
         "success": ok,
         "documents_written": len(schema_profile.get("schema", [])) + 1,
@@ -717,7 +1287,7 @@ def persist_kb(storage_dir: str, dataset_id: str, schema_profile: dict,
 
 
 def refresh_kb_from_duckdb(db_file: str, storage_dir: str) -> dict:
-    kb = get_kb_manager()
+    kb = get_kb_manager(db_file)
     _DB_FILE_REF[0] = db_file
     try:
         conn_ro = duckdb.connect(db_file, read_only=True)
@@ -758,7 +1328,7 @@ def refresh_kb_from_duckdb(db_file: str, storage_dir: str) -> dict:
     try:
         catalog = kb.load_catalog(force_refresh=True)
         conn = duckdb.connect(db_file)
-        conn.execute("DELETE FROM kb_joins")
+        conn.execute("DELETE FROM kb_metadata WHERE record_type = 'join'")
         processed = set()
         all_edges = []
         for tname in refreshed:
@@ -768,14 +1338,43 @@ def refresh_kb_from_duckdb(db_file: str, storage_dir: str) -> dict:
                     processed.add(pair)
                     all_edges.append(e)
         for e in all_edges:
-            conn.execute("INSERT INTO kb_joins VALUES (?,?,?,?,?,?)",
-                         [e["table1"], e["column1"], e["table2"],
-                          e["column2"], e["confidence"], e["source"]])
+            _upsert_metadata_record(conn, {
+                "id": f"join:refresh:{e['table1']}:{e['column1']}:{e['table2']}:{e['column2']}",
+                "record_type": "join",
+                "table_name": e["table1"],
+                "related_table": e["table2"],
+                "column_name": e["column1"],
+                "content_text": f"{e['table1']}.{e['column1']} -> {e['table2']}.{e['column2']}",
+                "metadata_json": e,
+                "confidence": float(e["confidence"]),
+            })
         conn.close()
         kb.joins_cache = None
         join_edges = len(all_edges)
     except Exception as ex:
         logger.warning(f"[kb] join rebuild failed: {ex}")
+
+    try:
+        conn = duckdb.connect(db_file)
+        kb_profile_edges = _refresh_joins_from_kb(conn)
+        real_data_edges = _refresh_joins_from_real_data(
+            db_file,
+            conn,
+            refreshed,
+        )
+        conn.close()
+        join_edges += kb_profile_edges + real_data_edges
+    except Exception as ex:
+        logger.warning(f"[kb] kb-profile join rebuild failed: {ex}")
+
+    try:
+        semantic_md = build_semantic_layer_markdown(
+            kb.load_catalog(force_refresh=True),
+            kb.load_joins(force_refresh=True),
+        )
+        _save_semantic_layer(storage_dir, semantic_md)
+    except Exception as ex:
+        logger.warning(f"[kb] semantic layer rebuild failed: {ex}")
 
     _save_kb_state(storage_dir, {
         "tables": refreshed,
@@ -789,6 +1388,356 @@ def refresh_kb_from_duckdb(db_file: str, storage_dir: str) -> dict:
         "join_edges": join_edges,
         "tables": refreshed,
     }
+
+
+def refresh_missing_kb_tables_with_ai(db_file: str, storage_dir: str) -> dict:
+    t0_all = time.time()
+    kb = get_kb_manager(db_file)
+    _DB_FILE_REF[0] = db_file
+
+    try:
+        t0_scan = time.time()
+        conn = duckdb.connect(db_file, read_only=True)
+        tables = [
+            row[0] for row in conn.execute("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'main'
+                  AND table_type = 'BASE TABLE'
+                  AND table_name NOT LIKE 'kb_%'
+                ORDER BY table_name
+            """).fetchall()
+        ]
+        existing = {
+            row[0] for row in conn.execute("""
+                SELECT DISTINCT table_name
+                FROM kb_metadata
+                WHERE record_type = 'table'
+            """).fetchall()
+            if row[0]
+        }
+        conn.close()
+        logger.info(f"[kb] scan complete | tables={len(tables)} | elapsed={time.time()-t0_scan:.2f}s")
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+    missing = [t for t in tables if t not in existing]
+    enriched = []
+    skipped = []
+
+    for tname in missing:
+        try:
+            t0_table = time.time()
+            conn_ro = duckdb.connect(db_file, read_only=True)
+            row_count = conn_ro.execute(f'SELECT COUNT(*) FROM "{tname}"').fetchone()[0]
+            conn_ro.close()
+            file_size_bytes = 0
+            try:
+                file_size_bytes = os.path.getsize(db_file)
+            except Exception:
+                pass
+
+            metadata = get_full_metadata_for_ai(
+                db_file,
+                tname,
+                tname,
+                file_size_bytes,
+                1,
+            )
+            system_prompt, user_prompt = _build_missing_table_prompt(metadata)
+            logger.info(f"[kb] ai start | table={tname} | rows={row_count} | cols={metadata.get('total_columns', 0)}")
+            ai_result = ask_json(user_prompt, system_prompt)
+            if not ai_result:
+                raise RuntimeError("AI returned no result")
+
+            ai_result["table_name"] = ai_result.get("table_name") or tname
+            ai_result["total_rows"] = ai_result.get("total_rows", row_count)
+            ai_result["total_columns"] = ai_result.get("total_columns", metadata.get("total_columns", 0))
+
+            schema_rows = ai_result.get("schema") or []
+            profile = {
+                "table_name": tname,
+                "total_rows": ai_result.get("total_rows", row_count),
+                "total_columns": ai_result.get("total_columns", metadata.get("total_columns", 0)),
+                "schema": schema_rows,
+            }
+
+            if kb.register_table(tname, profile):
+                enriched.append(tname)
+                logger.info(f"[kb] ai done | table={tname} | elapsed={time.time()-t0_table:.2f}s")
+            else:
+                skipped.append(tname)
+                logger.warning(f"[kb] register failed | table={tname} | elapsed={time.time()-t0_table:.2f}s")
+        except Exception as e:
+            logger.warning(f"[kb] AI enrichment skipped {tname}: {e} | elapsed={time.time()-t0_table:.2f}s")
+            skipped.append(tname)
+
+    try:
+        t0_semantic = time.time()
+        semantic_md = build_semantic_layer_markdown(
+            kb.load_catalog(force_refresh=True),
+            kb.load_joins(force_refresh=True),
+        )
+        _save_semantic_layer(storage_dir, semantic_md)
+        logger.info(f"[kb] semantic layer written | elapsed={time.time()-t0_semantic:.2f}s")
+    except Exception as ex:
+        logger.warning(f"[kb] semantic layer rebuild failed: {ex}")
+
+    try:
+        t0_state = time.time()
+        _save_kb_state(storage_dir, {
+            "tables": list(kb.load_catalog(force_refresh=True).keys()),
+            "refresh_mode": "missing_tables_ai_enrichment",
+            "enriched_tables": enriched,
+            "skipped_tables": skipped,
+        })
+        logger.info(f"[kb] kb_state written | elapsed={time.time()-t0_state:.2f}s")
+    except Exception as ex:
+        logger.warning(f"[kb] kb state save failed: {ex}")
+
+    logger.info(f"[kb] refresh complete | total_elapsed={time.time()-t0_all:.2f}s | enriched={len(enriched)} | skipped={len(skipped)}")
+    return {
+        "success": True,
+        "tables_scanned": len(tables),
+        "tables_missing": len(missing),
+        "tables_enriched": enriched,
+        "tables_skipped": skipped,
+    }
+
+
+def generate_kb_refresh_staging(db_file: str, storage_dir: str, staging_path: str) -> dict:
+    t0_all = time.time()
+    try:
+        conn = duckdb.connect(db_file, read_only=True)
+        tables = [
+            row[0] for row in conn.execute("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'main'
+                  AND table_type = 'BASE TABLE'
+                  AND table_name NOT LIKE 'kb_%'
+                ORDER BY table_name
+            """).fetchall()
+        ]
+        existing = {
+            row[0] for row in conn.execute("""
+                SELECT DISTINCT table_name
+                FROM kb_metadata
+                WHERE record_type = 'table'
+            """).fetchall()
+            if row[0]
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    missing = [t for t in tables if t not in existing]
+    staged_tables = []
+    scan_start = time.time()
+    for tname in missing:
+        try:
+            conn_ro = duckdb.connect(db_file, read_only=True)
+            describe = conn_ro.execute(f'DESCRIBE "{tname}"').fetchall()
+            row_count = conn_ro.execute(f'SELECT COUNT(*) FROM "{tname}"').fetchone()[0]
+            sample_rows = conn_ro.execute(f'SELECT * FROM "{tname}" LIMIT 1').fetchall()
+            cols = [c[0] for c in conn_ro.execute(f'DESCRIBE "{tname}"').fetchall()]
+            conn_ro.close()
+            staged_tables.append({
+                "table_name": tname,
+                "total_rows": int(row_count),
+                "total_columns": len(describe),
+                "schema": [
+                    {
+                        "column": c[0],
+                        "data_type": c[1],
+                        "business_meaning": "",
+                        "nullable": True,
+                        "sample_values": [],
+                    }
+                    for c in describe
+                ],
+                "sample_rows": [dict(zip(cols, row)) for row in sample_rows] if sample_rows else [],
+            })
+        except Exception as e:
+            logger.warning(f"[kb] staging skipped {tname}: {e}")
+
+    payload = {
+        "generated_at": datetime.utcnow().isoformat(),
+        "db_file": db_file,
+        "storage_dir": storage_dir,
+        "tables_scanned": len(tables),
+        "tables_missing": len(missing),
+        "tables_staged": len(staged_tables),
+        "tables": staged_tables,
+    }
+
+    os.makedirs(os.path.dirname(staging_path), exist_ok=True)
+    with open(staging_path, "w") as f:
+        json.dump(payload, f, indent=2, default=str)
+
+    return {
+        "success": True,
+        "mode": "staged",
+        "staging_path": staging_path,
+        "tables_scanned": len(tables),
+        "tables_missing": len(missing),
+        "tables_staged": len(staged_tables),
+        "elapsed_seconds": round(time.time() - t0_all, 2),
+    }
+
+
+def apply_kb_refresh_staging(db_file: str, storage_dir: str, staging_path: str) -> dict:
+    if not os.path.exists(staging_path):
+        return {"success": False, "error": f"staging file not found: {staging_path}"}
+
+    with open(staging_path) as f:
+        payload = json.load(f)
+
+    kb = get_kb_manager(db_file)
+    applied = []
+    skipped = []
+    for table_info in payload.get("tables", []):
+        try:
+            t0_table = time.time()
+            tname = table_info.get("table_name")
+            if not tname:
+                continue
+            logger.info(f"[kb] ai refresh start | table={tname}")
+            file_size_bytes = os.path.getsize(db_file) if os.path.exists(db_file) else 0
+            metadata = get_full_metadata_for_ai(
+                db_file,
+                tname,
+                tname,
+                file_size_bytes,
+                1,
+            )
+            system_prompt, user_prompt = build_schema_discovery_prompt(metadata)
+            logger.info(
+                f"[kb] ai refresh prompt | table={tname} | rows={table_info.get('total_rows', 0)} "
+                f"| cols={table_info.get('total_columns', 0)} | sample_rows={len(table_info.get('sample_rows', []))}"
+            )
+            ai_result = ask_json(user_prompt, system_prompt)
+            schema_rows = ai_result.get("schema") or table_info.get("schema", [])
+            profile = {
+                "table_name": ai_result.get("table_name") or tname,
+                "total_rows": ai_result.get("total_rows", table_info.get("total_rows", 0)),
+                "total_columns": ai_result.get("total_columns", table_info.get("total_columns", 0)),
+                "schema": schema_rows,
+            }
+            if kb.register_table(tname, profile):
+                applied.append(tname)
+                logger.info(f"[kb] ai refresh done | table={tname} | elapsed={time.time()-t0_table:.2f}s")
+            else:
+                skipped.append(tname)
+        except Exception as e:
+            logger.warning(f"[kb] apply skipped {table_info.get('table_name')}: {e} | elapsed={time.time()-t0_table:.2f}s")
+            skipped.append(table_info.get("table_name"))
+
+    existing_md = load_semantic_layer(storage_dir)
+    try:
+        catalog = kb.load_catalog(force_refresh=True)
+        joins = kb.load_joins(force_refresh=True)
+        merged_md = _merge_semantic_layer_markdown(existing_md, catalog, joins, applied)
+        _save_semantic_layer(storage_dir, merged_md)
+    except Exception:
+        pass
+
+    state = _merge_kb_state(storage_dir, {
+        "tables": list(kb.load_catalog(force_refresh=True).keys()),
+        "refresh_mode": "applied",
+        "enriched_tables": applied,
+        "skipped_tables": skipped,
+    })
+    _save_kb_state(storage_dir, state)
+
+    return {
+        "success": True,
+        "mode": "applied",
+        "staging_path": staging_path,
+        "tables_applied": applied,
+        "tables_skipped": skipped,
+    }
+
+
+def finalize_kb_refresh(db_file: str, storage_dir: str) -> dict:
+    kb = get_kb_manager(db_file)
+    try:
+        catalog = kb.load_catalog(force_refresh=True)
+        joins = kb.load_joins(force_refresh=True)
+        existing_md = load_semantic_layer(storage_dir)
+        semantic_md = _merge_semantic_layer_markdown(existing_md, catalog, joins, list(catalog.keys()))
+        _save_semantic_layer(storage_dir, semantic_md)
+        state = _merge_kb_state(storage_dir, {
+            "tables": list(catalog.keys()),
+            "refresh_mode": "finalized",
+        })
+        _save_kb_state(storage_dir, state)
+    except Exception as ex:
+        return {"success": False, "error": str(ex)}
+
+    return {
+        "success": True,
+        "mode": "finalized",
+        "tables": list(kb.load_catalog(force_refresh=True).keys()),
+    }
+
+
+def _build_missing_table_prompt(metadata: dict) -> Tuple[str, str]:
+    filename = metadata.get("filename", "unknown")
+    system_prompt = (
+        "You are a senior data engineer.\n"
+        "Return ONLY valid JSON.\n"
+        "Use concise, factual field values.\n"
+        "Do not add markdown fences, comments, or extra text."
+    )
+    payload = {
+        "table_name": metadata.get("table_name") or filename,
+        "total_rows": metadata.get("total_rows", 0),
+        "total_columns": metadata.get("total_columns", 0),
+        "columns": [
+            {
+                "name": col.get("name"),
+                "dtype": col.get("dtype"),
+                "null_count": col.get("null_count", 0),
+                "null_pct": col.get("null_pct", 0),
+                "unique_count": col.get("unique_count", 0),
+                "sample_values": (col.get("sample_values") or [])[:3],
+            }
+            for col in metadata.get("columns", [])
+        ],
+        "sample_rows": (metadata.get("sample_rows") or [])[:1],
+    }
+    user_prompt = f"""
+Analyze this table metadata and return JSON in exactly this shape:
+{{
+  "table_name": "",
+  "total_columns": 0,
+  "total_rows": 0,
+  "schema": [
+    {{
+      "column": "",
+      "business_meaning": "",
+      "data_type": "",
+      "nullable": true,
+      "null_count": 0,
+      "null_pct": 0,
+      "unique_count": 0,
+      "validation_rule": "",
+      "sample_values": [],
+      "categorical_values": []
+    }}
+  ]
+}}
+
+Use only the supplied metadata. Keep output compact.
+TABLE_METADATA=
+{json.dumps(payload, default=str, ensure_ascii=True)}
+"""
+    return system_prompt, user_prompt
 
 
 def upsert_example_pair(storage_dir: str, dataset_id: str, question: str,
@@ -814,14 +1763,16 @@ def upsert_join_edges(storage_dir: str, edges: list) -> dict:
             src = str(e.get("source") or "tab8")
             if not lt or not rt:
                 continue
-            conn.execute(
-                "DELETE FROM kb_joins "
-                "WHERE table1=? AND column1=? AND table2=? AND source=?",
-                [lt, lc, rt, src],
-            )
-            conn.execute("INSERT INTO kb_joins VALUES (?,?,?,?,?,?)",
-                         [lt, lc, rt, rc,
-                          float(e.get("confidence") or 0.5), src])
+            _upsert_metadata_record(conn, {
+                "id": f"join:{src}:{lt}:{lc}:{rt}:{rc}",
+                "record_type": "join",
+                "table_name": lt,
+                "related_table": rt,
+                "column_name": lc,
+                "content_text": f"{lt}.{lc} -> {rt}.{rc}",
+                "metadata_json": {**e, "source": src},
+                "confidence": float(e.get("confidence") or 0.5),
+            })
             inserted += 1
         conn.close()
         kb.joins_cache = None

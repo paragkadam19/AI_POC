@@ -18,6 +18,7 @@ Bedrock Titan embeddings and DuckDB VSS HNSW index.
 
 import json
 import re
+import os
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,6 +28,7 @@ import duckdb
 from logger_config import get_logger
 
 logger = get_logger(__name__)
+DEBUG_NLQ_PROMPTS = os.getenv("DEBUG_NLQ_PROMPTS", "").lower() in {"1", "true", "yes"}
 
 # Global KB Manager ref (wired in by app.py via set_kb_manager)
 _KB_MANAGER: Optional[Any] = None
@@ -43,7 +45,7 @@ def set_kb_manager(kb_manager):
 # RETRIEVAL: Vector semantic search via KB Manager
 # ============================================================================
 
-def retrieve_tables_vector(question: str, top_k: int = 15) -> Tuple[List[str], List[str]]:
+def retrieve_tables_vector(question: str, top_k: int = 20) -> Tuple[List[str], List[str]]:
     """
     Use KB Manager's vector semantic search to find relevant tables.
     Returns (table_names, warnings).
@@ -58,14 +60,25 @@ def retrieve_tables_vector(question: str, top_k: int = 15) -> Tuple[List[str], L
         return [], ["KB Manager not initialized"]
 
     try:
+        catalog = _KB_MANAGER.load_catalog(force_refresh=False) or {}
+        q = (question or "").lower()
+        exact_tables = [
+            t for t in catalog.keys()
+            if t and (t.lower() in q or q in t.lower())
+        ]
+
         # Real vector retrieval via kb_manager
         results = _KB_MANAGER.retrieve_by_vector(question, top_k=top_k)
 
         if not results:
+            if exact_tables:
+                return exact_tables[:5], []
             logger.warning("[poc8] VSS returned no results — KB may be empty")
             return [], ["No matching tables found in KB"]
 
-        # Keep the best score per table and drop only near-zero matches.
+        q_tokens = {tok for tok in re.findall(r"[a-z0-9_]+", q) if len(tok) >= 3}
+
+        # Keep the best score per table and boost exact table-name matches.
         table_scores: Dict[str, float] = {}
         for doc in results:
             tname = doc.get("table_name")
@@ -74,6 +87,9 @@ def retrieve_tables_vector(question: str, top_k: int = 15) -> Tuple[List[str], L
                 continue
             if score < 0.05:
                 continue
+            tname_l = str(tname).lower()
+            if any(tok == tname_l or tok in tname_l for tok in q_tokens):
+                score += 0.35
             if tname not in table_scores or score > table_scores[tname]:
                 table_scores[tname] = score
             logger.debug(
@@ -83,10 +99,14 @@ def retrieve_tables_vector(question: str, top_k: int = 15) -> Tuple[List[str], L
             )
 
         tables = [t for t, _ in sorted(table_scores.items(), key=lambda item: item[1], reverse=True)]
+        for t in reversed(exact_tables):
+            if t not in tables:
+                tables.insert(0, t)
         if not tables:
             warnings.append("Vector search found documents but no table names extracted")
             return [], warnings
 
+        tables = tables[:5]
         logger.info(f"[poc8] Vector retrieval found {len(tables)} tables from {len(results)} documents")
         return tables, warnings
 
@@ -278,6 +298,45 @@ def _build_schema_context(catalog: Dict[str, Any], tables: List[str]) -> str:
     return "\n\n".join(docs) if docs else "(No schema found for selected tables)"
 
 
+def _load_semantic_layer_context(storage_dir: str) -> str:
+    try:
+        from kb_manager import load_semantic_layer
+        doc = load_semantic_layer(storage_dir)
+        return doc.strip()
+    except Exception as e:
+        logger.warning(f"[poc8] semantic layer load failed: {e}")
+        return ""
+
+
+def _filter_semantic_layer_for_tables(semantic_layer: str, tables: List[str]) -> str:
+    if not semantic_layer.strip() or not tables:
+        return ""
+
+    wanted = set(tables)
+    lines = semantic_layer.splitlines()
+    blocks = []
+    current = []
+    current_table = None
+
+    def flush():
+        nonlocal current, current_table
+        if current_table in wanted and current:
+            blocks.append("\n".join(current).strip())
+        current = []
+        current_table = None
+
+    for line in lines:
+        if line.startswith("### "):
+            flush()
+            current_table = line[4:].strip()
+            current = [line]
+        elif current_table is not None:
+            current.append(line)
+
+    flush()
+    return "\n\n".join(blocks).strip()
+
+
 # ============================================================================
 # MAIN QUESTION → SQL FLOW
 # ============================================================================
@@ -305,7 +364,7 @@ def question_to_sql(
     try:
         # 1. RETRIEVE: Vector semantic search via KB Manager
         logger.info(f"[poc8] Starting vector retrieval for: {question[:60]}...")
-        retrieved, retrieval_warnings = retrieve_tables_vector(question, top_k=15)
+        retrieved, retrieval_warnings = retrieve_tables_vector(question, top_k=20)
         warnings.extend(retrieval_warnings)
 
         if not retrieved:
@@ -313,7 +372,7 @@ def question_to_sql(
             return {
                 "ok": False,
                 "error": "No relevant tables found for your question. "
-                         "Try uploading data or rephrasing.",
+                         "Make sure the KB has been built, or rephrase the question.",
                 "tables": [],
                 "warnings": warnings,
             }
@@ -367,8 +426,19 @@ def question_to_sql(
             f"({len(expanded.get('bridges_added', []))} bridges added)"
         )
 
+        if len(final_tables) == 1 and join_graph.get(final_tables[0]):
+            related = [n for n, _ in join_graph.get(final_tables[0], [])][:2]
+            for rel in related:
+                if rel not in final_tables:
+                    final_tables.append(rel)
+            logger.info(f"[poc8] Added fallback related tables: {related}")
+
         # 3. BUILD CONTEXT: Schema for Claude
         schema_context = _build_schema_context(catalog, final_tables)
+        semantic_layer = _filter_semantic_layer_for_tables(
+            _load_semantic_layer_context(storage_dir),
+            final_tables,
+        )
 
         # 4. LOAD EXAMPLES: Few-shot pairs
         examples = _KB_MANAGER.load_examples(min_quality=0.80, limit=3)
@@ -389,6 +459,9 @@ Convert natural language questions into DuckDB SQL.
 - If you prefer, you may also return {"query":"SELECT ..."}"""
 
         user_prompt = f"""
+SEMANTIC LAYER:
+{semantic_layer if semantic_layer else "(No semantic-layer document available)"}
+
 SCHEMA:
 {schema_context}
 
@@ -400,7 +473,30 @@ QUESTION: {question}
 Generate the SQL query."""
 
         logger.info(f"[poc8] Calling Claude with {len(final_tables)} tables in context...")
+        if DEBUG_NLQ_PROMPTS:
+            logger.info(
+                "\n"
+                + "=" * 72
+                + "\n[poc8] NLQ SYSTEM PROMPT\n"
+                + f"{system_prompt}\n"
+                + "=" * 72
+            )
+            logger.info(
+                "\n"
+                + "=" * 72
+                + "\n[poc8] NLQ USER PROMPT\n"
+                + f"{user_prompt}\n"
+                + "=" * 72
+            )
         response = ask_json_fn(user_prompt, system_prompt)
+        if DEBUG_NLQ_PROMPTS:
+            logger.info(
+                "\n"
+                + "=" * 72
+                + "\n[poc8] NLQ RAW RESPONSE\n"
+                + f"{json.dumps(response, indent=2, default=str)}\n"
+                + "=" * 72
+            )
 
         if not response:
             return {

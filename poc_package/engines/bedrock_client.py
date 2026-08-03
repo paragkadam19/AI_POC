@@ -3,6 +3,7 @@ import json
 import time
 import re
 import os
+import urllib3
 
 from logger_config import get_logger
 logger = get_logger(__name__)
@@ -22,6 +23,8 @@ _token_stats = {
 
 _langfuse = None
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 
 def _aws_env_config():
     access_key = os.getenv("AWS_ACCESS_KEY_ID")
@@ -36,6 +39,10 @@ def _init_langfuse():
     global _langfuse
     if _langfuse is not None:
         return _langfuse
+
+    if os.getenv("DISABLE_LANGFUSE", "").lower() in {"1", "true", "yes"}:
+        logger.info("[langfuse] disabled via DISABLE_LANGFUSE")
+        return None
 
     try:
         from langfuse import Langfuse
@@ -83,7 +90,7 @@ def get_client():
         if session_token:
             client_kwargs["aws_session_token"] = session_token
 
-        _client = boto3.client(**client_kwargs)
+        _client = boto3.client(**client_kwargs,verify = False)
     return _client
 
 
@@ -238,7 +245,7 @@ def ask(prompt: str,
 def ask_json(prompt: str,
              system: str = "",
              model: str = None,
-             max_tokens: int = 16000,
+             max_tokens: int = 8000,
              verbose: bool = True) -> dict:
     full_system = (system + "\n\n" if system else "") + \
                   "CRITICAL: Return ONLY valid JSON. No markdown fences, no explanation, no preamble. Use double quotes only. Keep the JSON compact."
@@ -282,7 +289,7 @@ JSON error:
 Broken JSON:
 {bad_json}
 """
-        return ask(repair_prompt, system=full_system, model=model, max_tokens=4000, verbose=verbose)
+        return ask(repair_prompt, system=full_system, model=model, max_tokens=3000, verbose=False)
 
     t0 = time.time()
     raw = ask(prompt, system=full_system, model=model, max_tokens=max_tokens, verbose=verbose)
