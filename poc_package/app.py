@@ -87,7 +87,7 @@ except ImportError:
         return {"success": False}
 from duckdb_helper import (
     ingest_csv, get_preview, get_full_metadata_for_ai,
-    SAMPLE_ROWS_SCHEMA,
+    SAMPLE_ROWS_SCHEMA, write_table_schema_snapshot,
 )
 
 app = Flask(__name__, static_folder="static", static_url_path="")
@@ -195,7 +195,7 @@ def table_name(dataset_id: str) -> str:
     return name
 
 
-AUDIT_COLUMN_NAMES = {"sys_date", "sys_active", "file_path"}
+AUDIT_COLUMN_NAMES = {"system_date", "system_active", "file_path"}
 
 
 def strip_audit_columns(schema_profile: dict) -> dict:
@@ -469,11 +469,16 @@ def upload():
         if not ingest_result.get("success"):
             return jsonify({"error": ingest_result.get("error", "DB ingest failed")}), 500
 
+        snapshot_result = write_table_schema_snapshot(DB_FILE, table)
+        if not snapshot_result.get("success"):
+            logger.warning(f"[schema] snapshot write failed: {snapshot_result.get('error')}")
+
         sample, columns, row_count = get_preview(DB_FILE, table, n=8, row_count=ingest_result["row_count"])
         return jsonify({
             "dataset_id": dataset_id, "filename": filename,
             "row_count": row_count, "columns": columns,
             "sample": sample, "duckdb": ingest_result,
+            "schema_snapshot": snapshot_result,
         })
     except Exception as e:
         logger.error(f"Upload/ingest failed for dataset={dataset_id}: {e}", exc_info=True)

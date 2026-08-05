@@ -44,10 +44,12 @@ INPUT
 
 TASK
 1. Verify/correct types from samples.
-2. Infer business meaning from name + data.
-3. Flag quality issues, PII/security, imbalance, invalid formats.
-4. Pick key columns and recommended indexes.
-5. Return ONLY valid JSON.
+2. Write a short but useful column description.
+3. Write a detailed business meaning for each column.
+4. Provide 1 example value or sample for each column.
+5. Flag quality issues, PII/security, imbalance, invalid formats.
+6. Pick key columns and recommended indexes.
+7. Return ONLY valid JSON.
 """
 
     metadata_payload = {
@@ -99,6 +101,7 @@ RETURN JSON:
   "schema": [
     {
       "column": "exact name",
+      "column_description": "short useful description",
       "business_meaning": "what this represents",
       "data_type": "corrected dtype based on actual samples (not just Polars inference!)",
       "nullable": true,

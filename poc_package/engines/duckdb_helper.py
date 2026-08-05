@@ -15,7 +15,7 @@ Low-cardinality columns get value_counts (not just distinct values)
 via DuckDB's histogram() aggregate, in a single combined query/scan.
 
 Every ingested table gets 3 audit columns added in the same single
-CREATE TABLE AS SELECT pass: sys_date, sys_active, file_path.
+CREATE TABLE AS SELECT pass: system_date, system_active, file_path.
 """
 import os
 import duckdb
@@ -28,6 +28,7 @@ DUCKDB_CONFIG = {
     "max_temp_directory_size":   "20GB",
     "threads":                   4,
     "preserve_insertion_order":  False,
+    "hnsw_enable_experimental_persistence": True,
 }
 
 SAMPLE_ROWS_SCHEMA = 10
@@ -50,8 +51,8 @@ def ingest_csv(csv_file: str, db_file: str, table: str, original_filename: str =
     Ingest CSV into DuckDB, adding 3 audit/control columns to every table
     in the same single CREATE TABLE AS SELECT pass (no extra scan needed):
 
-      - sys_date   : today's date, set at ingest time
-      - sys_active : boolean, true for every row by default
+      - system_date   : today's date, set at ingest time
+      - system_active : boolean, true for every row by default
       - file_path  : the local file path of the uploaded CSV
     """
     try:
@@ -68,8 +69,8 @@ def ingest_csv(csv_file: str, db_file: str, table: str, original_filename: str =
             CREATE TABLE {qtable} AS
             SELECT
                 *,
-                DATE '{today}'  AS sys_date,
-                true            AS sys_active,
+                DATE '{today}'  AS system_date,
+                true            AS system_active,
                 '{local_file_path}' AS file_path
             FROM read_csv_auto('{csv_file}', sample_size={CSV_AUTODETECT_SAMPLE_SIZE}, nullstr='')
         """)
@@ -86,6 +87,49 @@ def ingest_csv(csv_file: str, db_file: str, table: str, original_filename: str =
             "col_names":    [c[0] for c in cols],
             "file_size_mb": round(file_size_bytes / (1024 * 1024), 2),
         }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def write_table_schema_snapshot(db_file: str, table: str) -> dict:
+    """
+    Save the actual DuckDB schema for a table into a durable snapshot table.
+    This uses the real database types, not AI-generated metadata.
+    """
+    try:
+        conn = duckdb.connect(db_file, config=DUCKDB_CONFIG)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS table_schema_snapshot (
+                id TEXT PRIMARY KEY,
+                table_name TEXT,
+                column_name TEXT,
+                data_type TEXT,
+                nullable BOOLEAN,
+                created_at TEXT
+            )
+        """)
+
+        conn.execute("DELETE FROM table_schema_snapshot WHERE table_name = ?", [table])
+        rows = conn.execute(f"DESCRIBE {_quote_ident(table)}").fetchall()
+        now = date.today().isoformat()
+        for idx, row in enumerate(rows, start=1):
+            conn.execute(
+                """
+                INSERT INTO table_schema_snapshot
+                (id, table_name, column_name, data_type, nullable, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    f"{table}:{row[0]}",
+                    table,
+                    row[0],
+                    row[1],
+                    True,
+                    now,
+                ],
+            )
+        conn.close()
+        return {"success": True, "rows_written": len(rows)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 

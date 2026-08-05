@@ -19,6 +19,7 @@ Bedrock Titan embeddings and DuckDB VSS HNSW index.
 import json
 import re
 import os
+import difflib
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,6 +30,7 @@ from logger_config import get_logger
 
 logger = get_logger(__name__)
 DEBUG_NLQ_PROMPTS = os.getenv("DEBUG_NLQ_PROMPTS", "").lower() in {"1", "true", "yes"}
+AUDIT_COLUMNS = {"system_date", "system_active", "file_path"}
 
 # Global KB Manager ref (wired in by app.py via set_kb_manager)
 _KB_MANAGER: Optional[Any] = None
@@ -273,6 +275,8 @@ def _build_document(table_meta: dict) -> str:
     lines = [f"TABLE: {tname}"]
     for col in cols:
         cname = col.get("column", "")
+        if cname.lower() in AUDIT_COLUMNS:
+            continue
         ctype = col.get("data_type", "")
         meaning = col.get("business_meaning", "")
         sample = " | ".join(str(v) for v in (col.get("sample_values") or [])[:2])
@@ -335,6 +339,86 @@ def _filter_semantic_layer_for_tables(semantic_layer: str, tables: List[str]) ->
 
     flush()
     return "\n\n".join(blocks).strip()
+
+
+def _repair_sql_column_names(sql: str, catalog: Dict[str, Any], tables: List[str]) -> str:
+    if not sql or not catalog or not tables:
+        return sql
+
+    known_columns = []
+    for table_name in tables:
+        meta = catalog.get(table_name) or {}
+        for col in meta.get("columns", []):
+            actual = str(col.get("column") or "").strip()
+            if not actual:
+                continue
+            known_columns.append(actual)
+
+    def repl(match):
+        token = match.group(0)
+        lowered = token.lower()
+        if lowered in {"select", "from", "where", "join", "left", "right", "inner", "outer", "on", "and", "or", "as", "group", "by", "order", "limit", "partition", "over", "row_number", "with", "distinct", "case", "when", "then", "else", "end", "true", "false"}:
+            return token
+        if token in known_columns:
+            return token
+        candidate = difflib.get_close_matches(token, known_columns, n=1, cutoff=0.65)
+        return candidate[0] if candidate else token
+
+    pattern = r"\b[a-zA-Z][a-zA-Z0-9_]*\b"
+    return re.sub(pattern, repl, sql)
+
+
+def _build_expected_complexity_hint(question: str) -> str:
+    q = (question or "").lower()
+    hints = []
+    if any(tok in q for tok in ("growth", "trend", "month over month", "m-o-m", "mom", "yoy", "year over year")):
+        hints.append("window function (LAG/LEAD) or time-series logic")
+    if any(tok in q for tok in ("average", "sum", "total", "count", "minimum", "maximum", "revenue", "orders", "sales")):
+        hints.append("aggregate fields")
+    if any(tok in q for tok in ("segment", "region", "category", "premium", "east", "west", "north", "south")):
+        hints.append("filters + grouping by segment/region")
+    if any(tok in q for tok in ("join", "customers", "orders", "sales_performance", "order_items")):
+        hints.append("JOIN between related tables")
+    if any(tok in q for tok in ("ordered by", "order by", "sorted", "rank", "top", "latest")):
+        hints.append("ORDER BY")
+    if not hints:
+        return ""
+    return "*Expected Complexity*: " + ", ".join(dict.fromkeys(hints))
+
+
+def _repair_sql_with_error(
+    question: str,
+    sql: str,
+    error_text: str,
+    catalog: Dict[str, Any],
+    tables: List[str],
+    ask_json_fn,
+) -> str:
+    repair_system = """You are a DuckDB SQL repair agent.
+Return ONLY valid JSON.
+Use only exact table and column names from the provided schema.
+Fix the SQL so it executes in DuckDB.
+Do not invent joins, columns, or tables."""
+    schema_context = _build_schema_context(catalog, tables)
+    repair_prompt = f"""
+QUESTION:
+{question}
+
+ORIGINAL_SQL:
+{sql}
+
+DUCKDB_ERROR:
+{error_text}
+
+SCHEMA:
+{schema_context}
+
+Return JSON exactly like:
+{{"sql":"..."}}"""
+    repaired = ask_json_fn(repair_prompt, repair_system)
+    if not repaired:
+        return ""
+    return (repaired.get("sql") or repaired.get("query") or "").strip()
 
 
 # ============================================================================
@@ -432,6 +516,14 @@ def question_to_sql(
                 if rel not in final_tables:
                     final_tables.append(rel)
             logger.info(f"[poc8] Added fallback related tables: {related}")
+            expanded = expand_via_join_graph(
+                final_tables,
+                join_graph,
+                edge_confidence=edge_confidence,
+                min_bridge_confidence=0.65,
+            )
+            final_tables = expanded.get("tables", final_tables)
+            join_paths = expanded.get("join_paths", join_paths)
 
         # 3. BUILD CONTEXT: Schema for Claude
         schema_context = _build_schema_context(catalog, final_tables)
@@ -449,16 +541,40 @@ def question_to_sql(
             for ex in examples
         )
 
-        system_prompt = """You are an expert SQL engineer.
+        system_prompt = """You are an expert Duck DB SQL engineer.
 Convert natural language questions into DuckDB SQL.
 - Only SELECT, WITH, or EXPLAIN queries
 - No INSERT/UPDATE/DELETE
 - No schema modifications
 - Use DuckDB syntax only
+- Use ONLY exact column names and table names shown in the provided schema/context
+- Do not invent, normalize, or rename columns
+- Use only exact schema columns or join the table that contains them.
+- If a requested concept does not exist as an exact schema column, do not invent a new column name;
+  instead, find the table that contains the closest matching exact column or omit that field.
+- For ranking and aggregation, use the exact numeric measure column from schema and do not rename it.
+- Treat the semantic layer as the schema contract:
+  - never invent joins
+  - use only explicit join predicates from the context
+  - if a join looks weak or fuzzy, mark it as uncertain
+  - follow temporal rules when effective/date/version columns exist
+  - respect table grain and PK hints to avoid duplicates
+- Do not use audit/control columns for joins or filters unless the question explicitly asks for them:
+  - system_date
+  - system_active
+  - file_path
+- If you use any aggregate function like SUM, COUNT, AVG, MIN, or MAX,
+  every non-aggregated selected column must appear in GROUP BY.
+- Prefer GROUP BY ALL in DuckDB when grouping all non-aggregated select columns.
+- If DuckDB reports a binder error, use that exact error message to repair the SQL once.
 - Return ONLY JSON with a SQL field, for example {"sql":"SELECT ..."}
 - If you prefer, you may also return {"query":"SELECT ..."}"""
 
         user_prompt = f"""
+Use the semantic layer below as the source of truth for joins, grain, temporal rules, and fuzzy-match warnings.
+
+{_build_expected_complexity_hint(question)}
+
 SEMANTIC LAYER:
 {semantic_layer if semantic_layer else "(No semantic-layer document available)"}
 
@@ -523,6 +639,10 @@ Generate the SQL query."""
             }
 
         logger.info(f"[poc8] SQL generated: {sql[:80]}...")
+        repaired_sql = _repair_sql_column_names(sql, catalog, final_tables)
+        if repaired_sql != sql:
+            logger.info(f"[poc8] SQL repaired: {repaired_sql[:80]}...")
+            sql = repaired_sql
 
         # 6. EXECUTE
         try:
@@ -548,6 +668,36 @@ Generate the SQL query."""
 
         except Exception as exec_err:
             logger.error(f"[poc8] SQL execution failed: {exec_err}")
+            try:
+                repaired_sql = _repair_sql_with_error(
+                    question,
+                    sql,
+                    str(exec_err),
+                    catalog,
+                    final_tables,
+                    ask_json_fn,
+                )
+                repaired_sql = _repair_sql_column_names(repaired_sql, catalog, final_tables)
+                if repaired_sql and repaired_sql != sql:
+                    logger.info(f"[poc8] retrying with repaired SQL: {repaired_sql[:120]}...")
+                    conn = duckdb.connect(db_file, read_only=True)
+                    result_rows = conn.execute(repaired_sql).fetchall()
+                    result_cols = [d[0] for d in conn.description] if conn.description else []
+                    conn.close()
+                    results = [dict(zip(result_cols, row)) for row in result_rows]
+                    return {
+                        "ok": True,
+                        "sql": repaired_sql,
+                        "tables": final_tables,
+                        "join_paths": join_paths,
+                        "rows": results,
+                        "row_count": len(results),
+                        "columns": result_cols,
+                        "warnings": warnings + [f"SQL repaired after DuckDB error: {str(exec_err)}"],
+                        "retrieval_method": "vector_semantic_search",
+                    }
+            except Exception as repair_err:
+                logger.warning(f"[poc8] SQL repair retry failed: {repair_err}")
             return {
                 "ok": False,
                 "sql": sql,

@@ -121,6 +121,7 @@ def ask(prompt: str,
         system: str = "",
         model: str = None,
         max_tokens: int = 16000,
+        temperature: float = 0.1,
         retries: int = 3,
         verbose: bool = True) -> str:
     model = model or MODEL_HAIKU
@@ -128,6 +129,7 @@ def ask(prompt: str,
     body  = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": max_tokens,
+        "temperature": temperature,
         "messages": [{"role": "user", "content": prompt}],
     }
     if system:
@@ -246,6 +248,7 @@ def ask_json(prompt: str,
              system: str = "",
              model: str = None,
              max_tokens: int = 8000,
+             temperature: float = 0.1,
              verbose: bool = True) -> dict:
     full_system = (system + "\n\n" if system else "") + \
                   "CRITICAL: Return ONLY valid JSON. No markdown fences, no explanation, no preamble. Use double quotes only. Keep the JSON compact."
@@ -292,7 +295,14 @@ Broken JSON:
         return ask(repair_prompt, system=full_system, model=model, max_tokens=3000, verbose=False)
 
     t0 = time.time()
-    raw = ask(prompt, system=full_system, model=model, max_tokens=max_tokens, verbose=verbose)
+    raw = ask(
+        prompt,
+        system=full_system,
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        verbose=verbose,
+    )
     logger.info(f"[ask_json] ask() total (network+generation+read): {time.time()-t0:.3f}s")
     logger.info(
         "\n"
