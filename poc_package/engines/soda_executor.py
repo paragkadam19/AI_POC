@@ -26,6 +26,14 @@ def make_serializable(obj):
         return obj
 
 
+def _rows_to_dicts(description, rows, limit: int = 3) -> List[Dict[str, Any]]:
+    cols = [d[0] for d in (description or [])]
+    out = []
+    for row in (rows or [])[:limit]:
+        out.append({cols[i]: row[i] for i in range(min(len(cols), len(row)))})
+    return out
+
+
 def load_soda_yaml(yaml_path: str) -> Dict[str, Any]:
     """Parse SODA YAML file and return as dict."""
     with open(yaml_path, 'r') as f:
@@ -286,6 +294,7 @@ def parse_check_string(check_str: str, table_name: str,
                 flags=re.IGNORECASE,
             )
             fail_query = _normalize_duckdb_regex(fail_query)
+            fail_query = _normalize_duckdb_dates(fail_query)
             return (
                 "failed_rows",
                 fail_query,
@@ -302,6 +311,33 @@ def _normalize_duckdb_regex(sql: str) -> str:
     The prompt should already generate DuckDB-safe regex syntax. This helper
     now only performs light normalization for legacy inputs.
     """
+    return sql
+
+
+def _normalize_duckdb_dates(sql: str) -> str:
+    """
+    Normalize common date function spellings to DuckDB syntax.
+    """
+    if not sql:
+        return sql
+    sql = re.sub(
+        r"\bDATEDIFF\s*\(\s*year\s*,",
+        "date_diff('year',",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    sql = re.sub(
+        r"\bDATEDIFF\s*\(\s*month\s*,",
+        "date_diff('month',",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    sql = re.sub(
+        r"\bDATEDIFF\s*\(\s*day\s*,",
+        "date_diff('day',",
+        sql,
+        flags=re.IGNORECASE,
+    )
     return sql
 
 
@@ -328,7 +364,9 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
                 f"[soda] executing check | id={check_id} name={check_name} type={check_type} "
                 f"sql={sql_query} expected={expected}"
             )
-            result = conn.execute(sql_query).fetchall()
+            cursor = conn.execute(sql_query)
+            result = cursor.fetchall()
+            description = cursor.description
             
             if check_type == "failed_rows":
                 # For failed rows: count the returned rows
@@ -336,16 +374,15 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
                 # If > 0 rows → FAIL (violations found)
                 actual_value = len(result) if result else 0
                 passed = actual_value == 0
+                failed_rows = _rows_to_dicts(description, result, limit=3)
                 
                 if not passed:
                     # Show the failing data
                     error_msg = f"Found {actual_value} rows violating rule:\n"
-                    if result:
-                        # Show first 3 failing rows
-                        for i, row in enumerate(result[:3]):
-                            error_msg += f"  Row {i+1}: {row}\n"
-                        if len(result) > 3:
-                            error_msg += f"  ... and {len(result) - 3} more rows"
+                    for i, row in enumerate(failed_rows):
+                        error_msg += f"  Row {i+1}: {row}\n"
+                    if actual_value > len(failed_rows):
+                        error_msg += f"  ... and {actual_value - len(failed_rows)} more rows"
                 else:
                     error_msg = None
                 logger.info(
@@ -374,7 +411,8 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
                 "passed": passed,
                 "actual_value": make_serializable(actual_value),
                 "expected": expected,
-                "error_message": error_msg
+                "error_message": error_msg,
+                "failed_rows": make_serializable(failed_rows) if check_type == "failed_rows" else [],
             })
 
         except Exception as e:
@@ -391,7 +429,8 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
                 "passed": False,
                 "actual_value": None,
                 "expected": expected,
-                "error_message": f"Query failed: {str(e)}"
+                "error_message": f"Query failed: {str(e)}",
+                "failed_rows": [],
             })
 
     conn.close()

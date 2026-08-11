@@ -71,6 +71,59 @@ function asArray(v) {
   return [v];
 }
 
+function inferChartSpec(rows, cols) {
+  const sample = (rows || []).slice(0, 50);
+  const isNum = (v) => v !== null && v !== undefined && v !== "" && !Number.isNaN(Number(v));
+  const kinds = {};
+  (cols || []).forEach((c) => {
+    const vals = sample.map((r) => r?.[c]).filter((v) => v !== null && v !== undefined && v !== "");
+    const num = vals.filter(isNum).length;
+    const date = vals.filter((v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}/.test(v)).length;
+    if (date >= Math.max(1, Math.floor(vals.length / 2))) kinds[c] = "date";
+    else if (num >= Math.max(1, Math.floor(vals.length / 2))) kinds[c] = "number";
+    else kinds[c] = "text";
+  });
+  const textCols = (cols || []).filter((c) => kinds[c] === "text");
+  const numCols = (cols || []).filter((c) => kinds[c] === "number");
+  const dateCols = (cols || []).filter((c) => kinds[c] === "date");
+  if (dateCols.length && numCols.length) return { chart_type: "line", x_axis: dateCols[0], y_axis: numCols[0] };
+  if (textCols.length && numCols.length) return { chart_type: "bar", x_axis: textCols[0], y_axis: numCols[0] };
+  if (numCols.length) return { chart_type: "kpi", y_axis: numCols[0] };
+  return { chart_type: "table" };
+}
+
+function normalizeChartType(chartType) {
+  const t = String(chartType || "table").toLowerCase();
+  return ["bar", "line", "pie", "scatter", "kpi"].includes(t) ? t : "table";
+}
+
+function pickChartFields(spec, rows, cols) {
+  const list = Array.isArray(cols) ? cols : [];
+  const sample = (rows || []).slice(0, 50);
+  const isNum = (v) => v !== null && v !== undefined && v !== "" && !Number.isNaN(Number(String(v).replace(/[^0-9.-]/g, "")));
+  const meta = {};
+  list.forEach((c) => {
+    const vals = sample.map((r) => r?.[c]).filter((v) => v !== null && v !== undefined && v !== "");
+    const num = vals.filter(isNum).length;
+    const date = vals.filter((v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}/.test(v)).length;
+    if (date >= Math.max(1, Math.floor(vals.length / 2))) meta[c] = "date";
+    else if (num >= Math.max(1, Math.floor(vals.length / 2))) meta[c] = "number";
+    else meta[c] = "text";
+  });
+  const textCol = list.find((c) => meta[c] === "text") || list[0] || null;
+  const numCol = list.find((c) => meta[c] === "number") || list[1] || list[0] || null;
+  const dateCol = list.find((c) => meta[c] === "date") || null;
+  const xAxis = spec?.x_axis || spec?.series || dateCol || textCol || list[0] || null;
+  const yAxis = spec?.y_axis || spec?.value || numCol || list[1] || list[0] || null;
+  return { xAxis, yAxis, meta };
+}
+
+function toChartNumber(v) {
+  if (v === null || v === undefined || v === "") return 0;
+  const n = Number(String(v).replace(/[^0-9.-]/g, ""));
+  return Number.isNaN(n) ? 0 : n;
+}
+
 (async () => {
   try {
     const s = await api("/api/status");
@@ -204,7 +257,7 @@ function renderSchema(d) {
             .filter(v => v !== null && v !== undefined)
             .slice(0, 5)
             .map(v => `<code style="font-size:11px">${v}</code>`)
-            .join(" <span style=\"color:#94A3B8\">|</span> ");
+            .join(" <span style=\"color:#94A3B8\">•</span> ");
 
         const sampleFallback = col.value_distribution && Object.keys(col.value_distribution).length > 0
             ? Object.entries(col.value_distribution)
@@ -218,7 +271,7 @@ function renderSchema(d) {
                 .map(([k, v]) => `<span style="font-size:11px"><code>${k}</code>: ${v}</span>`)
                 .join("<br>")
                 : (col.categorical_values && col.categorical_values.length > 0
-                ? col.categorical_values.map(v => `<code style="font-size:11px">${v}</code>`).join(" <span style=\"color:#94A3B8\">|</span> ")
+                ? col.categorical_values.map(v => `<code style="font-size:11px">${v}</code>`).join(" <span style=\"color:#94A3B8\">•</span> ")
                 : '<span style="color:#94A3B8;font-size:11px">—</span>');
 
         html += `<tr>
@@ -544,6 +597,7 @@ function rejectSoda() {
 const nlQuery = $("nlQuery");
 const runQueryBtn = $("runQueryBtn");
 const clearQueryBtn = $("clearQueryBtn");
+let tab7Chart = null;
 
 if (clearQueryBtn && nlQuery) {
   clearQueryBtn.addEventListener("click", () => {
@@ -584,6 +638,11 @@ function renderQuery(d) {
   const el = $("queryResult");
   el.classList.remove("hidden");
 
+  if (tab7Chart) {
+    tab7Chart.destroy();
+    tab7Chart = null;
+  }
+
   if (!d.ok) {
     const warnings = asArray(d.warnings).map(w => `<li>${escapeHtml(String(w))}</li>`).join("");
     const detail = d.detail ? `<div class="ev-card"><div class="obs">Detail</div><div class="sig">${escapeHtml(String(d.detail))}</div></div>` : "";
@@ -597,8 +656,6 @@ function renderQuery(d) {
     return;
   }
 
-  const tables = (d.tables || []).map(t => `<code style="margin-right:6px">${t}</code>`).join("");
-  const joins = (d.join_paths || []).map(j => `<li><code>${j.left}</code> ↔ <code>${j.right}</code> via <code>${j.join_column}</code></li>`).join("");
   const previewRows = (d.preview && d.preview.rows) || d.rows || [];
   const previewCols = (d.preview && d.preview.columns) || d.columns || [];
 
@@ -618,34 +675,87 @@ function renderQuery(d) {
     ? `<div class="banner info">Warnings: ${warningsList.map((w) => escapeHtml(String(w))).join(" · ")}</div>`
     : "";
 
+  const backendSpec = d.chart_spec || {};
+  const inferredSpec = inferChartSpec(previewRows, previewCols);
+  const chartSpec = (backendSpec.chart_type && backendSpec.chart_type !== "table")
+    ? backendSpec
+    : inferredSpec;
+  const chartData = (d.chart_data && d.chart_data.length ? d.chart_data : previewRows) || [];
+  const chartType = normalizeChartType(chartSpec.chart_type || "table");
+  console.log("[tab7] render payload", {
+    ok: d.ok,
+    chartSpec,
+    chartType,
+    previewCols,
+    previewRowsCount: previewRows.length,
+    chartDataCount: chartData.length,
+    chartCanvasWillRender: chartType !== "table",
+    hasChartJs: !!window.Chart,
+  });
+  const chartHtml = chartType !== "table"
+    ? `<div class="card-list"><div class="ev-card chart-card"><div class="obs">Chart</div><div class="sig"><div style="position:relative;height:380px"><canvas id="tab7Chart"></canvas></div></div></div></div>`
+    : "";
+
   el.innerHTML = `
-    <div class="banner ok">✓ SQL generated and validated against DuckDB</div>
+    <div class="banner ok">✓ SQL generated and validated</div>
     ${warnings}
-    <div class="summary-strip">
-      <div class="kpi teal"><div class="v">${(d.tables || []).length}</div><div class="l">retrieved tables</div></div>
-      <div class="kpi amber"><div class="v">${(d.bridges_added || []).length}</div><div class="l">bridge tables</div></div>
-      <div class="kpi green"><div class="v">${previewRows.length}</div><div class="l">preview rows</div></div>
-    </div>
-    <div class="card-list">
-      <div class="ev-card">
-        <div class="obs">Question</div>
-        <div class="sig">${escapeHtml(d.question || "")}</div>
-      </div>
-      <div class="ev-card">
-        <div class="obs">Retrieved tables</div>
-        <div class="sig">${tables || "<span style='color:#94A3B8'>None</span>"}</div>
-      </div>
-      <div class="ev-card">
-        <div class="obs">Join paths</div>
-        <div class="sig"><ul style="margin:0;padding-left:18px">${joins || "<li>None needed</li>"}</ul></div>
-      </div>
-    </div>
+  ${chartHtml}
+  ${chartType !== "table" && !chartData.length ? `<div class="banner info">No chart data available for this result.</div>` : ""}
     <h3>Generated SQL</h3>
     <textarea readonly style="width:100%;min-height:180px;font-family:'SF Mono',Consolas,monospace;font-size:13px;
       background:#0F172A;color:#E2E8F0;padding:16px;border-radius:8px;border:none;resize:vertical;line-height:1.6">${escapeHtml(d.sql || "")}</textarea>
     <h3>Preview</h3>
     ${previewHtml}
   `;
+
+  if (chartType !== "table" && window.Chart && $("tab7Chart")) {
+    const ctx = $("tab7Chart").getContext("2d");
+    const inferred = inferChartSpec(chartData, previewCols);
+    const picked = pickChartFields(chartSpec, chartData, previewCols.length ? previewCols : Object.keys(chartData[0] || {}));
+    const xKey = picked.xAxis || inferred.x_axis || previewCols[0];
+    const yKey = picked.yAxis || inferred.y_axis || previewCols[1] || previewCols[0];
+    const labels = chartData.map((row) => String(row?.[xKey] ?? "")).filter((v) => v !== "");
+    const values = chartData.map((row) => toChartNumber(row?.[yKey] ?? 0));
+
+    console.log("[tab7] chart debug", { chartSpec, chartType, xKey, yKey, chartData, previewCols });
+
+    if (!labels.length || !values.length || !xKey || !yKey) {
+      console.warn("[tab7] chart skipped: unusable axes", { chartSpec, previewCols, xKey, yKey });
+      return;
+    }
+
+    const chartKind = chartType === "kpi" ? "bar" : chartType;
+    if (["bar", "line", "pie"].includes(chartKind)) {
+      tab7Chart = new Chart(ctx, {
+        type: chartKind,
+        data: {
+          labels,
+          datasets: [{
+            label: yKey || "Value",
+            data: values,
+            backgroundColor: "rgba(59, 130, 246, 0.65)",
+            borderColor: "rgba(59, 130, 246, 1)",
+            borderWidth: 1,
+          }],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: chartKind !== "bar" },
+          },
+        },
+      });
+    } else {
+      console.warn("[tab7] chart type not rendered in UI", chartKind);
+    }
+  } else {
+    console.warn("[tab7] chart not created", {
+      chartType,
+      hasChartJs: !!window.Chart,
+      hasCanvas: !!$("tab7Chart"),
+    });
+  }
 }
 
 /* ═══════════════════════════════════════════════════════

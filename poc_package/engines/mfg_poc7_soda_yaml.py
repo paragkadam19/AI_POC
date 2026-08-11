@@ -1,5 +1,5 @@
 """
-Manufacturing POC 7 — SODA Quality Checks YAML Generator (ENHANCED)
+soda_yaml.py — SODA Quality Checks YAML Generator (ENHANCED)
 ===================================================================
 Uses FULL schema profile including:
 - Validation rules (business rules discovered by AI)
@@ -33,6 +33,7 @@ Use the FULL context:
 - sample_values: Actual data seen (shows real patterns)
 - quality_concerns: Issues flagged (high nulls, duplicates, etc.)
 - null_count / null_pct: ACTUAL null stats (not just 0 or all)
+- bronze_datatype: actual DuckDB type; use this as the source of truth for type-based checks
 """
 
 PROMPT = """RULE GENERATION PRIORITY
@@ -75,6 +76,8 @@ Infer date formats. Examples:
   - invalid_count(Order_Date)=0
   - min(Order_Date) >= 2024-01-01
   - max(Order_Date) <= 2026-12-31
+  - If you need date differences, use DuckDB syntax: date_diff('year', start_date, end_date)
+    Do not use SQL Server style DATEDIFF(...).
 
 6. STRING LENGTH CHECKS
 Infer expected lengths. Examples:
@@ -134,6 +137,7 @@ If timestamp exists, generate freshness checks when appropriate.
 
 14. COLUMN TYPE VALIDATION
 Validate: integer, decimal, date, timestamp, boolean, string using Soda syntax.
+Prefer bronze_datatype over AI-inferred data_type whenever both are present.
 
 15. DATA QUALITY NAMES
 EVERY check must have: name: DQ-### Description
@@ -169,7 +173,7 @@ Country            -> State
 the query (e.g., `date_trunc`, `list_aggregate`, `unnest`, `QUALIFY`, `EXCLUDE`/`REPLACE` in SELECT,
 `read_csv`/`read_parquet` if referencing files directly).
  
-18. No SELECT \: Never use `SELECT `. Always explicitly list the columns needed to answer the question,
+18. No SELECT: Never use `SELECT `. Always explicitly list the columns needed to answer the question,
 using the exact column names/aliases from the schema provided.
  
 19. Aggregation correctness: If any aggregate function (`SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, etc.) appears in the

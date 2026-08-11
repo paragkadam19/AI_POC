@@ -1,5 +1,5 @@
 """
-mfg_poc8_nl_sql.py — Natural Language → SQL Query Builder
+nl_sql.py — Natural Language → SQL Query Builder
 ===========================================================
 Tab 8: Convert natural language questions into DuckDB SQL.
 
@@ -30,7 +30,14 @@ from logger_config import get_logger
 
 logger = get_logger(__name__)
 DEBUG_NLQ_PROMPTS = os.getenv("DEBUG_NLQ_PROMPTS", "").lower() in {"1", "true", "yes"}
+MODEL_ID = "us.anthropic.claude-sonnet-4-6"
 AUDIT_COLUMNS = {"system_date", "system_active", "file_path"}
+CHART_INTENT_WORDS = {
+    "trend", "trends", "compare", "comparison", "breakdown", "distribution",
+    "over time", "month over month", "mom", "yoy", "growth", "chart",
+    "graph", "visualize", "visualisation", "visualization", "plot", "by month",
+    "by day", "by week", "by year", "top", "rank", "group by"
+}
 
 # Global KB Manager ref (wired in by app.py via set_kb_manager)
 _KB_MANAGER: Optional[Any] = None
@@ -345,6 +352,7 @@ def _repair_sql_column_names(sql: str, catalog: Dict[str, Any], tables: List[str
     if not sql or not catalog or not tables:
         return sql
 
+    table_names = {str(t).strip().lower() for t in tables if t}
     known_columns = []
     for table_name in tables:
         meta = catalog.get(table_name) or {}
@@ -358,6 +366,8 @@ def _repair_sql_column_names(sql: str, catalog: Dict[str, Any], tables: List[str
         token = match.group(0)
         lowered = token.lower()
         if lowered in {"select", "from", "where", "join", "left", "right", "inner", "outer", "on", "and", "or", "as", "group", "by", "order", "limit", "partition", "over", "row_number", "with", "distinct", "case", "when", "then", "else", "end", "true", "false"}:
+            return token
+        if lowered in table_names:
             return token
         if token in known_columns:
             return token
@@ -384,6 +394,206 @@ def _build_expected_complexity_hint(question: str) -> str:
     if not hints:
         return ""
     return "*Expected Complexity*: " + ", ".join(dict.fromkeys(hints))
+
+
+def _infer_column_dtypes(rows: List[Dict[str, Any]], columns: List[str]) -> Dict[str, str]:
+    kinds: Dict[str, str] = {}
+    for col in columns or []:
+        values = [row.get(col) for row in rows if row and row.get(col) is not None]
+        if not values:
+            kinds[col] = "text"
+            continue
+
+        sample = values[:50]
+        num_count = 0
+        date_count = 0
+        bool_count = 0
+        for v in sample:
+            if isinstance(v, bool):
+                bool_count += 1
+            elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                num_count += 1
+            else:
+                s = str(v).strip()
+                if re.fullmatch(r"-?\d+(\.\d+)?", s):
+                    num_count += 1
+                elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+                    date_count += 1
+        if bool_count >= max(1, len(sample) // 2):
+            kinds[col] = "boolean"
+        elif date_count >= max(1, len(sample) // 2):
+            kinds[col] = "datetime"
+        elif num_count >= max(1, len(sample) // 2):
+            kinds[col] = "numeric"
+        else:
+            kinds[col] = "categorical" if len(set(str(v) for v in sample)) <= max(15, len(sample) // 2) else "text"
+    return kinds
+
+
+def _get_visual_intent(question: str) -> bool:
+    q = (question or "").lower()
+    return any(tok in q for tok in CHART_INTENT_WORDS)
+
+
+def _rule_based_chart_spec(question: str, rows: List[Dict[str, Any]], columns: List[str]) -> Dict[str, Any]:
+    if not rows:
+        return {"chart_type": "table", "reason": "no rows returned"}
+
+    if len(rows) == 1:
+        return {"chart_type": "kpi", "reason": "single row result"}
+
+    dtypes = _infer_column_dtypes(rows, columns)
+    numeric_cols = [c for c in columns if dtypes.get(c) == "numeric"]
+    datetime_cols = [c for c in columns if dtypes.get(c) == "datetime"]
+    categorical_cols = [c for c in columns if dtypes.get(c) in {"categorical", "text"}]
+
+    q = (question or "").lower()
+    if datetime_cols and numeric_cols and any(tok in q for tok in ("trend", "over time", "month", "week", "day", "year")):
+        return {
+            "chart_type": "line",
+            "x_axis": datetime_cols[0],
+            "y_axis": numeric_cols[0],
+            "series": categorical_cols[0] if categorical_cols else None,
+            "reason": "date + numeric with time-series intent",
+        }
+
+    if categorical_cols and numeric_cols:
+        if len(categorical_cols) == 1:
+            return {
+                "chart_type": "bar",
+                "x_axis": categorical_cols[0],
+                "y_axis": numeric_cols[0],
+                "series": None,
+                "reason": "category + numeric",
+            }
+        if len(categorical_cols) >= 2:
+            return {
+                "chart_type": "bar",
+                "x_axis": categorical_cols[0],
+                "y_axis": numeric_cols[0],
+                "series": categorical_cols[1],
+                "reason": "2 categorical + numeric; normalized to bar for UI support",
+            }
+
+    if numeric_cols and categorical_cols:
+        return {
+            "chart_type": "bar",
+            "x_axis": categorical_cols[0],
+            "y_axis": numeric_cols[0],
+            "reason": "fallback category + numeric",
+        }
+
+    if datetime_cols and numeric_cols:
+        return {
+            "chart_type": "line",
+            "x_axis": datetime_cols[0],
+            "y_axis": numeric_cols[0],
+            "reason": "date + numeric",
+        }
+
+    return {"chart_type": "table", "reason": "no chart-friendly dimensions"}
+
+
+def _llm_chart_spec(question: str, rows: List[Dict[str, Any]], columns: List[str], ask_json_fn) -> Dict[str, Any]:
+    if not ask_json_fn:
+        return {}
+    preview = rows[:5]
+    prompt = {
+        "question": question,
+        "columns": columns,
+        "row_count": len(rows),
+        "preview_rows": preview,
+        "output_format": {
+            "chart_type": "bar|line|pie|scatter|heatmap|kpi|table",
+            "x_axis": "optional column name",
+            "y_axis": "optional column name",
+            "series": "optional column name",
+            "value": "optional column name",
+            "reason": "short reason",
+        },
+    }
+    system = """You are a chart selection assistant.
+Return ONLY valid JSON.
+Pick a simple chart spec from the provided columns and rows.
+Use only the exact column names given in the input.
+If unsure, return {"chart_type":"table","reason":"unclear"}."""
+    try:
+        resp = ask_json_fn(json.dumps(prompt, default=str), system, model=MODEL_ID)
+        return resp or {}
+    except Exception:
+        return {}
+
+
+def _validate_chart_spec(spec: Dict[str, Any], columns: List[str], question: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    columns_set = set(columns or [])
+    spec = dict(spec or {})
+    chart_type = (spec.get("chart_type") or "table").lower()
+
+    for key in ("x_axis", "y_axis", "series", "value"):
+        if spec.get(key) and spec[key] not in columns_set:
+            spec[key] = None
+
+    if chart_type not in {"bar", "line", "pie", "scatter", "kpi", "table"}:
+        chart_type = "table"
+
+    if chart_type == "table":
+        return {"chart_type": "table", "reason": spec.get("reason") or "fallback table"}
+
+    if chart_type == "kpi":
+        return {"chart_type": "kpi", "reason": spec.get("reason") or "single value"}
+
+    if chart_type in {"bar", "line", "pie", "scatter"}:
+        if not spec.get("x_axis") or not spec.get("y_axis"):
+            return {"chart_type": "table", "reason": "missing axis columns"}
+    return spec
+
+
+def recommend_chart_spec(
+    question: str,
+    rows: List[Dict[str, Any]],
+    columns: List[str],
+    ask_json_fn=None,
+) -> Dict[str, Any]:
+    try:
+        spec = _rule_based_chart_spec(question, rows, columns)
+        if _get_visual_intent(question) and spec.get("chart_type") == "table":
+            llm_spec = _llm_chart_spec(question, rows, columns, ask_json_fn)
+            if llm_spec:
+                spec = llm_spec
+        return _validate_chart_spec(spec, columns, question, rows)
+    except Exception as e:
+        logger.warning(f"[poc8] chart spec failed: {e}")
+        return {"chart_type": "table", "reason": "chart spec failed"}
+
+
+def prepare_chart_dataset(rows: List[Dict[str, Any]], chart_spec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    spec = chart_spec or {}
+    chart_type = (spec.get("chart_type") or "table").lower()
+    if chart_type not in {"bar", "pie"}:
+        return rows
+
+    x_axis = spec.get("x_axis")
+    y_axis = spec.get("y_axis")
+    if not x_axis or not y_axis:
+        return rows
+
+    buckets: Dict[str, float] = defaultdict(float)
+    rest = 0.0
+    for row in rows or []:
+        key = str(row.get(x_axis) if row.get(x_axis) is not None else "Unknown")
+        try:
+            val = float(row.get(y_axis) or 0)
+        except Exception:
+            val = 0.0
+        buckets[key] += val
+
+    sorted_items = sorted(buckets.items(), key=lambda kv: kv[1], reverse=True)
+    top = sorted_items[:15]
+    rest = sum(v for _, v in sorted_items[15:])
+    out = [{x_axis: k, y_axis: v} for k, v in top]
+    if rest:
+        out.append({x_axis: "Other", y_axis: rest})
+    return out
 
 
 def _repair_sql_with_error(
@@ -415,7 +625,7 @@ SCHEMA:
 
 Return JSON exactly like:
 {{"sql":"..."}}"""
-    repaired = ask_json_fn(repair_prompt, repair_system)
+    repaired = ask_json_fn(repair_prompt, repair_system, model=MODEL_ID)
     if not repaired:
         return ""
     return (repaired.get("sql") or repaired.get("query") or "").strip()
@@ -431,6 +641,7 @@ def question_to_sql(
     storage_dir: str,
     question: str,
     ask_json_fn=None,
+    want_chart: bool = True,
 ) -> Dict[str, Any]:
     """
     Convert a natural language question into SQL using KB-aware retrieval.
@@ -444,6 +655,33 @@ def question_to_sql(
     warnings = []
     tables = []
     join_paths = []
+
+    def build_success_payload(sql: str, rows: List[Dict[str, Any]], cols: List[str], retrieval_method: str, extra_warnings: List[str] = None):
+        extra_warnings = extra_warnings or []
+        chart_spec = {"chart_type": "table", "reason": "chart disabled"}
+        chart_data = rows
+        if want_chart:
+            chart_spec = recommend_chart_spec(question, rows, cols, ask_json_fn=ask_json_fn)
+            chart_data = prepare_chart_dataset(rows, chart_spec)
+        logger.info(
+            f"[poc8] chart spec | type={chart_spec.get('chart_type')} | "
+            f"x={chart_spec.get('x_axis')} | y={chart_spec.get('y_axis')} | "
+            f"rows={len(chart_data)} | cols={cols}"
+        )
+        logger.info(f"[poc8] chart data preview | {chart_data[:3]}")
+        return {
+            "ok": True,
+            "sql": sql,
+            "tables": final_tables,
+            "join_paths": join_paths,
+            "rows": rows,
+            "row_count": len(rows),
+            "columns": cols,
+            "warnings": warnings + extra_warnings,
+            "retrieval_method": retrieval_method,
+            "chart_spec": chart_spec,
+            "chart_data": chart_data,
+        }
 
     try:
         # 1. RETRIEVE: Vector semantic search via KB Manager
@@ -553,6 +791,65 @@ Convert natural language questions into DuckDB SQL.
 - If a requested concept does not exist as an exact schema column, do not invent a new column name;
   instead, find the table that contains the closest matching exact column or omit that field.
 - For ranking and aggregation, use the exact numeric measure column from schema and do not rename it.
+
+SEMANTIC LAYER & JOINS GUIDANCE:
+- The semantic layer shows you EXACTLY which tables connect and HOW
+- Example: "customers → orders ON customer_id" means:
+  JOIN customers c ON c.customer_id = o.customer_id
+- Follow ONLY the joins shown in semantic layer. Never invent joins.
+- Confidence levels: 0.95 = trust it, 0.5 = uncertain, skip if unsure
+
+HOW TO USE JOINS - 3 COMMON PATTERNS:
+
+PATTERN 1: One-to-Many (Customer has many Orders)
+──────────────────────────────────────────────────
+Semantic Layer: "customers → orders ON customer_id"
+Question: "Customers and their total orders"
+
+✓ CORRECT:
+SELECT c.customer_id, c.customer_name, COUNT(*) as order_count
+FROM customers c
+LEFT JOIN orders o ON c.customer_id = o.customer_id
+GROUP BY c.customer_id, c.customer_name
+
+Why: LEFT JOIN keeps all customers. COUNT(*) aggregates orders.
+
+PATTERN 2: Multi-Table Star Join
+─────────────────────────────────
+Semantic Layer: 
+  "customers → orders ON customer_id"
+  "orders → order_items ON order_id"
+
+Question: "Total revenue by region for completed orders"
+
+✓ CORRECT:
+SELECT c.region, SUM(oi.line_total) as total_revenue
+FROM customers c
+INNER JOIN orders o ON c.customer_id = o.customer_id
+INNER JOIN order_items oi ON o.order_id = oi.order_id
+WHERE o.order_status = 'Completed'
+GROUP BY c.region
+
+Why: Follows join path customers→orders→order_items. All non-aggregated columns in GROUP BY.
+
+PATTERN 3: Complex Join with Window Functions
+──────────────────────────────────────────────
+Question: "Best product per customer in North"
+
+✓ CORRECT:
+WITH ranked AS (
+  SELECT c.customer_id, c.customer_name, p.product_name, 
+         SUM(oi.line_total) as total,
+         ROW_NUMBER() OVER (PARTITION BY c.customer_id ORDER BY SUM(oi.line_total) DESC) as rank
+  FROM customers c
+  INNER JOIN orders o ON c.customer_id = o.customer_id
+  INNER JOIN order_items oi ON o.order_id = oi.order_id
+  INNER JOIN products p ON oi.product_id = p.product_id
+  WHERE c.region = 'North'
+  GROUP BY c.customer_id, c.customer_name, p.product_name
+)
+SELECT * FROM ranked WHERE rank = 1
+
 - Treat the semantic layer as the schema contract:
   - never invent joins
   - use only explicit join predicates from the context
@@ -568,7 +865,8 @@ Convert natural language questions into DuckDB SQL.
 - Prefer GROUP BY ALL in DuckDB when grouping all non-aggregated select columns.
 - If DuckDB reports a binder error, use that exact error message to repair the SQL once.
 - Return ONLY JSON with a SQL field, for example {"sql":"SELECT ..."}
-- If you prefer, you may also return {"query":"SELECT ..."}"""
+- If you prefer, you may also return {"query":"SELECT ..."}
+"""
 
         user_prompt = f"""
 Use the semantic layer below as the source of truth for joins, grain, temporal rules, and fuzzy-match warnings.
@@ -604,7 +902,8 @@ Generate the SQL query."""
                 + f"{user_prompt}\n"
                 + "=" * 72
             )
-        response = ask_json_fn(user_prompt, system_prompt)
+        logger.info(f"[poc8] Using model: {MODEL_ID}")
+        response = ask_json_fn(user_prompt, system_prompt, model=MODEL_ID or None)
         if DEBUG_NLQ_PROMPTS:
             logger.info(
                 "\n"
@@ -654,17 +953,7 @@ Generate the SQL query."""
             # Convert to dicts
             results = [dict(zip(result_cols, row)) for row in result_rows]
 
-            return {
-                "ok": True,
-                "sql": sql,
-                "tables": final_tables,
-                "join_paths": join_paths,
-                "rows": results,
-                "row_count": len(results),
-                "columns": result_cols,
-                "warnings": warnings,
-                "retrieval_method": "vector_semantic_search",
-            }
+            return build_success_payload(sql, results, result_cols, "vector_semantic_search")
 
         except Exception as exec_err:
             logger.error(f"[poc8] SQL execution failed: {exec_err}")
@@ -685,17 +974,13 @@ Generate the SQL query."""
                     result_cols = [d[0] for d in conn.description] if conn.description else []
                     conn.close()
                     results = [dict(zip(result_cols, row)) for row in result_rows]
-                    return {
-                        "ok": True,
-                        "sql": repaired_sql,
-                        "tables": final_tables,
-                        "join_paths": join_paths,
-                        "rows": results,
-                        "row_count": len(results),
-                        "columns": result_cols,
-                        "warnings": warnings + [f"SQL repaired after DuckDB error: {str(exec_err)}"],
-                        "retrieval_method": "vector_semantic_search",
-                    }
+                    return build_success_payload(
+                        repaired_sql,
+                        results,
+                        result_cols,
+                        "vector_semantic_search",
+                        [f"SQL repaired after DuckDB error: {str(exec_err)}"],
+                    )
             except Exception as repair_err:
                 logger.warning(f"[poc8] SQL repair retry failed: {repair_err}")
             return {

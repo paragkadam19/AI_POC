@@ -120,29 +120,6 @@
         <textarea id="nlQuery" rows="3" placeholder="Example: provide me the data of total counts of order in Pune region."
           style="width:100%;font:inherit;font-size:14px;line-height:1.5;border:1px solid #CBD5E1;border-radius:10px;padding:12px 14px;resize:vertical;min-height:90px"></textarea>
       </div>
-      <div class="summary-strip">
-        <div class="kpi teal"><div class="v">RAG</div><div class="l">schema retrieval</div></div>
-        <div class="kpi amber"><div class="v">Graph</div><div class="l">join bridge</div></div>
-        <div class="kpi green"><div class="v">SQL</div><div class="l">validated output</div></div>
-      </div>
-      <div class="card-list">
-        <div class="ev-card">
-          <div class="obs">1. Retrieve relevant tables</div>
-          <div class="sig">Hybrid semantic and keyword scoring finds the schema slice most likely to answer the question.</div>
-        </div>
-        <div class="ev-card">
-          <div class="obs">2. Expand bridge tables</div>
-          <div class="sig">Join-graph search adds missing tables needed to connect the retrieved tables safely.</div>
-        </div>
-        <div class="ev-card">
-          <div class="obs">3. Generate SQL</div>
-          <div class="sig">The LLM receives only the relevant schema slice and returns a DuckDB query.</div>
-        </div>
-        <div class="ev-card">
-          <div class="obs">4. Validate the result</div>
-          <div class="sig">The generated SQL is checked with EXPLAIN and a preview query before showing it to the user.</div>
-        </div>
-      </div>
       <div class="actions">
         <button class="btn" id="clearQueryBtn">Clear</button>
         <button class="btn primary" id="runQueryBtn">Generate SQL</button>
@@ -154,6 +131,7 @@
 
 </main>
 
-<script src="app.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="app.js?v=20260811_1"></script>
 </body>
 </html>

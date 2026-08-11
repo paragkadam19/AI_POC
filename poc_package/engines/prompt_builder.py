@@ -42,8 +42,16 @@ INPUT
 - c = column stats (nulls, distincts, ranges, value_counts)
 - r = sample rows
 
+IMPORTANT
+- Do not include audit columns such as system_date, system_active, or file_path in critical_data, quality_concerns, or recommended_indexes unless the user explicitly asks for them.
+
 TASK
 1. Verify/correct types from samples.
+   The output `data_type` is the AI-inferred type, while the app will also
+   preserve the actual DuckDB type separately as `bronze_datatype`.
+   Return both fields for every column, even if they are the same.
+   For `bronze_datatype`, copy the exact type from the input schema value
+   for that column. Do not change it, infer it, or leave it blank.
 2. Write a short but useful column description.
 3. Write a detailed business meaning for each column.
 4. Provide 1 example value or sample for each column.
@@ -104,6 +112,7 @@ RETURN JSON:
       "column_description": "short useful description",
       "business_meaning": "what this represents",
       "data_type": "corrected dtype based on actual samples (not just Polars inference!)",
+      "bronze_datatype": "actual DuckDB type from the uploaded table",
       "nullable": true,
       "null_count": 0,
       "null_pct": 0,

@@ -120,7 +120,7 @@ def print_token_usage(input_tokens=0, output_tokens=0, total=0):
 def ask(prompt: str,
         system: str = "",
         model: str = None,
-        max_tokens: int = 16000,
+        max_tokens: int = 20000,
         temperature: float = 0.1,
         retries: int = 3,
         verbose: bool = True) -> str:
@@ -247,7 +247,7 @@ def ask(prompt: str,
 def ask_json(prompt: str,
              system: str = "",
              model: str = None,
-             max_tokens: int = 8000,
+             max_tokens: int = 20000,
              temperature: float = 0.1,
              verbose: bool = True) -> dict:
     full_system = (system + "\n\n" if system else "") + \
@@ -367,7 +367,6 @@ def print_separator(title: str = "", char: str = "─", width: int = 65):
         print(f"\n{'─'*pad} {title} {'─'*pad}")
     else:
         print("─" * width)
-
 
 def reset_token_stats():
     global _token_stats

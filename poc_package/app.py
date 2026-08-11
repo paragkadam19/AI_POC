@@ -13,6 +13,7 @@ Human-in-the-loop:
 import os, sys, json, re, time, shutil
 from datetime import datetime
 import yaml
+import duckdb
 
 from logger_config import setup_logging, get_logger
 
@@ -87,14 +88,14 @@ except ImportError:
         return {"success": False}
 from duckdb_helper import (
     ingest_csv, get_preview, get_full_metadata_for_ai,
-    SAMPLE_ROWS_SCHEMA, write_table_schema_snapshot,
+    SAMPLE_ROWS_SCHEMA, write_table_schema_snapshot, DUCKDB_CONFIG,
 )
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
 
 DB_FILE = os.path.join(STORAGE_DIR, "ai_poc_dq.duckdb")
-STATE   = {"dataset_id": None, "filename": None}
+STATE   = {"dataset_id": None, "filename": None, "poc1_metadata": None}
 UPLOAD_COPY_CHUNK_SIZE = 32 * 1024 * 1024
 
 
@@ -198,6 +199,30 @@ def table_name(dataset_id: str) -> str:
 AUDIT_COLUMN_NAMES = {"system_date", "system_active", "file_path"}
 
 
+def _is_audit_column_name(name: str) -> bool:
+    return str(name or "").strip().lower() in AUDIT_COLUMN_NAMES
+
+
+def _filter_audit_fields(schema_profile: dict) -> dict:
+    if not isinstance(schema_profile, dict):
+        return schema_profile
+    cleaned = json.loads(json.dumps(schema_profile))
+    for key in ("critical_data", "quality_concerns", "recommended_indexes"):
+        value = cleaned.get(key)
+        if not value:
+            continue
+        if isinstance(value, list):
+            filtered = []
+            for item in value:
+                if isinstance(item, dict) and _is_audit_column_name(item.get("column")):
+                    continue
+                if isinstance(item, str) and any(audit in item.lower() for audit in AUDIT_COLUMN_NAMES):
+                    continue
+                filtered.append(item)
+            cleaned[key] = filtered
+    return cleaned
+
+
 def strip_audit_columns(schema_profile: dict) -> dict:
     if not isinstance(schema_profile, dict):
         return schema_profile
@@ -210,6 +235,38 @@ def strip_audit_columns(schema_profile: dict) -> dict:
         ]
         cleaned["total_columns"] = len(cleaned["schema"])
     return cleaned
+
+
+def enrich_with_bronze_datatypes(schema_profile: dict, table: str) -> dict:
+    if not isinstance(schema_profile, dict):
+        return schema_profile
+    try:
+        conn = duckdb.connect(DB_FILE, read_only=True, config=DUCKDB_CONFIG)
+        rows = conn.execute(
+            """
+            SELECT column_name, data_type
+            FROM table_schema_snapshot
+            WHERE table_name = ?
+            """,
+            [table],
+        ).fetchall()
+        conn.close()
+        bronze_map = {str(row[0]): str(row[1]) for row in rows if row and row[0]}
+        logger.info(f"[poc1] bronze datatypes loaded | table={table} | cols={len(bronze_map)}")
+    except Exception as e:
+        logger.warning(f"[poc1] bronze datatype lookup failed | table={table} | error={e}")
+        return schema_profile
+
+    enriched = json.loads(json.dumps(schema_profile))
+    for col in enriched.get("schema", []) or []:
+        name = col.get("column")
+        bronze = bronze_map.get(name)
+        if bronze:
+            col["bronze_datatype"] = bronze
+            col["actual_data_type"] = bronze
+            if not col.get("data_type"):
+                col["data_type"] = bronze
+    return enriched
 
 
 def remove_audit_checks_from_yaml(yaml_text: str) -> str:
@@ -260,7 +317,7 @@ def maybe_refresh_kb() -> None:
 
 def _schema_map(schema_profile: dict) -> dict:
     return {
-        col.get("column"): col.get("data_type")
+        col.get("column"): col.get("bronze_datatype") or col.get("data_type")
         for col in (schema_profile or {}).get("schema", [])
         if col.get("column")
     }
@@ -500,13 +557,20 @@ def run_poc1():
 
         metadata = get_full_metadata_for_ai(DB_FILE, tbl, STATE["filename"], file_size_bytes, SAMPLE_ROWS_SCHEMA)
         logger.info(f"[poc1] STEP 2 - metadata fetched")
+        STATE["poc1_metadata"] = metadata
 
         system_prompt, user_prompt = build_schema_discovery_prompt(metadata)
         logger.info(f"[poc1] STEP 3 - prompt built | chars={len(system_prompt)+len(user_prompt)}")
 
+        t_ai = time.time()
         result = ask_json(user_prompt, system_prompt)
-        logger.info(f"[poc1] STEP 4 - AI call done in {time.time()-t_start:.3f}s")
+        logger.info(f"[poc1] STEP 4 - AI call done in {time.time()-t_ai:.3f}s | total={time.time()-t_start:.3f}s")
 
+        result = _filter_audit_fields(result)
+        logger.info(
+            "[poc1] bronze datatypes loaded from snapshot | sample=%s",
+            [(col.get("column"), col.get("data_type")) for col in (result.get("schema", []) or [])[:5]],
+        )
         result["_dataset_id"] = ds
         return jsonify(result)
     except Exception as e:
@@ -520,38 +584,66 @@ def approve_poc1():
     if not ds:
         return jsonify({"error": "No active dataset"}), 400
     try:
+        t_approve = time.time()
         result = request.get_json()
         if not result:
             return jsonify({"error": "No schema data received"}), 400
 
+        t_bronze = time.time()
+        result = enrich_with_bronze_datatypes(result, table_name(ds))
+        logger.info(
+            "[poc1] bronze_datatype in approve payload | sample=%s",
+            [
+                (col.get("column"), col.get("bronze_datatype"), col.get("data_type"))
+                for col in (result.get("schema", []) or [])[:5]
+            ],
+        )
+        logger.info(f"[poc1] bronze enrichment done in {time.time()-t_bronze:.3f}s")
+
+        t_save = time.time()
         versioned_name = save_versioned(ds, "poc1", result)
         logger.info(f"[poc1] schema approved and saved | dataset={ds} | file={versioned_name}")
 
         cpath           = contract_path(ds)
         is_new_contract = not os.path.exists(cpath)
         if is_new_contract:
-            contract = {col["column"]: col["data_type"] for col in result.get("schema", [])}
+            os.makedirs(CONTRACTS_DIR, exist_ok=True)
+            contract = {
+                col["column"]: col.get("bronze_datatype") or col["data_type"]
+                for col in result.get("schema", [])
+            }
             with open(cpath, "w") as f:
                 json.dump(contract, f, indent=2)
             logger.info(f"[poc1] contract locked | dataset={ds}")
 
         # Persist to KB (function-based API for file storage)
         try:
+            t_kb = time.time()
             kb_result = persist_kb(STORAGE_DIR, ds, result, table_name=table_name(ds))
-            logger.info(f"[kb] KB file store updated | docs={kb_result.get('documents_written', 0)}")
+            logger.info(
+                f"[kb] KB file store updated | db={DB_FILE} | table={table_name(ds)} | "
+                f"docs={kb_result.get('documents_written', 0)} | success={kb_result.get('success')}"
+            )
+            logger.info(f"[kb] persist_kb elapsed={time.time()-t_kb:.3f}s")
         except Exception as e:
             logger.warning(f"[kb] persist_kb failed (non-critical): {e}")
 
         # Invalidate KB Manager cache so next query sees the new table
         if KB_MANAGER:
             try:
+                t_cache = time.time()
                 KB_MANAGER.clear_cache()
                 logger.info("[kb] KB Manager cache cleared after schema approval")
+                logger.info(f"[kb] cache clear elapsed={time.time()-t_cache:.3f}s")
             except Exception as e:
                 logger.warning(f"[kb] cache clear failed (non-critical): {e}")
 
         if os.getenv("KB_REFRESH_ON_APPROVAL", "0").lower() in {"1", "true", "yes"}:
+            t_refresh = time.time()
             maybe_refresh_kb()
+            logger.info(f"[kb] maybe_refresh_kb elapsed={time.time()-t_refresh:.3f}s")
+
+        logger.info(f"[poc1] approve total elapsed={time.time()-t_approve:.3f}s")
 
         return jsonify({
             "success": True,
@@ -583,6 +675,7 @@ def run_poc7():
         return jsonify({"error": "Schema Discovery must be approved first (Tab 2 → Approve & Save)."}), 400
 
     try:
+        schema_profile = enrich_with_bronze_datatypes(schema_profile, table_name(ds))
         schema_profile = strip_audit_columns(schema_profile)
         schema_json = json.dumps(schema_profile, indent=2)
         prompt = poc7.PROMPT.replace("{table}", table_name(ds)).replace("{schema_profile}", schema_json)
@@ -671,9 +764,13 @@ def run_poc3a():
     if not poc1_schema:
         return jsonify({"error": "Run Schema Discovery (Tab 2) first"}), 400
     try:
+        poc1_schema = enrich_with_bronze_datatypes(poc1_schema, table_name(ds))
         cpath = contract_path(ds)
         if not os.path.exists(cpath):
-            contract = {col["column"]: col["data_type"] for col in poc1_schema.get("schema", [])}
+            contract = {
+                col["column"]: col.get("bronze_datatype") or col["data_type"]
+                for col in poc1_schema.get("schema", [])
+            }
             with open(cpath, "w") as f:
                 json.dump(contract, f, indent=2)
         with open(cpath) as f:

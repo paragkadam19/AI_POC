@@ -83,7 +83,28 @@ def _normalize_join_name(name: str) -> str:
 def _parse_sample_values(raw: str) -> List[str]:
     if not raw:
         return []
-    return [v.strip() for v in str(raw).split(" | ") if v and str(v).strip()]
+    parts = str(raw)
+    for sep in (" • ", " · ", " | "):
+        if sep in parts:
+            return [v.strip() for v in parts.split(sep) if v and str(v).strip()]
+    return [parts.strip()] if parts.strip() else []
+
+
+def _load_bronze_datatypes_from_snapshot(conn, table_name: str) -> Dict[str, str]:
+    """Load actual DuckDB types from table_schema_snapshot if available."""
+    try:
+        rows = conn.execute(
+            """
+            SELECT column_name, data_type
+            FROM table_schema_snapshot
+            WHERE table_name = ?
+            """,
+            [table_name],
+        ).fetchall()
+        return {str(r[0]): str(r[1]) for r in rows if r and r[0]}
+    except Exception as e:
+        logger.debug(f"[KB] table_schema_snapshot lookup skipped for {table_name}: {e}")
+        return {}
 
 
 def _is_key_like_column(col_name: str, column_type: str = "") -> bool:
@@ -560,8 +581,10 @@ def _upsert_metadata_record(conn, record: dict):
     column_description = record.get("column_description")
     detailed_business_meaning = record.get("detailed_business_meaning")
     column_example = record.get("column_example")
+    metadata_obj = record.get("metadata_json") or {}
+    bronze_datatype = record.get("bronze_datatype") or metadata_obj.get("bronze_datatype")
     content_text = record.get("content_text")
-    metadata_json = json.dumps(record.get("metadata_json") or {}, default=str)
+    metadata_json = json.dumps(metadata_obj, default=str)
     confidence = record.get("confidence")
     category = record.get("category")
     question = record.get("question")
@@ -574,15 +597,15 @@ def _upsert_metadata_record(conn, record: dict):
         """
         INSERT INTO kb_metadata
         (id, record_type, table_name, related_table, column_name, column_description,
-         detailed_business_meaning, column_example, content_text, metadata_json,
+         detailed_business_meaning, column_example, bronze_datatype, content_text, metadata_json,
          confidence, category, question, sql, created_at, updated_at, embedding)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             record_id, record_type, table_name, related_table, column_name,
             column_description, detailed_business_meaning, column_example,
-            content_text, metadata_json, confidence, category, question, sql,
-            now, now, embedding,
+            bronze_datatype, content_text, metadata_json, confidence,
+            category, question, sql, now, now, embedding,
         ],
     )
 
@@ -642,6 +665,7 @@ class KBManager:
                     column_description TEXT,
                     detailed_business_meaning TEXT,
                     column_example  TEXT,
+                    bronze_datatype TEXT,
                     content_text    TEXT,
                     metadata_json   TEXT,
                     confidence      DOUBLE,
@@ -654,7 +678,11 @@ class KBManager:
                 )
             """)
 
-            # Try VSS HNSW index
+            try:
+                conn.execute("ALTER TABLE kb_metadata ADD COLUMN IF NOT EXISTS bronze_datatype TEXT")
+            except Exception:
+                pass
+
             try:
                 conn.execute("INSTALL vss; LOAD vss;")
                 conn.execute("SET hnsw_enable_experimental_persistence = true;")
@@ -698,17 +726,18 @@ class KBManager:
     def _upsert_vector(self, conn, doc_id: str, table_name: str,
                        doc_type: str, text: str):
         """Embed text and store vector. Fails gracefully if embed fails."""
+        vector_id = doc_id if str(doc_id).startswith("vector:") else f"vector:{doc_id}"
         vector = _embed(text)
-        conn.execute("DELETE FROM kb_metadata WHERE id = ?", [doc_id])
+        conn.execute("DELETE FROM kb_metadata WHERE id = ?", [vector_id])
         if vector:
-            logger.debug(f"[KB] storing vector for {doc_id}")
+            logger.debug(f"[KB] storing vector for {vector_id}")
         else:
-            logger.debug(f"[KB] no vector produced for {doc_id}, storing zero vector")
+            logger.debug(f"[KB] no vector produced for {vector_id}, storing zero vector")
         conn.execute(
             "INSERT INTO kb_metadata "
             "(id, record_type, table_name, related_table, column_name, content_text, metadata_json, confidence, category, question, sql, created_at, updated_at, embedding) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [doc_id, "vector", table_name, None, doc_type, text, None, None, None, None, None,
+            [vector_id, "vector", table_name, None, doc_type, text, None, None, None, None, None,
              datetime.now().isoformat(), datetime.now().isoformat(), _pad(vector)],
         )
 
@@ -868,7 +897,12 @@ class KBManager:
                     "columns": [
                         {
                             "column": cn,
-                            "data_type": json.loads(mj or "{}").get("data_type", "") if mj else "",
+                            "data_type": (
+                                json.loads(mj or "{}").get("bronze_datatype", "")
+                                or json.loads(mj or "{}").get("column_type", "")
+                                or json.loads(mj or "{}").get("data_type", "")
+                            ) if mj else "",
+                            "bronze_datatype": json.loads(mj or "{}").get("bronze_datatype", "") if mj else "",
                             "business_meaning": json.loads(mj or "{}").get("business_meaning", "") if mj else "",
                             "nullable": json.loads(mj or "{}").get("nullable", True) if mj else True,
                             "sample_values": json.loads(mj or "{}").get("sample_values", []) if mj else [],
@@ -989,6 +1023,19 @@ class KBManager:
         try:
             self._ensure_kb_schema()
             conn = _connect(self.db_file)
+            raw_bronze_map = {}
+            try:
+                raw_rows = conn.execute(f'DESCRIBE "{table_name}"').fetchall()
+                raw_bronze_map = {str(r[0]): str(r[1]) for r in raw_rows if r and r[0]}
+            except Exception as e:
+                logger.warning(f"[KB] raw bronze map lookup failed for {table_name}: {e}")
+            snapshot_bronze_map = _load_bronze_datatypes_from_snapshot(conn, table_name)
+            bronze_map = {}
+            try:
+                bronze_rows = conn.execute(f'DESCRIBE "{table_name}"').fetchall()
+                bronze_map = {str(row[0]): str(row[1]) for row in bronze_rows if row and row[0]}
+            except Exception as e:
+                logger.warning(f"[KB] bronze datatype lookup failed for {table_name}: {e}")
             dataset_id = schema_profile.get("_dataset_id") or schema_profile.get("dataset_id") or table_name
             source_file_name = (
                 schema_profile.get("filename")
@@ -1007,12 +1054,19 @@ class KBManager:
                     continue
 
                 sample_values = col.get("sample_values") or col.get("categorical_values") or []
-                sample_values_text = " | ".join(str(v) for v in sample_values[:5] if v is not None)
+                sample_values_text = " • ".join(str(v) for v in sample_values[:5] if v is not None)
                 column_description = (col.get("column_description") or col.get("description") or "").strip()
                 detailed_business_meaning = (col.get("business_meaning") or "").strip()
                 validation_rule = (col.get("validation_rule") or "").strip()
                 column_example = (sample_values_text or (sample_values[0] if sample_values else "") or "").strip()
-                search_text = " | ".join(filter(None, [
+                bronze_datatype = (
+                    snapshot_bronze_map.get(cname)
+                    or raw_bronze_map.get(cname)
+                    or bronze_map.get(cname)
+                    or col.get("data_type")
+                    or "TEXT"
+                )
+                search_text = " • ".join(filter(None, [
                     table_name,
                     dataset_id,
                     source_file_name,
@@ -1033,11 +1087,13 @@ class KBManager:
                     "column_description": column_description,
                     "detailed_business_meaning": detailed_business_meaning,
                     "column_example": column_example,
+                    "bronze_datatype": bronze_datatype,
                     "content_text": search_text,
                     "metadata_json": {
                         "dataset_id": dataset_id,
                         "source_file_name": source_file_name,
                         "column_type": col.get("data_type") or "TEXT",
+                        "bronze_datatype": bronze_datatype,
                         "column_description": column_description,
                         "detailed_business_meaning": detailed_business_meaning,
                         "validation_rule": validation_rule,
@@ -1051,8 +1107,11 @@ class KBManager:
                         "search_text": search_text,
                     },
                 }
+                logger.info(
+                    f"[KB] bronze_datatype write | table={table_name} | column={cname} | "
+                    f"bronze_datatype={bronze_datatype} | ai_type={col.get('data_type')}"
+                )
                 _upsert_metadata_record(conn, column_meta)
-
                 if column_description:
                     _upsert_metadata_record(conn, {
                         "id": f"{table_name}:{cname}:meaning",
@@ -1071,7 +1130,76 @@ class KBManager:
                         "confidence": 0.9,
                     })
 
-                col_text = " | ".join(filter(None, [
+            written_columns = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM kb_metadata
+                WHERE table_name = ? AND record_type = 'column'
+                """,
+                [table_name],
+            ).fetchone()[0]
+            if int(written_columns or 0) == 0 and schema_cols:
+                logger.warning(f"[KB] column write verification failed for {table_name}; retrying once")
+                for pos, col in enumerate(schema_cols):
+                    cname = col.get("column")
+                    if not cname:
+                        continue
+                    sample_values = col.get("sample_values") or col.get("categorical_values") or []
+                    sample_values_text = " • ".join(str(v) for v in sample_values[:5] if v is not None)
+                    column_description = (col.get("column_description") or col.get("description") or "").strip()
+                    detailed_business_meaning = (col.get("business_meaning") or "").strip()
+                    validation_rule = (col.get("validation_rule") or "").strip()
+                    column_example = (sample_values_text or (sample_values[0] if sample_values else "") or "").strip()
+                    bronze_datatype = (
+                        snapshot_bronze_map.get(cname)
+                        or raw_bronze_map.get(cname)
+                        or bronze_map.get(cname)
+                        or col.get("data_type")
+                        or "TEXT"
+                    )
+                    search_text = " • ".join(filter(None, [
+                        table_name,
+                        dataset_id,
+                        source_file_name,
+                        cname,
+                        col.get("data_type") or "",
+                        column_description,
+                        detailed_business_meaning,
+                        validation_rule,
+                        column_example,
+                        sample_values_text,
+                    ]))
+                    _upsert_metadata_record(conn, {
+                        "id": f"{table_name}:{cname}",
+                        "record_type": "column",
+                        "table_name": table_name,
+                        "related_table": None,
+                        "column_name": cname,
+                        "column_description": column_description,
+                        "detailed_business_meaning": detailed_business_meaning,
+                        "column_example": column_example,
+                        "bronze_datatype": bronze_datatype,
+                        "content_text": search_text,
+                        "metadata_json": {
+                            "dataset_id": dataset_id,
+                            "source_file_name": source_file_name,
+                            "column_type": col.get("data_type") or "TEXT",
+                            "bronze_datatype": bronze_datatype,
+                            "column_description": column_description,
+                            "detailed_business_meaning": detailed_business_meaning,
+                            "validation_rule": validation_rule,
+                            "null_count": int(col.get("null_count", 0) or 0),
+                            "null_pct": float(col.get("null_pct", 0) or 0),
+                            "sample_values": sample_values,
+                            "ordinal_position": pos,
+                            "business_meaning": detailed_business_meaning or column_description,
+                            "column_example": column_example,
+                            "nullable": col.get("nullable", True),
+                            "search_text": search_text,
+                        },
+                    })
+
+                col_text = " • ".join(filter(None, [
                     table_name, cname,
                     col.get("data_type") or "",
                     column_description,
