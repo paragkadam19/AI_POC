@@ -3,6 +3,7 @@ import json
 import time
 import re
 import os
+from dotenv import load_dotenv
 import urllib3
 
 from logger_config import get_logger
@@ -25,6 +26,7 @@ _langfuse = None
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+load_dotenv() 
 
 def _aws_env_config():
     access_key = os.getenv("AWS_ACCESS_KEY_ID")
