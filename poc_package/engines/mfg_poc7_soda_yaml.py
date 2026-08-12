@@ -249,9 +249,9 @@ ensure both are present in the source schema and neither is an ingest-only
 audit field.
 Assign a descriptive name to every conditional check.
 
-SCHEMA DISCOVERY PROFILE
+Tune - Schema IntelligencePROFILE
 
-Use this schema discovery result as the source of truth:
+Use this Tune - Schema Intelligence result as the source of truth:
 
 {schema_profile}
 

@@ -132,7 +132,7 @@ function toChartNumber(v) {
       b.textContent = "CSV Ready · " + s.csv_file;
       b.classList.add("ok");
     } else {
-      b.textContent = "No CSV uploaded";
+      b.textContent = "No file uploaded";
     }
   } catch { $("statusBadge").textContent = "backend offline"; }
 })();
@@ -190,7 +190,7 @@ function renderUpload(data) {
 }
 
 /* ═══════════════════════════════════════════════════════
-   TAB 2 — SCHEMA DISCOVERY (POC 1)
+   TAB 2 — Tune - Schema Intelligence
    Human-in-the-loop: AI result shown for review/edit.
    Nothing saved until user clicks Approve & Save.
    Only after approval is Tab 3 unlocked.
@@ -438,7 +438,7 @@ async function approveSchema() {
 }
 
 function rejectSchema() {
-    if (confirm("Re-run AI schema discovery? This will discard current results.")) {
+    if (confirm("Re-run AI Tune - Schema Intelligence? This will discard current results.")) {
         $("runSchemaBtn").click();
     }
 }
@@ -454,7 +454,7 @@ function rejectSchema() {
 $("runSodaBtn").addEventListener("click", async () => {
   // Frontend gate — if Tab 2 was run in this session but not approved, block immediately
   if (window._pendingSchema && !window._schemaApproved) {
-    alert("Schema Discovery has been run but not approved yet.\n\nPlease go to Tab 2 and click 'Approve & Save' before generating the YAML.");
+    alert("Tune - Schema Intelligence has been run but not approved yet.\n\nPlease go to Tab 2 and click 'Approve & Save' before generating the YAML.");
     switchTab("schema");
     return;
   }
@@ -586,7 +586,7 @@ async function approveSoda() {
 }
 
 function rejectSoda() {
-  if (confirm("Re-generate YAML? This will discard your current edits.")) {
+  if (confirm("Re-compose YAML? This will discard your current edits.")) {
     $("runSodaBtn").click();
   }
 }

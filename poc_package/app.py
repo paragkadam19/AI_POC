@@ -1,8 +1,7 @@
 """
 app.py — Flask backend for Data Quality POC Console
 =================================================================
-Flow: Upload CSV → DuckDB ingest → Schema Discovery → SODA YAML →
-      Data Quality → Schema Validation → Schema Changes → NL→SQL
+Flow: 01 Signal → 02 Tune → 03 Compose → 04 Soundcheck → 05 Resonance → 06 Pitch Drift → 07 Retune
 
 Human-in-the-loop:
 - Tab 2: AI result shown for review/edit → user clicks Approve → saved
@@ -542,7 +541,7 @@ def upload():
         return jsonify({"error": f"DB error: {str(e)}"}), 500
 
 
-# ── Tab 2: Schema Discovery (POC 1) ───────────────────────────────────────────
+# ── Tab 2: Tune - Schema Intelligence  ───────────────────────────────────────────
 @app.route("/api/poc1/run", methods=["POST"])
 def run_poc1():
     ds       = STATE["dataset_id"]
@@ -574,7 +573,7 @@ def run_poc1():
         result["_dataset_id"] = ds
         return jsonify(result)
     except Exception as e:
-        logger.error(f"Schema discovery (poc1) failed for dataset={ds}: {e}", exc_info=True)
+        logger.error(f"Tune - Schema Intelligence, failed for dataset={ds}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
@@ -672,7 +671,7 @@ def run_poc7():
 
     schema_profile = load_latest(ds, "poc1")
     if not schema_profile:
-        return jsonify({"error": "Schema Discovery must be approved first (Tab 2 → Approve & Save)."}), 400
+        return jsonify({"error": "Tune - Schema Intelligence must be approved first (Tab 2 → Approve & Save)."}), 400
 
     try:
         schema_profile = enrich_with_bronze_datatypes(schema_profile, table_name(ds))
@@ -762,7 +761,7 @@ def run_poc3a():
     ds          = STATE["dataset_id"]
     poc1_schema = ds and load_latest(ds, "poc1")
     if not poc1_schema:
-        return jsonify({"error": "Run Schema Discovery (Tab 2) first"}), 400
+        return jsonify({"error": "Play Tune (Tab 2) first"}), 400
     try:
         poc1_schema = enrich_with_bronze_datatypes(poc1_schema, table_name(ds))
         cpath = contract_path(ds)
@@ -792,7 +791,7 @@ def run_poc3b():
     ds             = STATE["dataset_id"]
     current_schema = ds and load_latest(ds, "poc1")
     if not current_schema:
-        return jsonify({"error": "Run Schema Discovery (Tab 2) first"}), 400
+        return jsonify({"error": "Play Tune (Tab 2) first"}), 400
     try:
         versions = list_versions(ds, "poc1")
         if len(versions) < 2:

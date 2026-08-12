@@ -1,4 +1,4 @@
-"""Dynamic prompt generation for Schema Discovery (Tab 2 / POC 1).
+"""Dynamic prompt generation for Tune - Schema Intelligence (Tab 2 ).
 
 We keep the full metadata, but send it in a denser prompt with less
 repeated prose so the model gets the same facts with fewer tokens.

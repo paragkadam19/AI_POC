@@ -2,7 +2,7 @@
 ## AI-Powered Pipeline · AWS Bedrock · DuckDB · SODA Core
 
 6 POCs demonstrating AI-powered data quality on manufacturing CSV data.
-Upload any CSV → DuckDB ingest → Schema Discovery → SODA YAML → Data Quality → Schema Validation → Schema Changes.
+01 Signal → 02 Tune → 03 Compose → 04 Soundcheck → 05 Resonance → 06 Pitch Drift → 07 Retune
 
 ---
 
@@ -119,8 +119,8 @@ python run_manufacturing.py --poc 1 3
 
 | Tab | POC | What it does | Data source |
 |-----|-----|--------------|-------------|
-| 1 CSV Upload | — | Upload CSV → auto-ingest into DuckDB | `f.save()` stream, no RAM |
-| 2 Schema Discovery | POC 1 | AI profiles every column (types, nulls, samples) | DuckDB SUMMARIZE + 500-row SAMPLE |
+| 1 Signal | — | Upload CSV → auto-ingest into DuckDB | `f.save()` stream, no RAM |
+| 2 Tune | AI profiles every column (types, nulls, samples) | DuckDB SUMMARIZE + 500-row SAMPLE |
 | 3 SODA YAML | POC 7 | AI generates SODA Core checks from schema profile | POC 1 JSON only |
 | 4 Data Quality | POC 2 | AI designs + runs DQ checks, scores batches | DuckDB 1000-row SAMPLE |
 | 5 Schema Validation | POC 3a | Compares schema against locked contract | POC 1 JSON only |
@@ -134,7 +134,7 @@ python run_manufacturing.py --poc 1 3
 |------|--------------------|--------------------|
 | Upload | `f.read()` → 2GB in Python RAM | `f.save()` → streams disk-to-disk |
 | DuckDB ingest | `sample_size=-1` scans all rows | `sample_size=200000` fast type detection |
-| Schema Discovery | Polars reads full file | DuckDB SUMMARIZE on full dataset, 500-row SAMPLE sent to AI |
+| Tune | DuckDB SUMMARIZE on full dataset, 500-row SAMPLE sent to AI |
 | Data Quality | Polars reads full file | DuckDB 1000-row reservoir SAMPLE sent to AI |
 | SODA / Validation / Changes | — | JSON only, zero data reads |
 
