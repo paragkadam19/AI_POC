@@ -52,6 +52,9 @@ TASK
    Return both fields for every column, even if they are the same.
    For `bronze_datatype`, copy the exact type from the input schema value
    for that column. Do not change it, infer it, or leave it blank.
+   If `bronze_datatype` and `data_type` mismatch, compare them explicitly and
+   use the actual DuckDB type for downstream logic. For date-like mismatches,
+   convert `data_type` to `DATE` while keeping `bronze_datatype` unchanged.
 2. Write a short but useful column description.
 3. Write a detailed business meaning for each column.
 4. Provide 1 example value or sample for each column.

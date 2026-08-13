@@ -88,7 +88,7 @@ bash setup.sh
 This will:
 - Create a Python virtual environment
 - Install all packages from `requirements.txt`
-  (boto3, flask, duckdb, polars, soda-core-duckdb, pyyaml, etc.)
+  (boto3, flask, duckdb, polars, langfuse, soda-core-duckdb, pyyaml, etc.)
 - Verify AWS credentials from `.env`
 - Test a live Bedrock API call
 

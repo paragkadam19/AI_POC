@@ -42,7 +42,7 @@ pip install --quiet --upgrade pip
 pip install --quiet -r requirements.txt
 echo ""
 echo "  Installed packages:"
-pip show boto3 flask duckdb polars | grep -E "^(Name|Version)"
+pip show boto3 flask duckdb polars langfuse urllib3 | grep -E "^(Name|Version)"
 echo "  All dependencies installed."
 
 # ── Check AWS credentials from .env ───────────────────────────

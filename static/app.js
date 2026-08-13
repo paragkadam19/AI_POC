@@ -597,20 +597,13 @@ function rejectSoda() {
 const nlQuery = $("nlQuery");
 const runQueryBtn = $("runQueryBtn");
 const clearQueryBtn = $("clearQueryBtn");
-
-// Holds the current Chart.js instance so we can destroy it before drawing a
-// new one (Chart.js throws if you re-use a canvas that already has a chart).
-let _poc8ChartInstance = null;
+let tab7Chart = null;
 
 if (clearQueryBtn && nlQuery) {
   clearQueryBtn.addEventListener("click", () => {
     nlQuery.value = "";
     $("queryResult").classList.add("hidden");
     $("queryResult").innerHTML = "";
-    if (_poc8ChartInstance) {
-      _poc8ChartInstance.destroy();
-      _poc8ChartInstance = null;
-    }
   });
 }
 
@@ -645,9 +638,9 @@ function renderQuery(d) {
   const el = $("queryResult");
   el.classList.remove("hidden");
 
-  if (_poc8ChartInstance) {
-    _poc8ChartInstance.destroy();
-    _poc8ChartInstance = null;
+  if (tab7Chart) {
+    tab7Chart.destroy();
+    tab7Chart = null;
   }
 
   if (!d.ok) {
@@ -663,8 +656,6 @@ function renderQuery(d) {
     return;
   }
 
-  const tables = (d.tables || []).map(t => `<code style="margin-right:6px">${t}</code>`).join("");
-  const joins = (d.join_paths || []).map(j => `<li><code>${j.left}</code> ↔ <code>${j.right}</code> via <code>${j.join_column}</code></li>`).join("");
   const previewRows = (d.preview && d.preview.rows) || d.rows || [];
   const previewCols = (d.preview && d.preview.columns) || d.columns || [];
 
@@ -684,8 +675,32 @@ function renderQuery(d) {
     ? `<div class="banner info">Warnings: ${warningsList.map((w) => escapeHtml(String(w))).join(" · ")}</div>`
     : "";
 
+  const backendSpec = d.chart_spec || {};
+  const inferredSpec = inferChartSpec(previewRows, previewCols);
+  const chartSpec = (backendSpec.chart_type && backendSpec.chart_type !== "table")
+    ? backendSpec
+    : inferredSpec;
+  const chartData = (d.chart_data && d.chart_data.length ? d.chart_data : previewRows) || [];
+  const chartType = normalizeChartType(chartSpec.chart_type || "table");
+  console.log("[tab7] render payload", {
+    ok: d.ok,
+    chartSpec,
+    chartType,
+    previewCols,
+    previewRowsCount: previewRows.length,
+    chartDataCount: chartData.length,
+    chartCanvasWillRender: chartType !== "table",
+    hasChartJs: !!window.Chart,
+  });
+  const chartHtml = chartType !== "table"
+    ? `<div class="card-list"><div class="ev-card chart-card"><div class="obs">Chart</div><div class="sig"><div style="position:relative;height:380px"><canvas id="tab7Chart"></canvas></div></div></div></div>`
+    : "";
+
   el.innerHTML = `
-    ${renderChartSection(d)}
+    <div class="banner ok">✓ SQL generated and validated</div>
+    ${warnings}
+  ${chartHtml}
+  ${chartType !== "table" && !chartData.length ? `<div class="banner info">No chart data available for this result.</div>` : ""}
     <h3>Generated SQL</h3>
     <textarea readonly style="width:100%;min-height:180px;font-family:'SF Mono',Consolas,monospace;font-size:13px;
       background:#0F172A;color:#E2E8F0;padding:16px;border-radius:8px;border:none;resize:vertical;line-height:1.6">${escapeHtml(d.sql || "")}</textarea>
@@ -693,247 +708,55 @@ function renderQuery(d) {
     ${previewHtml}
   `;
 
-  // Chart.js (or the heatmap grid) needs the canvas/container to already be
-  // in the DOM, so this runs after el.innerHTML is set above.
-  mountChartVisualization(d);
-}
+  if (chartType !== "table" && window.Chart && $("tab7Chart")) {
+    const ctx = $("tab7Chart").getContext("2d");
+    const inferred = inferChartSpec(chartData, previewCols);
+    const picked = pickChartFields(chartSpec, chartData, previewCols.length ? previewCols : Object.keys(chartData[0] || {}));
+    const xKey = picked.xAxis || inferred.x_axis || previewCols[0];
+    const yKey = picked.yAxis || inferred.y_axis || previewCols[1] || previewCols[0];
+    const labels = chartData.map((row) => String(row?.[xKey] ?? "")).filter((v) => v !== "");
+    const values = chartData.map((row) => toChartNumber(row?.[yKey] ?? 0));
 
-/* ───────────────────────────────────────────────────────
-   Chart visualization — consumes result.chart_spec / result.chart_data
-   from poc8.question_to_sql(). chart_spec.chart_type drives which
-   renderer runs; "table" means "don't chart, the preview table above
-   is already the answer" so we render nothing extra for it.
-─────────────────────────────────────────────────────── */
+    console.log("[tab7] chart debug", { chartSpec, chartType, xKey, yKey, chartData, previewCols });
 
-const POC8_PALETTE = ["#2DD4BF", "#F59E0B", "#34D399", "#F472B6", "#818CF8", "#FB923C", "#22D3EE", "#A78BFA", "#FBBF24", "#4ADE80"];
-
-function renderChartSection(d) {
-  const spec = d.chart_spec;
-  const rows = d.chart_data || d.rows || [];
-  if (!spec || spec.chart_type === "table" || !rows.length) return "";
-
-  const chartWarnings = asArray(spec.warnings);
-  const warnHtml = chartWarnings.length
-    ? `<div class="banner info" style="margin-top:8px">Chart notes: ${chartWarnings.map(w => escapeHtml(String(w))).join(" · ")}</div>`
-    : "";
-  const heading = `<h3>Visualization${spec.title ? `: ${escapeHtml(spec.title)}` : ""}</h3>`;
-
-  if (spec.chart_type === "kpi") {
-    const val = rows[0] ? rows[0][spec.y_axis] : null;
-    return `
-      ${heading}
-      <div class="summary-strip">
-        <div class="kpi teal"><div class="v">${fmt(val)}</div><div class="l">${escapeHtml(spec.y_axis || "result")}</div></div>
-      </div>
-      ${warnHtml}`;
-  }
-
-  if (spec.chart_type === "heatmap") {
-    return `
-      ${heading}
-      <div id="poc8Heatmap"></div>
-      ${warnHtml}`;
-  }
-
-  // bar / line / pie / scatter / histogram all render into a Chart.js canvas
-  return `
-    ${heading}
-    <div style="background:#0F172A;border-radius:8px;padding:16px;margin-bottom:4px">
-      <canvas id="poc8Chart" height="320"></canvas>
-    </div>
-    ${warnHtml}`;
-}
-
-function mountChartVisualization(d) {
-  const spec = d.chart_spec;
-  if (!spec || spec.chart_type === "table" || spec.chart_type === "kpi") return;
-
-  if (spec.chart_type === "heatmap") {
-    renderHeatmapGrid(d);
-    return;
-  }
-
-  drawChart(d);
-}
-
-function chartAxisOptions(title) {
-  return {
-    responsive: true,
-    maintainAspectRatio: false,
-    plugins: {
-      legend: { labels: { color: "#E2E8F0" } },
-      title: { display: !!title, text: title, color: "#E2E8F0" },
-    },
-    scales: {
-      x: { ticks: { color: "#94A3B8" }, grid: { color: "#1E293B" } },
-      y: { ticks: { color: "#94A3B8" }, grid: { color: "#1E293B" } },
-    },
-  };
-}
-
-function drawChart(d) {
-  const spec = d.chart_spec;
-  const rows = d.chart_data || d.rows || [];
-  const canvas = document.getElementById("poc8Chart");
-  if (!spec || !canvas || !rows.length) return;
-
-  if (typeof Chart === "undefined") {
-    canvas.replaceWith(Object.assign(document.createElement("div"), {
-      style: "color:#94A3B8;font-size:12px",
-      innerText: "Chart.js isn't loaded — add <script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script> to render charts. The data table above still has the full result.",
-    }));
-    return;
-  }
-
-  const ctx = canvas.getContext("2d");
-  const { chart_type, x_axis, y_axis, series, title } = spec;
-
-  if (chart_type === "pie") {
-    const labels = rows.map(r => String(r[x_axis]));
-    const values = rows.map(r => Number(r[y_axis]) || 0);
-    _poc8ChartInstance = new Chart(ctx, {
-      type: "pie",
-      data: { labels, datasets: [{ data: values, backgroundColor: POC8_PALETTE }] },
-      options: chartAxisOptions(title),
-    });
-    return;
-  }
-
-  if (chart_type === "bar") {
-    const labels = rows.map(r => String(r[x_axis]));
-    const values = rows.map(r => Number(r[y_axis]) || 0);
-    _poc8ChartInstance = new Chart(ctx, {
-      type: "bar",
-      data: { labels, datasets: [{ label: y_axis, data: values, backgroundColor: "#2DD4BF" }] },
-      options: chartAxisOptions(title),
-    });
-    return;
-  }
-
-  if (chart_type === "line") {
-    let labels = [...new Set(rows.map(r => String(r[x_axis])))];
-    let datasets;
-
-    if (series) {
-      const groups = {};
-      rows.forEach(r => {
-        const key = String(r[series]);
-        (groups[key] = groups[key] || []).push(r);
-      });
-      datasets = Object.keys(groups).map((key, i) => ({
-        label: key,
-        data: labels.map(l => {
-          const match = groups[key].find(r => String(r[x_axis]) === l);
-          return match ? (Number(match[y_axis]) || 0) : null;
-        }),
-        borderColor: POC8_PALETTE[i % POC8_PALETTE.length],
-        backgroundColor: "transparent",
-        tension: 0.3,
-        spanGaps: true,
-      }));
-    } else {
-      datasets = [{
-        label: y_axis,
-        data: rows.map(r => Number(r[y_axis]) || 0),
-        borderColor: "#2DD4BF",
-        backgroundColor: "transparent",
-        tension: 0.3,
-      }];
+    if (!labels.length || !values.length || !xKey || !yKey) {
+      console.warn("[tab7] chart skipped: unusable axes", { chartSpec, previewCols, xKey, yKey });
+      return;
     }
 
-    _poc8ChartInstance = new Chart(ctx, {
-      type: "line",
-      data: { labels, datasets },
-      options: chartAxisOptions(title),
-    });
-    return;
-  }
-
-  if (chart_type === "scatter") {
-    const points = rows.map(r => ({ x: Number(r[x_axis]) || 0, y: Number(r[y_axis]) || 0 }));
-    _poc8ChartInstance = new Chart(ctx, {
-      type: "scatter",
-      data: { datasets: [{ label: `${y_axis} vs ${x_axis}`, data: points, backgroundColor: "#2DD4BF" }] },
-      options: chartAxisOptions(title),
-    });
-    return;
-  }
-
-  if (chart_type === "histogram") {
-    const values = rows.map(r => Number(r[x_axis])).filter(v => !Number.isNaN(v));
-    if (!values.length) return;
-
-    const bins = 12;
-    const min = Math.min(...values);
-    const max = Math.max(...values);
-    const width = (max - min) / bins || 1;
-    const counts = new Array(bins).fill(0);
-
-    values.forEach(v => {
-      let idx = Math.floor((v - min) / width);
-      if (idx >= bins) idx = bins - 1;
-      if (idx < 0) idx = 0;
-      counts[idx]++;
-    });
-
-    const labels = counts.map((_, i) => `${(min + i * width).toFixed(1)}–${(min + (i + 1) * width).toFixed(1)}`);
-    _poc8ChartInstance = new Chart(ctx, {
-      type: "bar",
-      data: { labels, datasets: [{ label: x_axis, data: counts, backgroundColor: "#2DD4BF" }] },
-      options: chartAxisOptions(title),
+    const chartKind = chartType === "kpi" ? "bar" : chartType;
+    if (["bar", "line", "pie"].includes(chartKind)) {
+      tab7Chart = new Chart(ctx, {
+        type: chartKind,
+        data: {
+          labels,
+          datasets: [{
+            label: yKey || "Value",
+            data: values,
+            backgroundColor: "rgba(59, 130, 246, 0.65)",
+            borderColor: "rgba(59, 130, 246, 1)",
+            borderWidth: 1,
+          }],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: chartKind !== "bar" },
+          },
+        },
+      });
+    } else {
+      console.warn("[tab7] chart type not rendered in UI", chartKind);
+    }
+  } else {
+    console.warn("[tab7] chart not created", {
+      chartType,
+      hasChartJs: !!window.Chart,
+      hasCanvas: !!$("tab7Chart"),
     });
   }
 }
-
-// Heatmap has no first-party Chart.js chart type, so it's rendered as a
-// plain colour-scaled HTML table instead of pulling in a plugin/D3.
-function renderHeatmapGrid(d) {
-  const spec = d.chart_spec;
-  const rows = d.chart_data || d.rows || [];
-  const container = document.getElementById("poc8Heatmap");
-  if (!spec || !container) return;
-
-  const xCol = spec.x_axis, yCol = spec.y_axis, vCol = spec.series;
-  if (!xCol || !yCol || !vCol || !rows.length) {
-    container.innerHTML = "<div style='color:#94A3B8;font-size:12px'>Not enough dimensions for a heatmap.</div>";
-    return;
-  }
-
-  const xCats = [...new Set(rows.map(r => String(r[xCol])))];
-  const yCats = [...new Set(rows.map(r => String(r[yCol])))];
-  const valueMap = {};
-  let min = Infinity, max = -Infinity;
-
-  rows.forEach(r => {
-    const key = `${String(r[xCol])}|${String(r[yCol])}`;
-    const v = Number(r[vCol]) || 0;
-    valueMap[key] = v;
-    if (v < min) min = v;
-    if (v > max) max = v;
-  });
-
-  const colorFor = (v) => {
-    if (max === min) return "rgba(45,212,191,0.45)";
-    const t = (v - min) / (max - min);
-    const alpha = 0.15 + t * 0.75;
-    return `rgba(45,212,191,${alpha.toFixed(2)})`;
-  };
-
-  let html = `<div class="table-wrap"><table><thead><tr><th></th>${xCats.map(x => `<th>${escapeHtml(x)}</th>`).join("")}</tr></thead><tbody>`;
-  yCats.forEach(y => {
-    html += `<tr><th style="text-align:left">${escapeHtml(y)}</th>`;
-    xCats.forEach(x => {
-      const key = `${x}|${y}`;
-      const v = valueMap[key];
-      html += `<td style="background:${v !== undefined ? colorFor(v) : "transparent"};text-align:center">${v !== undefined ? fmt(v) : ""}</td>`;
-    });
-    html += "</tr>";
-  });
-  html += "</tbody></table></div>";
-
-  container.innerHTML = html;
-}
-
 
 /* ═══════════════════════════════════════════════════════
    TAB 4 — DATA QUALITY (POC 2)

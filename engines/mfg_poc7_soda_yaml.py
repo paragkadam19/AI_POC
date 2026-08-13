@@ -34,6 +34,11 @@ Use the FULL context:
 - quality_concerns: Issues flagged (high nulls, duplicates, etc.)
 - null_count / null_pct: ACTUAL null stats (not just 0 or all)
 - bronze_datatype: actual DuckDB type; use this as the source of truth for type-based checks
+- If `bronze_datatype` is `VARCHAR` but the values clearly look like dates,
+  treat the column as a date field for rule generation and generate date checks.
+- If `bronze_datatype` and `data_type` differ, compare them explicitly and use
+  the actual DuckDB type for rule generation. For date-like mismatches,
+  convert the AI-facing `data_type` to `DATE` while keeping `bronze_datatype`.
 """
 
 PROMPT = """RULE GENERATION PRIORITY
@@ -138,6 +143,9 @@ If timestamp exists, generate freshness checks when appropriate.
 14. COLUMN TYPE VALIDATION
 Validate: integer, decimal, date, timestamp, boolean, string using Soda syntax.
 Prefer bronze_datatype over AI-inferred data_type whenever both are present.
+If bronze_datatype and data_type differ, compare them explicitly and use the
+actual DuckDB type for checks. For date-like mismatches, treat the field as
+DATE for invalid_count, min(), max(), freshness, and date comparisons.
 
 15. DATA QUALITY NAMES
 EVERY check must have: name: DQ-### Description

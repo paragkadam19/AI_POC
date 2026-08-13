@@ -42,6 +42,8 @@ def _init_langfuse():
     if _langfuse is not None:
         return _langfuse
 
+    logger.info(f"[langfuse] bootstrap | python={os.environ.get('VIRTUAL_ENV') or ''} | disable={os.getenv('DISABLE_LANGFUSE', '')}")
+
     if os.getenv("DISABLE_LANGFUSE", "").lower() in {"1", "true", "yes"}:
         logger.info("[langfuse] disabled via DISABLE_LANGFUSE")
         return None

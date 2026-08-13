@@ -256,9 +256,11 @@ def parse_check_string(check_str: str, table_name: str,
             col_name = col_name.strip('"\'')
             if operator == "==":
                 operator = "="
+            is_date_check = bool(re.match(r"^\d{4}-\d{2}-\d{2}$", value.strip()))
+            col_expr = f'TRY_CAST("{col_name}" AS DATE)' if is_date_check else f'"{col_name}"'
             return (
                 "min_check",
-                f'SELECT MIN("{col_name}") FROM {table_name}',
+                f'SELECT MIN({col_expr}) FROM {table_name}',
                 f"{operator} {value}"
             )
 
@@ -269,9 +271,11 @@ def parse_check_string(check_str: str, table_name: str,
             col_name = col_name.strip('"\'')
             if operator == "==":
                 operator = "="
+            is_date_check = bool(re.match(r"^\d{4}-\d{2}-\d{2}$", value.strip()))
+            col_expr = f'TRY_CAST("{col_name}" AS DATE)' if is_date_check else f'"{col_name}"'
             return (
                 "max_check",
-                f'SELECT MAX("{col_name}") FROM {table_name}',
+                f'SELECT MAX({col_expr}) FROM {table_name}',
                 f"{operator} {value}"
             )
 
@@ -451,11 +455,16 @@ def evaluate_check(actual_value: Any, expected_str: str, check_type: str) -> Tup
     if actual_value is None:
         return False, "Actual value is NULL"
 
-    match = re.match(r"([<>=]+)\s*([\d\.-]+)", expected_str.strip())
+    expected_raw = expected_str.strip()
+    match = re.match(r"([<>=]+)\s*([\w\-\.: ]+)", expected_raw)
     if not match:
         return False, f"Could not parse expected: {expected_str}"
 
     operator, expected_value = match.groups()
+    expected_value = expected_value.strip().lower()
+
+    if expected_value in {"today", "current_date"}:
+        expected_value = date.today().isoformat()
 
     # Date-ish expected values are compared lexicographically after normalization.
     if re.match(r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?$", str(expected_value)):

@@ -23,6 +23,7 @@ except Exception:
 
 setup_logging()
 logger = get_logger(__name__)
+logger.info(f"[boot] python={sys.executable}")
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 STORAGE_DIR   = os.path.join(BASE_DIR, "storage")
@@ -96,6 +97,7 @@ CORS(app)
 DB_FILE = os.path.join(STORAGE_DIR, "ai_poc_dq.duckdb")
 STATE   = {"dataset_id": None, "filename": None, "poc1_metadata": None}
 UPLOAD_COPY_CHUNK_SIZE = 32 * 1024 * 1024
+POC1_MODEL_ID = "us.anthropic.claude-sonnet-4-6"
 
 
 # ── KB Manager initialisation ─────────────────────────────────────────────────
@@ -562,7 +564,7 @@ def run_poc1():
         logger.info(f"[poc1] STEP 3 - prompt built | chars={len(system_prompt)+len(user_prompt)}")
 
         t_ai = time.time()
-        result = ask_json(user_prompt, system_prompt)
+        result = ask_json(user_prompt, system_prompt, model=POC1_MODEL_ID)
         logger.info(f"[poc1] STEP 4 - AI call done in {time.time()-t_ai:.3f}s | total={time.time()-t_start:.3f}s")
 
         result = _filter_audit_fields(result)

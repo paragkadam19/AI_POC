@@ -13,7 +13,7 @@ def _merge_no_verify(self, url, proxies, stream, verify, cert):
     return settings
 requests.Session.merge_environment_settings = _merge_no_verify
 
-#... rest of your existing main.py imports/code below
+# ... rest of your existing main.py imports/code below
 from app import app
 
 if __name__ == "__main__":
