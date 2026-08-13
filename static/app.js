@@ -708,7 +708,20 @@ function renderQuery(d) {
     ${previewHtml}
   `;
 
-  if (chartType !== "table" && window.Chart && $("tab7Chart")) {
+  const POC8_PALETTE = [
+  "#C1694A", // terracotta
+  "#6E8CAE", // slate blue
+  "#C9A24D", // mustard / ochre
+  "#7A9471", // sage
+  "#C58B92", // dusty rose
+  "#3F8079", // deep teal
+  "#8E6B95", // plum / heather
+  "#5E7A54", // moss
+  "#B49A7B", // warm taupe / stone
+  "#92434B", // wine / burgundy
+];
+
+if (chartType !== "table" && window.Chart && $("tab7Chart")) {
     const ctx = $("tab7Chart").getContext("2d");
     const inferred = inferChartSpec(chartData, previewCols);
     const picked = pickChartFields(chartSpec, chartData, previewCols.length ? previewCols : Object.keys(chartData[0] || {}));
@@ -733,8 +746,8 @@ function renderQuery(d) {
           datasets: [{
             label: yKey || "Value",
             data: values,
-            backgroundColor: "rgba(59, 130, 246, 0.65)",
-            borderColor: "rgba(59, 130, 246, 1)",
+            backgroundColor: POC8_PALETTE,
+            borderColor: POC8_PALETTE[0],
             borderWidth: 1,
           }],
         },
