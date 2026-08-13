@@ -1,7 +1,9 @@
 """
-nl_sql.py — Natural Language → SQL Query Builder
-===========================================================
-Tab 8: Convert natural language questions into DuckDB SQL.
+mfg_poc8_nl_sql.py — Natural Language → SQL Query Builder (+ Chart Recommendation)
+====================================================================================
+Tab 8: Convert natural language questions into DuckDB SQL, execute them, and
+recommend a chart spec (chart type + axis mapping) so the frontend can render
+a graph instead of just a table.
 
 Flow:
   1. Retrieve relevant tables using KB Manager (vector semantic search)
@@ -10,10 +12,21 @@ Flow:
   4. Send to Claude with few-shot examples
   5. Claude generates SQL
   6. Execute and return results + metadata
+  7. Recommend a chart spec (rule-based, with optional LLM refinement)
+          for the result set and attach it to the response.
 
-Key change: Now uses kb_manager.retrieve_by_vector() for semantic retrieval
-instead of bag-of-words. This means real vector similarity search powered by
-Bedrock Titan embeddings and DuckDB VSS HNSW index.
+Revision history:
+  - Added `recommend_chart_spec()` / `prepare_chart_dataset()` and wired them
+    into `question_to_sql()` via a `want_chart` flag. Charting is purely
+    additive and fails safe (falls back to "table" chart_type) if anything
+    goes wrong.
+  - Fixed a mis-classification bug: grouping keys that happen to be numeric
+    (e.g. an "age" column derived from DATE_PART) were being treated as the
+    chart's numeric *measure* instead of the real aggregate (COUNT/SUM/...),
+    which produced nonsensical bar charts (e.g. state vs. age instead of
+    state vs. applicant count). `_infer_column_dtypes()` now detects the
+    true aggregate column from the SQL text and demotes other numeric
+    columns to categorical dimensions in GROUP BY queries.
 """
 
 import json
@@ -21,7 +34,7 @@ import re
 import os
 import difflib
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, date
 from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
@@ -30,15 +43,15 @@ from logger_config import get_logger
 
 logger = get_logger(__name__)
 DEBUG_NLQ_PROMPTS = os.getenv("DEBUG_NLQ_PROMPTS", "").lower() in {"1", "true", "yes"}
-MODEL_ID = "us.anthropic.claude-sonnet-4-6"
 AUDIT_COLUMNS = {"system_date", "system_active", "file_path"}
+MODEL_ID = "us.anthropic.claude-sonnet-4-6"
+MAX_CATEGORIES = 15  # cap for bar/pie chart categories before we bucket the long tail into "Other"
 CHART_INTENT_WORDS = {
     "trend", "trends", "compare", "comparison", "breakdown", "distribution",
     "over time", "month over month", "mom", "yoy", "growth", "chart",
     "graph", "visualize", "visualisation", "visualization", "plot", "by month",
     "by day", "by week", "by year", "top", "rank", "group by"
 }
-
 # Global KB Manager ref (wired in by app.py via set_kb_manager)
 _KB_MANAGER: Optional[Any] = None
 
@@ -387,213 +400,13 @@ def _build_expected_complexity_hint(question: str) -> str:
         hints.append("aggregate fields")
     if any(tok in q for tok in ("segment", "region", "category", "premium", "east", "west", "north", "south")):
         hints.append("filters + grouping by segment/region")
-    if any(tok in q for tok in ("join", "customers", "orders", "sales_performance", "order_items")):
+    if any(tok in q for tok in ("join", "customers", "orders", "sales_performance", "order_items", "applicant")):
         hints.append("JOIN between related tables")
     if any(tok in q for tok in ("ordered by", "order by", "sorted", "rank", "top", "latest")):
         hints.append("ORDER BY")
     if not hints:
         return ""
     return "*Expected Complexity*: " + ", ".join(dict.fromkeys(hints))
-
-
-def _infer_column_dtypes(rows: List[Dict[str, Any]], columns: List[str]) -> Dict[str, str]:
-    kinds: Dict[str, str] = {}
-    for col in columns or []:
-        values = [row.get(col) for row in rows if row and row.get(col) is not None]
-        if not values:
-            kinds[col] = "text"
-            continue
-
-        sample = values[:50]
-        num_count = 0
-        date_count = 0
-        bool_count = 0
-        for v in sample:
-            if isinstance(v, bool):
-                bool_count += 1
-            elif isinstance(v, (int, float)) and not isinstance(v, bool):
-                num_count += 1
-            else:
-                s = str(v).strip()
-                if re.fullmatch(r"-?\d+(\.\d+)?", s):
-                    num_count += 1
-                elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-                    date_count += 1
-        if bool_count >= max(1, len(sample) // 2):
-            kinds[col] = "boolean"
-        elif date_count >= max(1, len(sample) // 2):
-            kinds[col] = "datetime"
-        elif num_count >= max(1, len(sample) // 2):
-            kinds[col] = "numeric"
-        else:
-            kinds[col] = "categorical" if len(set(str(v) for v in sample)) <= max(15, len(sample) // 2) else "text"
-    return kinds
-
-
-def _get_visual_intent(question: str) -> bool:
-    q = (question or "").lower()
-    return any(tok in q for tok in CHART_INTENT_WORDS)
-
-
-def _rule_based_chart_spec(question: str, rows: List[Dict[str, Any]], columns: List[str]) -> Dict[str, Any]:
-    if not rows:
-        return {"chart_type": "table", "reason": "no rows returned"}
-
-    if len(rows) == 1:
-        return {"chart_type": "kpi", "reason": "single row result"}
-
-    dtypes = _infer_column_dtypes(rows, columns)
-    numeric_cols = [c for c in columns if dtypes.get(c) == "numeric"]
-    datetime_cols = [c for c in columns if dtypes.get(c) == "datetime"]
-    categorical_cols = [c for c in columns if dtypes.get(c) in {"categorical", "text"}]
-
-    q = (question or "").lower()
-    if datetime_cols and numeric_cols and any(tok in q for tok in ("trend", "over time", "month", "week", "day", "year")):
-        return {
-            "chart_type": "line",
-            "x_axis": datetime_cols[0],
-            "y_axis": numeric_cols[0],
-            "series": categorical_cols[0] if categorical_cols else None,
-            "reason": "date + numeric with time-series intent",
-        }
-
-    if categorical_cols and numeric_cols:
-        if len(categorical_cols) == 1:
-            return {
-                "chart_type": "bar",
-                "x_axis": categorical_cols[0],
-                "y_axis": numeric_cols[0],
-                "series": None,
-                "reason": "category + numeric",
-            }
-        if len(categorical_cols) >= 2:
-            return {
-                "chart_type": "bar",
-                "x_axis": categorical_cols[0],
-                "y_axis": numeric_cols[0],
-                "series": categorical_cols[1],
-                "reason": "2 categorical + numeric; normalized to bar for UI support",
-            }
-
-    if numeric_cols and categorical_cols:
-        return {
-            "chart_type": "bar",
-            "x_axis": categorical_cols[0],
-            "y_axis": numeric_cols[0],
-            "reason": "fallback category + numeric",
-        }
-
-    if datetime_cols and numeric_cols:
-        return {
-            "chart_type": "line",
-            "x_axis": datetime_cols[0],
-            "y_axis": numeric_cols[0],
-            "reason": "date + numeric",
-        }
-
-    return {"chart_type": "table", "reason": "no chart-friendly dimensions"}
-
-
-def _llm_chart_spec(question: str, rows: List[Dict[str, Any]], columns: List[str], ask_json_fn) -> Dict[str, Any]:
-    if not ask_json_fn:
-        return {}
-    preview = rows[:5]
-    prompt = {
-        "question": question,
-        "columns": columns,
-        "row_count": len(rows),
-        "preview_rows": preview,
-        "output_format": {
-            "chart_type": "bar|line|pie|scatter|heatmap|kpi|table",
-            "x_axis": "optional column name",
-            "y_axis": "optional column name",
-            "series": "optional column name",
-            "value": "optional column name",
-            "reason": "short reason",
-        },
-    }
-    system = """You are a chart selection assistant.
-Return ONLY valid JSON.
-Pick a simple chart spec from the provided columns and rows.
-Use only the exact column names given in the input.
-If unsure, return {"chart_type":"table","reason":"unclear"}."""
-    try:
-        resp = ask_json_fn(json.dumps(prompt, default=str), system, model=MODEL_ID)
-        return resp or {}
-    except Exception:
-        return {}
-
-
-def _validate_chart_spec(spec: Dict[str, Any], columns: List[str], question: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    columns_set = set(columns or [])
-    spec = dict(spec or {})
-    chart_type = (spec.get("chart_type") or "table").lower()
-
-    for key in ("x_axis", "y_axis", "series", "value"):
-        if spec.get(key) and spec[key] not in columns_set:
-            spec[key] = None
-
-    if chart_type not in {"bar", "line", "pie", "scatter", "kpi", "table"}:
-        chart_type = "table"
-
-    if chart_type == "table":
-        return {"chart_type": "table", "reason": spec.get("reason") or "fallback table"}
-
-    if chart_type == "kpi":
-        return {"chart_type": "kpi", "reason": spec.get("reason") or "single value"}
-
-    if chart_type in {"bar", "line", "pie", "scatter"}:
-        if not spec.get("x_axis") or not spec.get("y_axis"):
-            return {"chart_type": "table", "reason": "missing axis columns"}
-    return spec
-
-
-def recommend_chart_spec(
-    question: str,
-    rows: List[Dict[str, Any]],
-    columns: List[str],
-    ask_json_fn=None,
-) -> Dict[str, Any]:
-    try:
-        spec = _rule_based_chart_spec(question, rows, columns)
-        if _get_visual_intent(question) and spec.get("chart_type") == "table":
-            llm_spec = _llm_chart_spec(question, rows, columns, ask_json_fn)
-            if llm_spec:
-                spec = llm_spec
-        return _validate_chart_spec(spec, columns, question, rows)
-    except Exception as e:
-        logger.warning(f"[poc8] chart spec failed: {e}")
-        return {"chart_type": "table", "reason": "chart spec failed"}
-
-
-def prepare_chart_dataset(rows: List[Dict[str, Any]], chart_spec: Dict[str, Any]) -> List[Dict[str, Any]]:
-    spec = chart_spec or {}
-    chart_type = (spec.get("chart_type") or "table").lower()
-    if chart_type not in {"bar", "pie"}:
-        return rows
-
-    x_axis = spec.get("x_axis")
-    y_axis = spec.get("y_axis")
-    if not x_axis or not y_axis:
-        return rows
-
-    buckets: Dict[str, float] = defaultdict(float)
-    rest = 0.0
-    for row in rows or []:
-        key = str(row.get(x_axis) if row.get(x_axis) is not None else "Unknown")
-        try:
-            val = float(row.get(y_axis) or 0)
-        except Exception:
-            val = 0.0
-        buckets[key] += val
-
-    sorted_items = sorted(buckets.items(), key=lambda kv: kv[1], reverse=True)
-    top = sorted_items[:15]
-    rest = sum(v for _, v in sorted_items[15:])
-    out = [{x_axis: k, y_axis: v} for k, v in top]
-    if rest:
-        out.append({x_axis: "Other", y_axis: rest})
-    return out
 
 
 def _repair_sql_with_error(
@@ -625,10 +438,382 @@ SCHEMA:
 
 Return JSON exactly like:
 {{"sql":"..."}}"""
-    repaired = ask_json_fn(repair_prompt, repair_system, model=MODEL_ID)
+    repaired = ask_json_fn(repair_prompt, repair_system,model="us.anthropic.claude-sonnet-4-6")
     if not repaired:
         return ""
     return (repaired.get("sql") or repaired.get("query") or "").strip()
+
+
+# ============================================================================
+# CHART SPEC RECOMMENDATION
+# ============================================================================
+# Design: don't ask the LLM to draw the chart — decide chart_type + axis
+# mapping only, and let the frontend render with a charting library
+# (Recharts / Chart.js / Plotly). Rule-based by default (free, deterministic,
+# instant); escalates to a single lightweight LLM call only when the question
+# has visualization-intent language the rules can't disambiguate on their own
+# (e.g. "trend" vs "breakdown"). Every spec is validated against the actual
+# result columns before being returned, so a hallucinated column name can
+# never reach the frontend.
+
+_VIZ_INTENT_TOKENS = (
+    "trend", "distribution", "compare", "comparison", "breakdown", "over time",
+    "share", "proportion", "correlation", "relationship", "pattern", "top ",
+    "rank", "heatmap", "histogram", "pie chart", "line chart", "bar chart",
+)
+
+CHART_SPEC_SYSTEM_PROMPT = """You are a data visualization assistant.
+Given a user's question, the SQL that answered it, and the shape of the result
+set (column names + inferred dtypes + row count), recommend the single best
+chart type to visualize this data.
+
+Rules:
+- 1 categorical column + 1 numeric column -> bar chart
+- a datetime column + 1+ numeric columns -> line chart
+- 1 categorical column + 1 numeric column, and the numeric values are shares
+  of a whole (percentages, counts of a small set of categories), <=8 categories -> pie chart
+- 2 numeric columns, many rows (>50), no time/category axis -> scatter plot
+- 1 numeric column, many rows, no category/time axis -> histogram
+- 2 categorical columns + 1 numeric measure -> heatmap
+- a single row with 1 numeric value -> kpi (a number card, not a chart)
+- if nothing above cleanly fits, or the user explicitly asked for a table/list -> table
+
+Output STRICTLY as JSON matching this schema, and nothing else:
+{"chart_type": "bar" | "line" | "pie" | "scatter" | "histogram" | "heatmap" | "kpi" | "table",
+ "x_axis": "<exact column_name or null>",
+ "y_axis": "<exact column_name or null>",
+ "series": "<exact column_name or null, for multi-series/grouped charts>",
+ "aggregation": "sum" | "avg" | "count" | "none",
+ "title": "<short descriptive title>"}
+
+Only use column names that appear exactly in the provided result columns list.
+Never invent a column name."""
+
+
+def _looks_like_date(value: Any) -> bool:
+    if isinstance(value, (datetime, date)):
+        return True
+    if isinstance(value, str):
+        return bool(re.match(r"^\d{4}-\d{2}-\d{2}", value))
+    return False
+
+
+# --- Measure detection -------------------------------------------------
+# A column's Python dtype (int/float) alone doesn't tell you whether it's
+# the thing being measured (a COUNT/SUM/AVG/...) or a grouping key that
+# just happens to be numeric (age, year, month, rank, a coded category...).
+# For GROUP BY / aggregate queries we detect the real measure column(s) by
+# alias in the SQL text and use that to correct dtype inference below.
+_AGG_ALIAS_RE = re.compile(
+    r"\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\([^)]*\)\s+AS\s+(\w+)",
+    re.IGNORECASE,
+)
+
+
+def _detect_measure_columns(sql: str, columns: List[str]) -> List[str]:
+    """Columns that are real SQL aggregates (COUNT/SUM/AVG/MIN/MAX ... AS alias),
+    even though their Python dtype looks like a plain number."""
+    if not sql:
+        return []
+    aliases = {a.lower() for a in _AGG_ALIAS_RE.findall(sql)}
+    if not aliases:
+        return []
+    return [c for c in columns if c.lower() in aliases]
+
+
+def _infer_column_dtypes(
+    columns: List[str],
+    rows: List[Dict[str, Any]],
+    sql: str = "",
+    sample_size: int = 200,
+) -> Dict[str, str]:
+    """
+    Lightweight semantic dtype inference from already-fetched rows
+    (no extra DB round trip). Returns one of:
+    numeric | categorical | text | datetime | boolean | unknown
+
+    `sql` is optional but recommended: in a GROUP BY / aggregate query, any
+    numeric-typed column that ISN'T the detected aggregate (COUNT/SUM/...)
+    is demoted to "categorical" if it has low cardinality. Without this, a
+    numeric grouping key (e.g. an age computed via DATE_PART) can get
+    mistaken for the chart's measure instead of the real COUNT/SUM column,
+    producing a nonsensical axis pairing (e.g. state-vs-age instead of
+    state-vs-applicant-count).
+    """
+    dtypes: Dict[str, str] = {}
+    sample = rows[:sample_size]
+
+    for col in columns:
+        values = [r.get(col) for r in sample if r.get(col) is not None]
+        if not values:
+            dtypes[col] = "unknown"
+            continue
+
+        v0 = values[0]
+        if isinstance(v0, bool):
+            dtypes[col] = "boolean"
+        elif isinstance(v0, (int, float)):
+            dtypes[col] = "numeric"
+        elif _looks_like_date(v0):
+            dtypes[col] = "datetime"
+        else:
+            distinct = len({str(v) for v in values})
+            dtypes[col] = "categorical" if distinct <= max(20, int(len(values) * 0.5)) else "text"
+
+    # --- Demote non-measure numeric columns to categorical dimensions ---
+    measure_cols = set(_detect_measure_columns(sql, columns))
+    if measure_cols and "GROUP BY" in (sql or "").upper():
+        for col in columns:
+            if col in measure_cols or dtypes.get(col) != "numeric":
+                continue
+            distinct = len({str(r.get(col)) for r in sample if r.get(col) is not None})
+            if distinct <= max(20, int(len(sample) * 0.5)):
+                dtypes[col] = "categorical"
+                logger.debug(f"[poc8] chart dtype: demoted numeric grouping key '{col}' to categorical (measure={sorted(measure_cols)})")
+
+    return dtypes
+
+
+def _rule_based_chart_spec(
+    question: str,
+    columns: List[str],
+    dtypes: Dict[str, str],
+    row_count: int,
+) -> Dict[str, Any]:
+    """Deterministic heuristic chart_type + axis selection. No LLM call."""
+    q = (question or "").lower()
+    numeric_cols = [c for c in columns if dtypes.get(c) == "numeric"]
+    categorical_cols = [c for c in columns if dtypes.get(c) == "categorical"]
+    datetime_cols = [c for c in columns if dtypes.get(c) == "datetime"]
+
+    spec: Dict[str, Any] = {
+        "chart_type": "table",
+        "x_axis": None,
+        "y_axis": None,
+        "series": None,
+        "aggregation": "none",
+        "title": (question or "Result").strip().capitalize(),
+    }
+
+    if row_count == 0:
+        return spec
+
+    if row_count == 1 and len(numeric_cols) >= 1 and len(columns) <= 3:
+        spec["chart_type"] = "kpi"
+        spec["y_axis"] = numeric_cols[0]
+        return spec
+
+    if datetime_cols and numeric_cols:
+        spec["chart_type"] = "line"
+        spec["x_axis"] = datetime_cols[0]
+        spec["y_axis"] = numeric_cols[0]
+        if len(numeric_cols) > 1:
+            spec["series"] = numeric_cols[1]
+        return spec
+
+    if len(categorical_cols) == 2 and numeric_cols:
+        spec["chart_type"] = "heatmap"
+        spec["x_axis"] = categorical_cols[0]
+        spec["y_axis"] = categorical_cols[1]
+        spec["series"] = numeric_cols[0]
+        return spec
+
+    if len(categorical_cols) == 1 and len(numeric_cols) == 1:
+        share_language = any(tok in q for tok in ("share", "percentage", "%", "proportion", "breakdown of", "distribution of"))
+        spec["chart_type"] = "pie" if share_language else "bar"
+        spec["x_axis"] = categorical_cols[0]
+        spec["y_axis"] = numeric_cols[0]
+        return spec
+
+    if not categorical_cols and not datetime_cols and len(numeric_cols) == 1 and row_count > 20:
+        spec["chart_type"] = "histogram"
+        spec["x_axis"] = numeric_cols[0]
+        return spec
+
+    if not categorical_cols and not datetime_cols and len(numeric_cols) >= 2 and row_count > 20:
+        spec["chart_type"] = "scatter"
+        spec["x_axis"] = numeric_cols[0]
+        spec["y_axis"] = numeric_cols[1]
+        return spec
+
+    if categorical_cols and numeric_cols:
+        spec["chart_type"] = "bar"
+        spec["x_axis"] = categorical_cols[0]
+        spec["y_axis"] = numeric_cols[0]
+        return spec
+
+    return spec
+
+
+def _has_visualization_intent(question: str) -> bool:
+    q = (question or "").lower()
+    return any(tok in q for tok in _VIZ_INTENT_TOKENS)
+
+
+def _llm_chart_spec(
+    question: str,
+    sql: str,
+    columns: List[str],
+    dtypes: Dict[str, str],
+    row_count: int,
+    ask_json_fn,
+    model: str = "us.anthropic.claude-sonnet-4-6",
+) -> Optional[Dict[str, Any]]:
+    """One lightweight LLM call: schema + row count only, never the actual data rows."""
+    user_prompt = f"""
+Question: {question}
+SQL: {sql}
+Result columns (name: dtype): {json.dumps(dtypes)}
+Result row count: {row_count}
+"""
+    try:
+        return ask_json_fn(user_prompt, CHART_SPEC_SYSTEM_PROMPT, model=model)
+    except Exception as e:
+        logger.warning(f"[poc8] chart LLM call failed: {e}")
+        return None
+
+
+def recommend_chart_spec(
+    question: str,
+    sql: str,
+    columns: List[str],
+    rows: List[Dict[str, Any]],
+    ask_json_fn=None,
+    use_llm: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """
+    Decide chart_type + axis mapping for a NL->SQL result set.
+
+    Rule-based by default (fast, free, deterministic). Escalates to a single
+    LLM call only when the question has visualization-intent language the
+    rules can't disambiguate (e.g. "trend" vs "breakdown"), or when
+    use_llm=True is forced. Always validates the final spec against the
+    actual result columns and caps pie/bar category counts, so a bad LLM
+    response degrades to the rule-based spec instead of breaking the chart.
+
+    Returns:
+        {
+          "chart_type": "bar"|"line"|"pie"|"scatter"|"histogram"|"heatmap"|"kpi"|"table",
+          "x_axis": str|None, "y_axis": str|None, "series": str|None,
+          "aggregation": str, "title": str, "warnings": [str, ...]
+        }
+    """
+    warnings: List[str] = []
+    row_count = len(rows)
+    dtypes = _infer_column_dtypes(columns, rows, sql=sql)
+
+    spec = _rule_based_chart_spec(question, columns, dtypes, row_count)
+
+    should_try_llm = use_llm if use_llm is not None else _has_visualization_intent(question)
+    if should_try_llm and ask_json_fn and row_count > 0:
+        llm_spec = _llm_chart_spec(question, sql, columns, dtypes, row_count, ask_json_fn)
+        if llm_spec and llm_spec.get("chart_type"):
+            spec = {
+                "chart_type": llm_spec.get("chart_type", spec["chart_type"]),
+                "x_axis": llm_spec.get("x_axis"),
+                "y_axis": llm_spec.get("y_axis"),
+                "series": llm_spec.get("series"),
+                "aggregation": llm_spec.get("aggregation", "none"),
+                "title": llm_spec.get("title") or spec["title"],
+            }
+        else:
+            warnings.append("LLM chart recommendation unavailable; used rule-based spec")
+
+    # --- Guardrail: every referenced column must actually exist in the result set ---
+    valid_cols = set(columns)
+    for axis_key in ("x_axis", "y_axis", "series"):
+        val = spec.get(axis_key)
+        if val and val not in valid_cols:
+            match = difflib.get_close_matches(val, columns, n=1, cutoff=0.6)
+            if match:
+                spec[axis_key] = match[0]
+            else:
+                warnings.append(f"Chart spec referenced unknown column '{val}' for {axis_key}; cleared")
+                spec[axis_key] = None
+
+    # --- Guardrail: cap category count for bar/pie ---
+    if spec["chart_type"] in ("bar", "pie") and spec.get("x_axis") in valid_cols:
+        distinct_vals = {str(r.get(spec["x_axis"])) for r in rows}
+        if len(distinct_vals) > MAX_CATEGORIES:
+            if spec["chart_type"] == "pie":
+                spec["chart_type"] = "bar"
+                warnings.append(f"{len(distinct_vals)} categories exceeds pie chart limit ({MAX_CATEGORIES}); switched to bar")
+            else:
+                warnings.append(f"{len(distinct_vals)} categories exceeds display limit ({MAX_CATEGORIES}); long tail bucketed into 'Other'")
+
+    # --- Guardrail: empty results never get charted ---
+    if row_count == 0:
+        spec["chart_type"] = "table"
+        warnings.append("Empty result set; showing table")
+
+    # --- Guardrail: no usable axes -> table ---
+    if spec["chart_type"] not in ("kpi", "table") and not spec.get("x_axis") and not spec.get("y_axis"):
+        spec["chart_type"] = "table"
+        warnings.append("Could not resolve valid chart axes; falling back to table")
+
+    spec["warnings"] = warnings
+    return spec
+
+
+def prepare_chart_dataset(
+    rows: List[Dict[str, Any]],
+    spec: Dict[str, Any],
+    max_categories: int = MAX_CATEGORIES,
+) -> List[Dict[str, Any]]:
+    """
+    For bar/pie charts with more categories than max_categories, keep the top
+    (max_categories - 1) rows by y_axis value and collapse the rest into a
+    single 'Other' bucket, so the frontend doesn't need this logic itself.
+    No-op for every other chart type, or when the category count is already fine.
+    """
+    if spec.get("chart_type") not in ("bar", "pie"):
+        return rows
+
+    x_col = spec.get("x_axis")
+    y_col = spec.get("y_axis")
+    if not x_col or not y_col or len(rows) <= max_categories:
+        return rows
+
+    def _num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    sorted_rows = sorted(rows, key=lambda r: _num(r.get(y_col)), reverse=True)
+    top = sorted_rows[: max_categories - 1]
+    rest = sorted_rows[max_categories - 1:]
+    other_sum = sum(_num(r.get(y_col)) for r in rest)
+
+    if other_sum:
+        top = list(top) + [{x_col: "Other", y_col: other_sum}]
+
+    return top
+
+
+def _build_chart_payload(
+    question: str,
+    sql: str,
+    columns: List[str],
+    rows: List[Dict[str, Any]],
+    ask_json_fn,
+) -> Dict[str, Any]:
+    """Wraps recommend_chart_spec + prepare_chart_dataset with a safe fallback to 'table'."""
+    try:
+        spec = recommend_chart_spec(question, sql, columns, rows, ask_json_fn=ask_json_fn)
+        data = prepare_chart_dataset(rows, spec)
+        return {"chart_spec": spec, "chart_data": data}
+    except Exception as e:
+        logger.warning(f"[poc8] chart spec generation failed, falling back to table: {e}")
+        return {
+            "chart_spec": {
+                "chart_type": "table",
+                "x_axis": None, "y_axis": None, "series": None,
+                "aggregation": "none", "title": question or "Result",
+                "warnings": [f"chart generation failed: {e}"],
+            },
+            "chart_data": rows,
+        }
 
 
 # ============================================================================
@@ -644,9 +829,14 @@ def question_to_sql(
     want_chart: bool = True,
 ) -> Dict[str, Any]:
     """
-    Convert a natural language question into SQL using KB-aware retrieval.
+    Convert a natural language question into SQL using KB-aware retrieval,
+    execute it, and (by default) attach a recommended chart spec.
 
-    Returns {ok, sql, tables, join_paths, warnings, error, ...}
+    Returns {ok, sql, tables, join_paths, warnings, error, rows, columns,
+             chart_spec, chart_data, ...}
+
+    Set want_chart=False to skip chart recommendation entirely (e.g. for
+    callers that only need tabular data and want to avoid the extra work).
     """
     if not ask_json_fn:
         from bedrock_client import ask_json
@@ -655,33 +845,6 @@ def question_to_sql(
     warnings = []
     tables = []
     join_paths = []
-
-    def build_success_payload(sql: str, rows: List[Dict[str, Any]], cols: List[str], retrieval_method: str, extra_warnings: List[str] = None):
-        extra_warnings = extra_warnings or []
-        chart_spec = {"chart_type": "table", "reason": "chart disabled"}
-        chart_data = rows
-        if want_chart:
-            chart_spec = recommend_chart_spec(question, rows, cols, ask_json_fn=ask_json_fn)
-            chart_data = prepare_chart_dataset(rows, chart_spec)
-        logger.info(
-            f"[poc8] chart spec | type={chart_spec.get('chart_type')} | "
-            f"x={chart_spec.get('x_axis')} | y={chart_spec.get('y_axis')} | "
-            f"rows={len(chart_data)} | cols={cols}"
-        )
-        logger.info(f"[poc8] chart data preview | {chart_data[:3]}")
-        return {
-            "ok": True,
-            "sql": sql,
-            "tables": final_tables,
-            "join_paths": join_paths,
-            "rows": rows,
-            "row_count": len(rows),
-            "columns": cols,
-            "warnings": warnings + extra_warnings,
-            "retrieval_method": retrieval_method,
-            "chart_spec": chart_spec,
-            "chart_data": chart_data,
-        }
 
     try:
         # 1. RETRIEVE: Vector semantic search via KB Manager
@@ -791,65 +954,6 @@ Convert natural language questions into DuckDB SQL.
 - If a requested concept does not exist as an exact schema column, do not invent a new column name;
   instead, find the table that contains the closest matching exact column or omit that field.
 - For ranking and aggregation, use the exact numeric measure column from schema and do not rename it.
-
-SEMANTIC LAYER & JOINS GUIDANCE:
-- The semantic layer shows you EXACTLY which tables connect and HOW
-- Example: "customers → orders ON customer_id" means:
-  JOIN customers c ON c.customer_id = o.customer_id
-- Follow ONLY the joins shown in semantic layer. Never invent joins.
-- Confidence levels: 0.95 = trust it, 0.5 = uncertain, skip if unsure
-
-HOW TO USE JOINS - 3 COMMON PATTERNS:
-
-PATTERN 1: One-to-Many (Customer has many Orders)
-──────────────────────────────────────────────────
-Semantic Layer: "customers → orders ON customer_id"
-Question: "Customers and their total orders"
-
-✓ CORRECT:
-SELECT c.customer_id, c.customer_name, COUNT(*) as order_count
-FROM customers c
-LEFT JOIN orders o ON c.customer_id = o.customer_id
-GROUP BY c.customer_id, c.customer_name
-
-Why: LEFT JOIN keeps all customers. COUNT(*) aggregates orders.
-
-PATTERN 2: Multi-Table Star Join
-─────────────────────────────────
-Semantic Layer: 
-  "customers → orders ON customer_id"
-  "orders → order_items ON order_id"
-
-Question: "Total revenue by region for completed orders"
-
-✓ CORRECT:
-SELECT c.region, SUM(oi.line_total) as total_revenue
-FROM customers c
-INNER JOIN orders o ON c.customer_id = o.customer_id
-INNER JOIN order_items oi ON o.order_id = oi.order_id
-WHERE o.order_status = 'Completed'
-GROUP BY c.region
-
-Why: Follows join path customers→orders→order_items. All non-aggregated columns in GROUP BY.
-
-PATTERN 3: Complex Join with Window Functions
-──────────────────────────────────────────────
-Question: "Best product per customer in North"
-
-✓ CORRECT:
-WITH ranked AS (
-  SELECT c.customer_id, c.customer_name, p.product_name, 
-         SUM(oi.line_total) as total,
-         ROW_NUMBER() OVER (PARTITION BY c.customer_id ORDER BY SUM(oi.line_total) DESC) as rank
-  FROM customers c
-  INNER JOIN orders o ON c.customer_id = o.customer_id
-  INNER JOIN order_items oi ON o.order_id = oi.order_id
-  INNER JOIN products p ON oi.product_id = p.product_id
-  WHERE c.region = 'North'
-  GROUP BY c.customer_id, c.customer_name, p.product_name
-)
-SELECT * FROM ranked WHERE rank = 1
-
 - Treat the semantic layer as the schema contract:
   - never invent joins
   - use only explicit join predicates from the context
@@ -865,8 +969,7 @@ SELECT * FROM ranked WHERE rank = 1
 - Prefer GROUP BY ALL in DuckDB when grouping all non-aggregated select columns.
 - If DuckDB reports a binder error, use that exact error message to repair the SQL once.
 - Return ONLY JSON with a SQL field, for example {"sql":"SELECT ..."}
-- If you prefer, you may also return {"query":"SELECT ..."}
-"""
+- If you prefer, you may also return {"query":"SELECT ..."}"""
 
         user_prompt = f"""
 Use the semantic layer below as the source of truth for joins, grain, temporal rules, and fuzzy-match warnings.
@@ -902,8 +1005,7 @@ Generate the SQL query."""
                 + f"{user_prompt}\n"
                 + "=" * 72
             )
-        logger.info(f"[poc8] Using model: {MODEL_ID}")
-        response = ask_json_fn(user_prompt, system_prompt, model=MODEL_ID or None)
+        response = ask_json_fn(user_prompt, system_prompt,model="us.anthropic.claude-sonnet-4-6")
         if DEBUG_NLQ_PROMPTS:
             logger.info(
                 "\n"
@@ -953,7 +1055,21 @@ Generate the SQL query."""
             # Convert to dicts
             results = [dict(zip(result_cols, row)) for row in result_rows]
 
-            return build_success_payload(sql, results, result_cols, "vector_semantic_search")
+            # 7. CHART SPEC — additive, never blocks the SQL result on failure
+            chart_payload = _build_chart_payload(question, sql, result_cols, results, ask_json_fn) if want_chart else {}
+
+            return {
+                "ok": True,
+                "sql": sql,
+                "tables": final_tables,
+                "join_paths": join_paths,
+                "rows": results,
+                "row_count": len(results),
+                "columns": result_cols,
+                "warnings": warnings,
+                "retrieval_method": "vector_semantic_search",
+                **chart_payload,
+            }
 
         except Exception as exec_err:
             logger.error(f"[poc8] SQL execution failed: {exec_err}")
@@ -974,13 +1090,21 @@ Generate the SQL query."""
                     result_cols = [d[0] for d in conn.description] if conn.description else []
                     conn.close()
                     results = [dict(zip(result_cols, row)) for row in result_rows]
-                    return build_success_payload(
-                        repaired_sql,
-                        results,
-                        result_cols,
-                        "vector_semantic_search",
-                        [f"SQL repaired after DuckDB error: {str(exec_err)}"],
-                    )
+
+                    chart_payload = _build_chart_payload(question, repaired_sql, result_cols, results, ask_json_fn) if want_chart else {}
+
+                    return {
+                        "ok": True,
+                        "sql": repaired_sql,
+                        "tables": final_tables,
+                        "join_paths": join_paths,
+                        "rows": results,
+                        "row_count": len(results),
+                        "columns": result_cols,
+                        "warnings": warnings + [f"SQL repaired after error: {str(exec_err)}"],
+                        "retrieval_method": "vector_semantic_search",
+                        **chart_payload,
+                    }
             except Exception as repair_err:
                 logger.warning(f"[poc8] SQL repair retry failed: {repair_err}")
             return {

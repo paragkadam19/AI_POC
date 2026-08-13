@@ -5,15 +5,15 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
-#import requests
-#_orig_merge = requests.Session.merge_environment_settings
-# def _merge_no_verify(self, url, proxies, stream, verify, cert):
-#     settings = _orig_merge(self, url, proxies, stream, verify, cert)
-#     settings["verify"] = False
-#     return settings
-# requests.Session.merge_environment_settings = _merge_no_verify
+import requests
+_orig_merge = requests.Session.merge_environment_settings
+def _merge_no_verify(self, url, proxies, stream, verify, cert):
+    settings = _orig_merge(self, url, proxies, stream, verify, cert)
+    settings["verify"] = False
+    return settings
+requests.Session.merge_environment_settings = _merge_no_verify
 
-# ... rest of your existing main.py imports/code below
+#... rest of your existing main.py imports/code below
 from app import app
 
 if __name__ == "__main__":
