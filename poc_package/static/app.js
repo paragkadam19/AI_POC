@@ -705,7 +705,20 @@ function renderQuery(d) {
    is already the answer" so we render nothing extra for it.
 ─────────────────────────────────────────────────────── */
 
-const POC8_PALETTE = ["#2DD4BF", "#F59E0B", "#34D399", "#F472B6", "#818CF8", "#FB923C", "#22D3EE", "#A78BFA", "#FBBF24", "#4ADE80"];
+// const POC8_PALETTE = ["#2DD4BF", "#F59E0B", "#34D399", "#F472B6", "#818CF8", "#FB923C", "#22D3EE", "#A78BFA", "#FBBF24", "#4ADE80"];
+
+const POC8_PALETTE = [
+  "#C1694A", // terracotta
+  "#6E8CAE", // slate blue
+  "#C9A24D", // mustard / ochre
+  "#7A9471", // sage
+  "#C58B92", // dusty rose
+  "#3F8079", // deep teal
+  "#8E6B95", // plum / heather
+  "#5E7A54", // moss
+  "#B49A7B", // warm taupe / stone
+  "#92434B", // wine / burgundy
+];
 
 function renderChartSection(d) {
   const spec = d.chart_spec;
