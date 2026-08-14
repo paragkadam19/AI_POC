@@ -9,6 +9,14 @@ import urllib3
 from logger_config import get_logger
 logger = get_logger(__name__)
 
+from botocore.config import Config
+
+config = Config(
+    read_timeout=400,      # 5 minutes, adjust to your workload
+    connect_timeout=50,
+    retries={"max_attempts": 3, "mode": "adaptive"}
+)
+
 MODEL_HAIKU = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 MODEL_TITAN_EMBED = "amazon.titan-embed-text-v2:0"
 REGION      = "us-east-1"
@@ -26,7 +34,7 @@ _langfuse = None
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-load_dotenv() 
+load_dotenv()
 
 def _aws_env_config():
     access_key = os.getenv("AWS_ACCESS_KEY_ID")
@@ -94,7 +102,7 @@ def get_client():
         if session_token:
             client_kwargs["aws_session_token"] = session_token
 
-        _client = boto3.client(**client_kwargs,verify = False)
+        _client = boto3.client(**client_kwargs, verify=False, config=config)
     return _client
 
 
@@ -121,10 +129,60 @@ def print_token_usage(input_tokens=0, output_tokens=0, total=0):
     )
 
 
+def _consume_message_stream(resp, verbose: bool = True) -> dict:
+    """
+    Consumes an EventStream returned by invoke_model_with_response_stream
+    for Anthropic Messages-API models, and reassembles it into the same
+    shape a non-streaming invoke_model() call would have returned:
+        {"content": [{"type": "text", "text": "..."}], "usage": {...}, "stop_reason": "..."}
+    """
+    text_parts = []
+    usage = {"input_tokens": 0, "output_tokens": 0}
+    stop_reason = None
+
+    for event in resp["body"]:
+        chunk = event.get("chunk")
+        if not chunk:
+            continue
+
+        chunk_data = json.loads(chunk["bytes"])
+        event_type = chunk_data.get("type")
+
+        if event_type == "message_start":
+            msg_usage = chunk_data.get("message", {}).get("usage", {})
+            usage["input_tokens"] = msg_usage.get("input_tokens", usage["input_tokens"])
+
+        elif event_type == "content_block_delta":
+            delta = chunk_data.get("delta", {})
+            if delta.get("type") == "text_delta":
+                text_piece = delta.get("text", "")
+                text_parts.append(text_piece)
+                if verbose:
+                    print(text_piece, end="", flush=True)
+
+        elif event_type == "message_delta":
+            delta_usage = chunk_data.get("usage", {})
+            if "output_tokens" in delta_usage:
+                usage["output_tokens"] = delta_usage["output_tokens"]
+            stop_reason = chunk_data.get("delta", {}).get("stop_reason", stop_reason)
+
+        elif event_type == "message_stop":
+            pass
+
+    if verbose:
+        print()  # newline after streamed text
+
+    return {
+        "content": [{"type": "text", "text": "".join(text_parts)}],
+        "usage": usage,
+        "stop_reason": stop_reason,
+    }
+
+
 def ask(prompt: str,
         system: str = "",
         model: str = None,
-        max_tokens: int = 20000,
+        max_tokens: int = 50000,
         temperature: float = 0.1,
         retries: int = 3,
         verbose: bool = True) -> str:
@@ -167,17 +225,15 @@ def ask(prompt: str,
                     # metadata={"max_tokens": max_tokens},
                     model=model,
                 ) as generation:
-                    resp = get_client().invoke_model(
+                    resp = get_client().invoke_model_with_response_stream(
                         modelId     = model,
                         body        = json.dumps(body),
-                        # contentType = "application/json",
-                        # accept      = "application/json",
                     )
-                    logger.info(f"[bedrock] invoke_model network+generation time: {time.time()-t0:.3f}s")
+                    logger.info(f"[bedrock] invoke_model call setup time: {time.time()-t0:.3f}s")
 
                     t0 = time.time()
-                    result = json.loads(resp["body"].read())
-                    logger.info(f"[bedrock] response body read+json.loads: {time.time()-t0:.3f}s")
+                    result = _consume_message_stream(resp, verbose=False)
+                    logger.info(f"[bedrock] stream consume (network+generation): {time.time()-t0:.3f}s")
                     logger.info(
                         "\n"
                         + "=" * 72
@@ -202,17 +258,15 @@ def ask(prompt: str,
                         },
                     )
             else:
-                resp = get_client().invoke_model(
+                resp = get_client().invoke_model_with_response_stream(
                     modelId     = model,
                     body        = json.dumps(body),
-                    contentType = "application/json",
-                    accept      = "application/json",
                 )
-                logger.info(f"[bedrock] invoke_model network+generation time: {time.time()-t0:.3f}s")
+                logger.info(f"[bedrock] invoke_model call setup time: {time.time()-t0:.3f}s")
 
                 t0 = time.time()
-                result = json.loads(resp["body"].read())
-                logger.info(f"[bedrock] response body read+json.loads: {time.time()-t0:.3f}s")
+                result = _consume_message_stream(resp, verbose=False)
+                logger.info(f"[bedrock] stream consume (network+generation): {time.time()-t0:.3f}s")
                 logger.info(
                     "\n"
                     + "=" * 72
@@ -251,7 +305,7 @@ def ask(prompt: str,
 def ask_json(prompt: str,
              system: str = "",
              model: str = None,
-             max_tokens: int = 20000,
+             max_tokens: int = 50000,
              temperature: float = 0.1,
              verbose: bool = True) -> dict:
     full_system = (system + "\n\n" if system else "") + \
@@ -296,7 +350,7 @@ JSON error:
 Broken JSON:
 {bad_json}
 """
-        return ask(repair_prompt, system=full_system, model=model, max_tokens=3000, verbose=False)
+        return ask(repair_prompt, system=full_system, model=model, max_tokens=50000, verbose=False)
 
     t0 = time.time()
     raw = ask(
@@ -349,14 +403,19 @@ def embed_text(text: str, model: str = None) -> list:
     """
     Generate a semantic embedding using Amazon Titan embeddings on Bedrock.
     Returns a plain list[float].
+
+    NOTE: Embedding models are single-shot (no token-by-token generation),
+    so this uses invoke_model (non-streaming), NOT
+    invoke_model_with_response_stream. Titan embedding models don't
+    benefit from — and in some cases don't support — the streaming API.
     """
     model = model or MODEL_TITAN_EMBED
     body = {"inputText": text or ""}
     resp = get_client().invoke_model(
         modelId=model,
         body=json.dumps(body),
-        contentType="application/json",
-        accept="application/json",
+        #contentType="application/json",
+        #accept="application/json",
     )
     result = json.loads(resp["body"].read())
     embedding = result.get("embedding") or result.get("embeddings")
