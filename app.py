@@ -97,7 +97,9 @@ CORS(app)
 DB_FILE = os.path.join(STORAGE_DIR, "ai_poc_dq.duckdb")
 STATE   = {"dataset_id": None, "filename": None, "poc1_metadata": None}
 UPLOAD_COPY_CHUNK_SIZE = 32 * 1024 * 1024
-POC1_MODEL_ID = "us.anthropic.claude-sonnet-4-6"
+#POC1_MODEL_ID = "us.anthropic.claude-sonnet-4-6"
+POC1_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
 
 
 # ── KB Manager initialisation ─────────────────────────────────────────────────
