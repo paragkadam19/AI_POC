@@ -192,6 +192,7 @@ def parse_check_string(check_str: str, table_name: str,
             if operator == "==":
                 operator = "="
 
+            valid_regex = extra.get("valid regex") if isinstance(extra, dict) else None
             if valid_values:
                 escaped = [str(v).replace("'", "''") for v in valid_values]
                 in_list = ", ".join(f"'{v}'" for v in escaped)
@@ -199,10 +200,16 @@ def parse_check_string(check_str: str, table_name: str,
                     f'SELECT COUNT(*) FROM {table_name} '
                     f'WHERE "{col_name}" IS NOT NULL AND "{col_name}" NOT IN ({in_list})'
                 )
+            elif valid_regex:
+                sql = (
+                    f'SELECT COUNT(*) FROM {table_name} '
+                    f'WHERE "{col_name}" IS NOT NULL AND NOT regexp_matches("{col_name}", \'{valid_regex}\')'
+                )
             else:
                 sql = f'SELECT COUNT(*) FROM {table_name} WHERE 1=0'
 
             return ("invalid_count", sql, f"{operator} {value}")
+
 
     # 4. duplicate_count
     if "duplicate_count" in check_str:
@@ -247,6 +254,79 @@ def parse_check_string(check_str: str, table_name: str,
                 f'SELECT MAX(LENGTH(CAST("{col_name}" AS VARCHAR))) FROM {table_name}',
                 f"{operator} {value}"
             )
+
+
+    # avg check
+    if re.search(r"avg\(", check_str):
+        match = re.match(r"avg\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.: ]+)", check_str)
+        if match:
+            col_name, operator, value = match.groups()
+            col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
+            return (
+                "avg_check",
+                f'SELECT AVG("{col_name}") FROM {table_name}',
+                f"{operator} {value}"
+            )        
+
+    # between check
+    if re.search(r"between\(", check_str):
+        match = re.match(r"between\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.: ]+)\s+and\s+([\w\-\.: ]+)", check_str, re.IGNORECASE)
+        if match:
+            col_name, operator, low, high = match.groups()
+            col_name = col_name.strip('"\'')
+            return (
+                "between_check",
+                f'SELECT COUNT(*) FROM {table_name} WHERE "{col_name}" < {low} OR "{col_name}" > {high}',
+                "= 0"
+            )
+
+    # freshness check
+    if re.search(r"freshness\(", check_str):
+        match = re.match(r"freshness\(([\w\-\"']+)\)\s*([<>=!]+)\s*(\d+)\s*(d|h|m)?", check_str, re.IGNORECASE)
+        if match:
+            col_name, operator, value, unit = match.groups()
+            col_name = col_name.strip('"\'')
+            unit = (unit or "d").lower()
+            interval_map = {"d": "DAY", "h": "HOUR", "m": "MINUTE"}
+            interval = interval_map.get(unit, "DAY")
+            if operator == "==":
+                operator = "="
+            return (
+                "freshness_check",
+                f'SELECT COUNT(*) FROM {table_name} WHERE TRY_CAST("{col_name}" AS DATE) < CURRENT_DATE - INTERVAL {value} {interval}',
+                "= 0"
+            )                
+
+    # null_percent check
+    if "missing_percent" in check_str:
+        match = re.match(r"missing_percent\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.]+)", check_str)
+        if match:
+            col_name, operator, value = match.groups()
+            col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
+            return (
+                "null_percent_check",
+                f'SELECT ROUND(COUNT(*) FILTER (WHERE "{col_name}" IS NULL) * 100.0 / COUNT(*), 2) FROM {table_name}',
+                f"{operator} {value}"
+            )
+
+    # uniqueness_ratio check
+    if "uniqueness_ratio" in check_str:
+        match = re.match(r"uniqueness_ratio\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.]+)", check_str)
+        if match:
+            col_name, operator, value = match.groups()
+            col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
+            return (
+                "uniqueness_ratio_check",
+                f'SELECT ROUND(COUNT(DISTINCT "{col_name}") * 1.0 / COUNT(*), 4) FROM {table_name}',
+                f"{operator} {value}"
+            )
+                    
 
     # 6. min/max (numeric or date range)
     if re.search(r"min\(", check_str):
