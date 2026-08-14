@@ -13,6 +13,9 @@ import os, sys, json, re, time, shutil
 from datetime import datetime
 import yaml
 import duckdb
+from flask import session, redirect, url_for
+import hashlib
+import functools
 
 from logger_config import setup_logging, get_logger
 
@@ -92,16 +95,43 @@ from duckdb_helper import (
 )
 
 app = Flask(__name__, static_folder="static", static_url_path="")
+app.secret_key = "change-this-to-a-random-secret-key-in-production"
 CORS(app)
 
 DB_FILE = os.path.join(STORAGE_DIR, "ai_poc_dq.duckdb")
 STATE   = {"dataset_id": None, "filename": None, "poc1_metadata": None}
 UPLOAD_COPY_CHUNK_SIZE = 32 * 1024 * 1024
-POC1_MODEL_ID = "us.anthropic.claude-sonnet-4-6"
 
 
 # ── KB Manager initialisation ─────────────────────────────────────────────────
 KB_MANAGER = None
+
+def init_auth_db():
+    """Create admin schema and users table in DuckDB if not exists."""
+    try:
+        conn = duckdb.connect(DB_FILE, read_only=False, config=DUCKDB_CONFIG)
+        conn.execute("CREATE SCHEMA IF NOT EXISTS admin")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin.users (
+                user_id    VARCHAR PRIMARY KEY,
+                password   VARCHAR NOT NULL,
+                full_name  VARCHAR NOT NULL,
+                is_active  BOOLEAN DEFAULT TRUE
+            )
+        """)
+        # Seed a default admin user (remove after first login in production)
+        existing = conn.execute("SELECT COUNT(*) FROM admin.users WHERE user_id = 'admin'").fetchone()[0]
+        if existing == 0:
+            conn.execute("""
+                INSERT INTO admin.users (user_id, password, full_name, is_active)
+                VALUES ('admin', 'admin123', 'Administrator', TRUE)
+            """)
+            logger.info("[auth] default admin user created — user_id=admin, password=admin123")
+        conn.close()
+        logger.info("[auth] auth DB initialized")
+    except Exception as e:
+        logger.warning(f"[auth] auth DB init failed (non-critical): {e}")
+
 
 def init_kb_manager_system():
     """Initialize KB Manager at app startup and wire into poc8."""
@@ -115,6 +145,80 @@ def init_kb_manager_system():
         logger.warning(f"[app] KB Manager init failed (non-critical): {e}")
 
 init_kb_manager_system()
+
+init_auth_db()
+
+def login_required(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("user_id"):
+            return redirect("/login")
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route("/login")
+def login_page():
+    if session.get("user_id"):
+        return redirect("/")
+    return send_from_directory("static", "login.html")
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def auth_login():
+    body     = request.get_json(silent=True) or {}
+    user_id  = (body.get("user_id") or "").strip()
+    password = (body.get("password") or "").strip()
+ 
+    if not user_id or not password:
+        return jsonify({"success": False, "error": "User ID and Password are required."}), 400
+ 
+    try:
+        conn = duckdb.connect(DB_FILE, read_only=True, config=DUCKDB_CONFIG)
+        row  = conn.execute(
+            "SELECT user_id, password, full_name, is_active FROM admin.users WHERE user_id = ?",
+            [user_id]
+        ).fetchone()
+        conn.close()
+ 
+        if not row:
+            return jsonify({"success": False, "error": "User ID not found."}), 401
+ 
+        db_user_id, db_password, full_name, is_active = row
+ 
+        if not is_active:
+            return jsonify({"success": False, "error": "Your account is inactive. Contact admin."}), 403
+ 
+        if password != db_password:
+            return jsonify({"success": False, "error": "Incorrect password."}), 401
+ 
+        session["user_id"]   = db_user_id
+        session["full_name"] = full_name
+        logger.info(f"[auth] login success | user={db_user_id}")
+        return jsonify({"success": True, "full_name": full_name})
+ 
+    except Exception as e:
+        logger.error(f"[auth] login failed: {e}", exc_info=True)
+        return jsonify({"success": False, "error": "Server error."}), 500
+
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    user = session.get("user_id", "unknown")
+    session.clear()
+    logger.info(f"[auth] logout | user={user}")
+    return jsonify({"success": True})
+ 
+@app.route("/api/auth/me", methods=["GET"])
+def auth_me():
+    if not session.get("user_id"):
+        return jsonify({"logged_in": False}), 401
+    return jsonify({
+        "logged_in": True,
+        "user_id":   session.get("user_id"),
+        "full_name": session.get("full_name"),
+    })
+
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -441,6 +545,7 @@ def compare_schema_snapshots(previous_schema: dict, current_schema: dict, previo
 
 # ── static UI ─────────────────────────────────────────────────────────────────
 @app.route("/")
+@login_required
 def index():
     return send_from_directory("static", "index.html")
 
@@ -564,7 +669,7 @@ def run_poc1():
         logger.info(f"[poc1] STEP 3 - prompt built | chars={len(system_prompt)+len(user_prompt)}")
 
         t_ai = time.time()
-        result = ask_json(user_prompt, system_prompt, model=POC1_MODEL_ID)
+        result = ask_json(user_prompt, system_prompt)
         logger.info(f"[poc1] STEP 4 - AI call done in {time.time()-t_ai:.3f}s | total={time.time()-t_start:.3f}s")
 
         result = _filter_audit_fields(result)

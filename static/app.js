@@ -1,5 +1,10 @@
 /* app.js — Manufacturing Data Quality POC Console */
 
+// Load user info and show welcome (async () => { try { const res = await fetch("/api/auth/me"); const data = await res.json(); if (data.logged_in) { const el = document.getElementById("welcomeUser"); if (el) el.textContent = Welcome, ${data.full_name}; } else { window.location.href = "/login"; } } catch { window.location.href = "/login"; } })();
+
+async function doLogout() { await fetch("/api/auth/logout", { method: "POST" }); window.location.href = "/login"; }
+
+
 const $ = (id) => document.getElementById(id);
 
 document.querySelectorAll(".tab").forEach((t) =>

@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Data Resonance — Login</title>
+  <link rel="icon" type="image/png" href="bajaj_logo.png"/>
+  <style>
+    :root {
+      --steel:  #1C2B3A;
+      --blue:   #2563EB;
+      --ltblue: #EFF6FF;
+      --red:    #DC2626;
+      --ltred:  #FEF2F2;
+      --gray1:  #F8FAFC;
+      --gray2:  #E2E8F0;
+      --gray3:  #94A3B8;
+      --dgray:  #475569;
+      --ink:    #0F172A;
+      --shadow: 0 1px 3px rgba(15,23,42,.08), 0 4px 16px rgba(15,23,42,.06);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      background: var(--steel);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .login-wrap {
+      width: 100%;
+      max-width: 420px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      margin-bottom: 32px;
+    }
+    .brand img {
+      width: 90px;
+      height: 60px;
+      object-fit: contain;
+    }
+    .brand-text h1 {
+      font-size: 20px;
+      font-weight: 700;
+      color: #fff;
+    }
+    .brand-text p {
+      font-size: 12px;
+      color: rgba(255,255,255,.6);
+    }
+    .card {
+      background: #fff;
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      padding: 36px 32px;
+    }
+    .card h2 {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--steel);
+      margin-bottom: 6px;
+    }
+    .card .sub {
+      font-size: 13px;
+      color: var(--dgray);
+      margin-bottom: 28px;
+    }
+    .field {
+      margin-bottom: 18px;
+    }
+    .field label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink);
+      margin-bottom: 6px;
+    }
+    .field input {
+      width: 100%;
+      padding: 11px 14px;
+      border: 1px solid var(--gray2);
+      border-radius: 8px;
+      font: inherit;
+      font-size: 14px;
+      color: var(--ink);
+      background: var(--gray1);
+      transition: .15s;
+      outline: none;
+    }
+    .field input:focus {
+      border-color: var(--blue);
+      background: #fff;
+      box-shadow: 0 0 0 3px rgba(37,99,235,.12);
+    }
+    .btn-login {
+      width: 100%;
+      padding: 12px;
+      background: var(--blue);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font: inherit;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      margin-top: 8px;
+      transition: .15s;
+    }
+    .btn-login:hover { background: #1D4ED8; }
+    .btn-login:disabled { opacity: .6; cursor: not-allowed; }
+    .error-banner {
+      display: none;
+      background: var(--ltred);
+      color: var(--red);
+      border: 1px solid #FCA5A5;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 18px;
+    }
+    .footer {
+      text-align: center;
+      margin-top: 24px;
+      font-size: 12px;
+      color: rgba(255,255,255,.4);
+    }
+  </style>
+</head>
+<body>
+
+<div class="login-wrap">
+  <div class="brand">
+    <img src="bajaj_techai.png" alt="Bajaj Tech AI"/>
+    <div class="brand-text">
+      <h1>Data Resonance</h1>
+      <p>AI-Powered Data Intelligence</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Sign in</h2>
+    <p class="sub">Enter your credentials to access the platform</p>
+
+    <div class="error-banner" id="errorBanner"></div>
+
+    <div class="field">
+      <label for="userId">User ID</label>
+      <input type="text" id="userId" placeholder="Enter your user ID" autocomplete="username"/>
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input type="password" id="password" placeholder="Enter your password" autocomplete="current-password"/>
+    </div>
+
+    <button class="btn-login" id="loginBtn" onclick="doLogin()">Sign In</button>
+  </div>
+
+  <div class="footer">© 2026 Bajaj Tech AI · Data Resonance POC</div>
+</div>
+
+<script>
+  // Allow Enter key to submit
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") doLogin();
+  });
+
+  async function doLogin() {
+    const userId   = document.getElementById("userId").value.trim();
+    const password = document.getElementById("password").value.trim();
+    const btn      = document.getElementById("loginBtn");
+    const banner   = document.getElementById("errorBanner");
+
+    banner.style.display = "none";
+
+    if (!userId || !password) {
+      showError("Please enter both User ID and Password.");
+      return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = "Signing in…";
+
+    try {
+      const res  = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: userId, password }),
+      });
+      const data = await res.json();
+
+      if (data.success) {
+        window.location.href = "/";
+      } else {
+        showError(data.error || "Login failed.");
+      }
+    } catch (e) {
+      showError("Server error. Please try again.");
+    }
+
+    btn.disabled = false;
+    btn.textContent = "Sign In";
+  }
+
+  function showError(msg) {
+    const banner = document.getElementById("errorBanner");
+    banner.textContent = msg;
+    banner.style.display = "block";
+  }
+</script>
+</body>
+</html>
