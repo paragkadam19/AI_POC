@@ -299,6 +299,35 @@ def parse_check_string(check_str: str, table_name: str,
                 "= 0"
             )                
 
+    # null_percent check
+    if "missing_percent" in check_str:
+        match = re.match(r"missing_percent\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.]+)", check_str)
+        if match:
+            col_name, operator, value = match.groups()
+            col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
+            return (
+                "null_percent_check",
+                f'SELECT ROUND(COUNT(*) FILTER (WHERE "{col_name}" IS NULL) * 100.0 / COUNT(*), 2) FROM {table_name}',
+                f"{operator} {value}"
+            )
+
+    # uniqueness_ratio check
+    if "uniqueness_ratio" in check_str:
+        match = re.match(r"uniqueness_ratio\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.]+)", check_str)
+        if match:
+            col_name, operator, value = match.groups()
+            col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
+            return (
+                "uniqueness_ratio_check",
+                f'SELECT ROUND(COUNT(DISTINCT "{col_name}") * 1.0 / COUNT(*), 4) FROM {table_name}',
+                f"{operator} {value}"
+            )
+                    
+
     # 6. min/max (numeric or date range)
     if re.search(r"min\(", check_str):
         match = re.match(r"min\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.: ]+)", check_str)

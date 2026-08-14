@@ -95,7 +95,7 @@ from duckdb_helper import (
 )
 
 app = Flask(__name__, static_folder="static", static_url_path="")
-app.secret_key = "change-this-to-a-random-secret-key-in-production"
+app.secret_key = "0e804a303436784cb17d9e26a1fb27129ee6f8056ab9b6cbbd9cb82e8641008d"
 CORS(app)
 
 DB_FILE = os.path.join(STORAGE_DIR, "ai_poc_dq.duckdb")
@@ -109,26 +109,42 @@ POC1_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 KB_MANAGER = None
 
 def init_auth_db():
-    """Create admin schema and users table in DuckDB if not exists."""
+    """Create admin schema, users and login_activity tables in DuckDB."""
     try:
         conn = duckdb.connect(DB_FILE, read_only=False, config=DUCKDB_CONFIG)
         conn.execute("CREATE SCHEMA IF NOT EXISTS admin")
+ 
+        # users table — id is auto increment PK
         conn.execute("""
             CREATE TABLE IF NOT EXISTS admin.users (
-                user_id    VARCHAR PRIMARY KEY,
+                id         INTEGER PRIMARY KEY,
+                user_id    VARCHAR UNIQUE NOT NULL,
                 password   VARCHAR NOT NULL,
                 full_name  VARCHAR NOT NULL,
                 is_active  BOOLEAN DEFAULT TRUE
             )
         """)
-        # Seed a default admin user (remove after first login in production)
+ 
+        # login_activity table — user_ref_id is FK to admin.users.id
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin.login_activity (
+                id           INTEGER PRIMARY KEY,
+                user_ref_id  INTEGER NOT NULL REFERENCES admin.users(id),
+                login_time   TIMESTAMP,
+                logout_time  TIMESTAMP,
+                session_id   VARCHAR
+            )
+        """)
+ 
+        # Seed default admin user if not exists
         existing = conn.execute("SELECT COUNT(*) FROM admin.users WHERE user_id = 'admin'").fetchone()[0]
         if existing == 0:
             conn.execute("""
-                INSERT INTO admin.users (user_id, password, full_name, is_active)
-                VALUES ('admin', 'admin123', 'Administrator', TRUE)
+                INSERT INTO admin.users (id, user_id, password, full_name, is_active)
+                VALUES (1, 'admin', 'admin123', 'Administrator', TRUE)
             """)
             logger.info("[auth] default admin user created — user_id=admin, password=admin123")
+ 
         conn.close()
         logger.info("[auth] auth DB initialized")
     except Exception as e:
@@ -175,27 +191,50 @@ def auth_login():
         return jsonify({"success": False, "error": "User ID and Password are required."}), 400
  
     try:
-        conn = duckdb.connect(DB_FILE, read_only=True, config=DUCKDB_CONFIG)
+        conn = duckdb.connect(DB_FILE, read_only=False, config=DUCKDB_CONFIG)
         row  = conn.execute(
-            "SELECT user_id, password, full_name, is_active FROM admin.users WHERE user_id = ?",
+            "SELECT id, user_id, password, full_name, is_active FROM admin.users WHERE user_id = ?",
             [user_id]
         ).fetchone()
-        conn.close()
  
         if not row:
+            conn.close()
             return jsonify({"success": False, "error": "User ID not found."}), 401
  
-        db_user_id, db_password, full_name, is_active = row
+        db_id, db_user_id, db_password, full_name, is_active = row
  
         if not is_active:
+            conn.close()
             return jsonify({"success": False, "error": "Your account is inactive. Contact admin."}), 403
  
         if password != db_password:
+            conn.close()
             return jsonify({"success": False, "error": "Incorrect password."}), 401
  
-        session["user_id"]   = db_user_id
-        session["full_name"] = full_name
-        logger.info(f"[auth] login success | user={db_user_id}")
+        # Generate session ID
+        import uuid
+        from datetime import datetime as dt
+        session_id = str(uuid.uuid4())
+ 
+        # Get next login_activity id
+        max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM admin.login_activity").fetchone()[0]
+        next_id = max_id + 1
+ 
+        # Insert login activity row
+        conn.execute("""
+            INSERT INTO admin.login_activity (id, user_ref_id, login_time, logout_time, session_id)
+            VALUES (?, ?, ?, NULL, ?)
+        """, [next_id, db_id, dt.now(), session_id])
+        conn.close()
+ 
+        # Save to session
+        session["user_id"]          = db_user_id
+        session["full_name"]        = full_name
+        session["user_ref_id"]      = db_id
+        session["session_id"]       = session_id
+        session["activity_row_id"]  = next_id
+ 
+        logger.info(f"[auth] login success | user={db_user_id} | activity_id={next_id}")
         return jsonify({"success": True, "full_name": full_name})
  
     except Exception as e:
@@ -203,13 +242,29 @@ def auth_login():
         return jsonify({"success": False, "error": "Server error."}), 500
 
 
-
 @app.route("/api/auth/logout", methods=["POST"])
 def auth_logout():
-    user = session.get("user_id", "unknown")
+    user          = session.get("user_id", "unknown")
+    activity_id   = session.get("activity_row_id")
+ 
+    # Update logout_time in login_activity
+    if activity_id:
+        try:
+            from datetime import datetime as dt
+            conn = duckdb.connect(DB_FILE, read_only=False, config=DUCKDB_CONFIG)
+            conn.execute("""
+                UPDATE admin.login_activity
+                SET logout_time = ?
+                WHERE id = ?
+            """, [dt.now(), activity_id])
+            conn.close()
+            logger.info(f"[auth] logout recorded | user={user} | activity_id={activity_id}")
+        except Exception as e:
+            logger.warning(f"[auth] logout time update failed: {e}")
+ 
     session.clear()
-    logger.info(f"[auth] logout | user={user}")
     return jsonify({"success": True})
+
  
 @app.route("/api/auth/me", methods=["GET"])
 def auth_me():
