@@ -20,7 +20,7 @@ except Exception:
 
 def _default_db_path() -> str:
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    return os.path.join(base_dir, "storage", "ai_poc_dq.duckdb")
+    return os.path.join(base_dir, "storage", "data_resonance.duckdb")
 
 
 def _default_storage_dir() -> str:
@@ -49,7 +49,7 @@ def main() -> int:
             load_dotenv(pkg_env, override=True)
 
     parser = argparse.ArgumentParser(
-        description="Refresh kb_metadata from all tables in ai_poc_dq.duckdb."
+        description="Refresh kb_metadata from all tables in data_resonance.duckdb."
     )
     parser.add_argument(
         "--db-file",

@@ -635,7 +635,7 @@ def _refresh_joins_from_kb(conn) -> int:
 # ============================================================================
 
 class KBManager:
-    """Manages KB tables inside ai_poc_dq.duckdb."""
+    """Manages KB tables inside data_resonance.duckdb."""
 
     def __init__(self, db_file: str):
         self.db_file        = db_file

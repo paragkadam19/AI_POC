@@ -94,7 +94,7 @@ from duckdb_helper import (
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
 
-DB_FILE = os.path.join(STORAGE_DIR, "ai_poc_dq.duckdb")
+DB_FILE = os.path.join(STORAGE_DIR, "data_resonance.duckdb")
 STATE   = {"dataset_id": None, "filename": None, "poc1_metadata": None}
 UPLOAD_COPY_CHUNK_SIZE = 32 * 1024 * 1024
 #POC1_MODEL_ID = "us.anthropic.claude-sonnet-4-6"
