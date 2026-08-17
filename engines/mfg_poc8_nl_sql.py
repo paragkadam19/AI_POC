@@ -396,7 +396,27 @@ def _build_expected_complexity_hint(question: str) -> str:
     return "*Expected Complexity*: " + ", ".join(dict.fromkeys(hints))
 
 
-def _infer_column_dtypes(rows: List[Dict[str, Any]], columns: List[str]) -> Dict[str, str]:
+_SHARE_NAME_RE = re.compile(r"pct|percent|percentage|share|proportion", re.IGNORECASE)
+_AGG_ALIAS_RE = re.compile(
+    r"\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\([^)]*\)\s+AS\s+(\w+)",
+    re.IGNORECASE,
+)
+
+
+def _detect_measure_columns(sql: str, columns: List[str]) -> List[str]:
+    """Columns that are real numeric measures rather than grouping keys:
+    either a bare SQL aggregate (COUNT/SUM/AVG/MIN/MAX ... AS alias), or a
+    column whose own name says it's a derived share/percentage (which won't
+    match the aggregate-alias regex, since it's usually wrapped in ROUND(...)
+    or a window-function expression rather than a bare aggregate call)."""
+    measures = {c for c in columns if _SHARE_NAME_RE.search(c)}
+    if sql:
+        aliases = {a.lower() for a in _AGG_ALIAS_RE.findall(sql)}
+        measures |= {c for c in columns if c.lower() in aliases}
+    return list(measures)
+
+
+def _infer_column_dtypes(rows: List[Dict[str, Any]], columns: List[str], sql: str = "") -> Dict[str, str]:
     kinds: Dict[str, str] = {}
     for col in columns or []:
         values = [row.get(col) for row in rows if row and row.get(col) is not None]
@@ -427,6 +447,24 @@ def _infer_column_dtypes(rows: List[Dict[str, Any]], columns: List[str]) -> Dict
             kinds[col] = "numeric"
         else:
             kinds[col] = "categorical" if len(set(str(v) for v in sample)) <= max(15, len(sample) // 2) else "text"
+
+    # A numeric-typed column isn't necessarily the chart's *measure* — a
+    # GROUP BY query often includes a grouping key that just happens to be a
+    # number (age, year, rank...). Only demote it to a dimension when the
+    # query actually has a detected aggregate measure to plot instead, so a
+    # genuine "two independent numbers" result (e.g. for a scatter plot) is
+    # left alone.
+    measure_cols = set(_detect_measure_columns(sql, columns))
+    if measure_cols and "GROUP BY" in (sql or "").upper():
+        for col in columns:
+            if col in measure_cols or kinds.get(col) != "numeric":
+                continue
+            values = [row.get(col) for row in rows if row and row.get(col) is not None]
+            sample = values[:50]
+            distinct = len({str(v) for v in sample})
+            if distinct <= max(15, len(sample) // 2):
+                kinds[col] = "categorical"
+
     return kinds
 
 
@@ -435,14 +473,14 @@ def _get_visual_intent(question: str) -> bool:
     return any(tok in q for tok in CHART_INTENT_WORDS)
 
 
-def _rule_based_chart_spec(question: str, rows: List[Dict[str, Any]], columns: List[str]) -> Dict[str, Any]:
+def _rule_based_chart_spec(question: str, rows: List[Dict[str, Any]], columns: List[str], sql: str = "") -> Dict[str, Any]:
     if not rows:
         return {"chart_type": "table", "reason": "no rows returned"}
 
     if len(rows) == 1:
         return {"chart_type": "kpi", "reason": "single row result"}
 
-    dtypes = _infer_column_dtypes(rows, columns)
+    dtypes = _infer_column_dtypes(rows, columns, sql=sql)
     numeric_cols = [c for c in columns if dtypes.get(c) == "numeric"]
     datetime_cols = [c for c in columns if dtypes.get(c) == "datetime"]
     categorical_cols = [c for c in columns if dtypes.get(c) in {"categorical", "text"}]
@@ -458,19 +496,33 @@ def _rule_based_chart_spec(question: str, rows: List[Dict[str, Any]], columns: L
         }
 
     if categorical_cols and numeric_cols:
+        # A "percentage share" question commonly returns BOTH the raw count
+        # and a computed percentage column. Don't just grab numeric_cols[0]
+        # by position — prefer an explicit share/percentage column by name,
+        # then the true SQL aggregate measure, then fall back to the first
+        # numeric column (old behavior).
+        share_language = any(tok in q for tok in ("share", "percentage", "%", "proportion", "breakdown of", "distribution of"))
+        measure_cols = set(_detect_measure_columns(sql, columns))
+        share_col = next((c for c in numeric_cols if _SHARE_NAME_RE.search(c)), None)
+        primary_measure = next((c for c in numeric_cols if c in measure_cols), None)
+        y_axis = share_col or primary_measure or numeric_cols[0]
+
         if len(categorical_cols) == 1:
             return {
-                "chart_type": "bar",
+                "chart_type": "pie" if share_language else "bar",
                 "x_axis": categorical_cols[0],
-                "y_axis": numeric_cols[0],
+                "y_axis": y_axis,
                 "series": None,
-                "reason": "category + numeric",
+                "reason": "category + numeric" + (" (percentage share)" if share_language else ""),
             }
         if len(categorical_cols) >= 2:
+            # A pie chart has no room for a "series" dimension, so 2+
+            # categorical columns always stay a grouped bar regardless of
+            # share language.
             return {
                 "chart_type": "bar",
                 "x_axis": categorical_cols[0],
-                "y_axis": numeric_cols[0],
+                "y_axis": y_axis,
                 "series": categorical_cols[1],
                 "reason": "2 categorical + numeric; normalized to bar for UI support",
             }
@@ -552,10 +604,11 @@ def recommend_chart_spec(
     question: str,
     rows: List[Dict[str, Any]],
     columns: List[str],
+    sql: str = "",
     ask_json_fn=None,
 ) -> Dict[str, Any]:
     try:
-        spec = _rule_based_chart_spec(question, rows, columns)
+        spec = _rule_based_chart_spec(question, rows, columns, sql=sql)
         if _get_visual_intent(question) and spec.get("chart_type") == "table":
             llm_spec = _llm_chart_spec(question, rows, columns, ask_json_fn)
             if llm_spec:
@@ -661,7 +714,7 @@ def question_to_sql(
         chart_spec = {"chart_type": "table", "reason": "chart disabled"}
         chart_data = rows
         if want_chart:
-            chart_spec = recommend_chart_spec(question, rows, cols, ask_json_fn=ask_json_fn)
+            chart_spec = recommend_chart_spec(question, rows, cols, sql=sql, ask_json_fn=ask_json_fn)
             chart_data = prepare_chart_dataset(rows, chart_spec)
         logger.info(
             f"[poc8] chart spec | type={chart_spec.get('chart_type')} | "
