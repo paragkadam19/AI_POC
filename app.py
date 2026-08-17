@@ -143,7 +143,7 @@ def init_auth_db():
                 INSERT INTO admin.users (id, user_id, password, full_name, is_active)
                 VALUES (1, 'admin', 'admin123', 'Administrator', TRUE)
             """)
-            logger.info("[auth] default admin user created — user_id=admin, password=admin123")
+            #logger.info("[auth] default admin user created — user_id=admin, password=admin123")
  
         conn.close()
         logger.info("[auth] auth DB initialized")

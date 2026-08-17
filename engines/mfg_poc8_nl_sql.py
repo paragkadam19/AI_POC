@@ -791,9 +791,38 @@ Convert natural language questions into DuckDB SQL.
 - If a requested concept does not exist as an exact schema column, do not invent a new column name;
   instead, find the table that contains the closest matching exact column or omit that field.
 - For ranking and aggregation, use the exact numeric measure column from schema and do not rename it.
-- If bronze_datatype differs from data_type, always CAST(column_name AS data_type) explicitly in SQL.
-  Never assume the column is already in data_type. Always cast when they differ.
-  Example: bronze=VARCHAR, ai=DATE → CAST(order_date AS DATE) in all filters, GROUP BY, ORDER BY, and comparisons.
+- ## Data Type Handling
+**Bronze vs approved data_type mismatch**
+If bronze_datatype (the raw DuckDB column type) differs from data_type (the type derived and approved by the human-in-the-loop), the column is NOT guaranteed to already be stored as data_type. Always CAST(column_name AS data_type) — or TRY_CAST when nulls/blanks/malformed values are possible — in every filter, GROUP BY, ORDER BY, JOIN condition, and comparison touching that column. Never assume storage matches the approved semantic type.
+
+  Example: bronze=VARCHAR, data_type=INTEGER → CAST(quantity AS INTEGER)   (or TRY_CAST if blanks exist)
+  Example: bronze=VARCHAR, data_type=BOOLEAN → CAST(is_active AS BOOLEAN)
+  Example: bronze=DOUBLE,  data_type=INTEGER → CAST(unit_count AS INTEGER)
+
+**VARCHAR → DATE / TIMESTAMP — never cast blind**
+A plain CAST(column_name AS DATE) only succeeds if the VARCHAR is already ISO-formatted (YYYY-MM-DD / YYYY-MM-DD HH:MM:SS). Source data frequently isn't. Before casting such a column:
+
+  1. Inspect the column's sample values (from the profiling/schema data supplied for that column) to identify the actual string pattern.
+  2. Derive the matching strptime format string from that pattern.
+  3. Cast via TRY_STRPTIME(column_name, '<format>')::DATE (or ::TIMESTAMP) so one malformed row doesn't fail the whole query.
+  4. Only use a plain CAST/TRY_CAST(column_name AS DATE) when sample values are confirmed already ISO 8601.
+
+  Never assume a format without checking sample values — a wrong format string either errors or silently returns wrong dates.
+
+  Example: bronze=VARCHAR, data_type=DATE, samples look like "03/17/2024" →
+    TRY_STRPTIME(order_date, '%m/%d/%Y')::DATE   in all filters, GROUP BY, ORDER BY, and comparisons.
+
+  Example: bronze=VARCHAR, data_type=TIMESTAMP, samples look like "2024-03-17 14:05:00" (already ISO) →
+    TRY_CAST(event_time AS TIMESTAMP)
+
+  Quick reference — common raw pattern → strptime format:
+    2024-03-17               → %Y-%m-%d
+    03/17/2024               → %m/%d/%Y
+    17/03/2024               → %d/%m/%Y
+    17-Mar-2024               → %d-%b-%Y
+    20240317                  → %Y%m%d
+    2024-03-17 14:05:00       → %Y-%m-%d %H:%M:%S
+    03/17/2024 2:05 PM        → %m/%d/%Y %I:%M %p
 
 SEMANTIC LAYER & JOINS GUIDANCE:
 - The semantic layer shows you EXACTLY which tables connect and HOW
