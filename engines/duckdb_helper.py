@@ -96,47 +96,6 @@ def ingest_csv(csv_file: str, db_file: str, table: str,
         return {"success": False, "error": str(e)}
 
 
-def write_table_schema_snapshot(db_file: str, table: str, schema: str = None) -> dict:
-    """
-    Save actual DuckDB schema for a table into {schema}.table_schema_snapshot.
-    """
-    try:
-        conn = _connect(db_file, schema=schema)
-
-        if schema:
-            conn.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
-
-        snapshot_table = f"{schema}.table_schema_snapshot" if schema else "table_schema_snapshot"
-
-        conn.execute(f"""
-            CREATE TABLE IF NOT EXISTS {snapshot_table} (
-                id          TEXT PRIMARY KEY,
-                table_name  TEXT,
-                column_name TEXT,
-                data_type   TEXT,
-                nullable    BOOLEAN,
-                created_at  TEXT
-            )
-        """)
-
-        qtable = _qualified(schema, table)
-        conn.execute(f"DELETE FROM {snapshot_table} WHERE table_name = ?", [table])
-        rows = conn.execute(f"DESCRIBE {qtable}").fetchall()
-        now  = date.today().isoformat()
-        for row in rows:
-            conn.execute(
-                f"""
-                INSERT INTO {snapshot_table}
-                (id, table_name, column_name, data_type, nullable, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                [f"{table}:{row[0]}", table, row[0], row[1], True, now],
-            )
-        conn.close()
-        return {"success": True, "rows_written": len(rows)}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
 
 # ── Preview ────────────────────────────────────────────────────────────────────
 def get_preview(db_file: str, table: str, n: int = 8,

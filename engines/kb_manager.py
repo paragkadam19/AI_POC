@@ -2,7 +2,7 @@
 KB_MANAGER: Knowledge Base with Vector Semantic Search
 =======================================================
 Updated for multi-tenancy: KBManager now accepts a `user_schema`
-parameter. All kb_metadata and table_schema_snapshot tables are
+parameter. All kb_metadata tables are
 created inside the user's own schema (e.g. parag.kb_metadata).
 """
 
@@ -81,18 +81,6 @@ def _parse_sample_values(raw: str) -> List[str]:
             return [v.strip() for v in parts.split(sep) if v and str(v).strip()]
     return [parts.strip()] if parts.strip() else []
 
-
-def _load_bronze_datatypes_from_snapshot(conn, table_name: str, user_schema: str = None) -> Dict[str, str]:
-    snapshot_table = f"{user_schema}.table_schema_snapshot" if user_schema else "table_schema_snapshot"
-    try:
-        rows = conn.execute(
-            f"SELECT column_name, data_type FROM {snapshot_table} WHERE table_name = ?",
-            [table_name],
-        ).fetchall()
-        return {str(r[0]): str(r[1]) for r in rows if r and r[0]}
-    except Exception as e:
-        logger.debug(f"[KB] snapshot lookup skipped for {table_name}: {e}")
-        return {}
 
 
 def _is_key_like_column(col_name: str, column_type: str = "") -> bool:
@@ -798,10 +786,14 @@ class KBManager:
             self._ensure_kb_schema()
             conn = _connect(self.db_file)
 
-            snapshot_bronze_map = _load_bronze_datatypes_from_snapshot(conn, table_name, user_schema=self.user_schema)
+            snapshot_bronze_map = {}
             raw_bronze_map      = {}
             try:
-                qtable    = f"{self.user_schema}.{table_name}" if self.user_schema else f'"{table_name}"'
+                # Avoid double schema prefix if table_name already has schema
+                if self.user_schema and not table_name.startswith(f"{self.user_schema}."):
+                    qtable = f"{self.user_schema}.{table_name}"
+                else:
+                    qtable = table_name
                 raw_rows  = conn.execute(f'DESCRIBE {qtable}').fetchall()
                 raw_bronze_map = {str(r[0]): str(r[1]) for r in raw_rows if r and r[0]}
             except Exception as e:
@@ -824,8 +816,7 @@ class KBManager:
                 validation_rule           = (col.get("validation_rule") or "").strip()
                 column_example            = (sample_values_text or (sample_values[0] if sample_values else "") or "").strip()
                 bronze_datatype           = (
-                    snapshot_bronze_map.get(cname)
-                    or raw_bronze_map.get(cname)
+                    raw_bronze_map.get(cname)
                     or col.get("data_type")
                     or "TEXT"
                 )
@@ -905,8 +896,7 @@ class KBManager:
                     WHERE table_schema = '{self.user_schema or 'main'}'
                       AND table_type = 'BASE TABLE'
                       AND table_name NOT LIKE 'kb_%'
-                      AND table_name != 'table_schema_snapshot'
-                    ORDER BY table_name
+                            ORDER BY table_name
                 """).fetchall()
                 real_data_edges = _refresh_joins_from_real_data(
                     self.db_file, conn,
@@ -1073,7 +1063,6 @@ def refresh_kb_from_duckdb(db_file: str, storage_dir: str,
             SELECT table_name FROM information_schema.tables
             WHERE table_schema = '{user_schema or 'main'}' AND table_type = 'BASE TABLE'
               AND table_name NOT LIKE 'kb_%'
-              AND table_name != 'table_schema_snapshot'
             ORDER BY table_name
         """).fetchall()
         conn_ro.close()

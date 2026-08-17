@@ -74,20 +74,20 @@ try:
         upsert_example_pair, upsert_join_edges,
     )
 except ImportError:
-    def persist_kb(storage_dir, dataset_id, schema_profile, table_name=None, user_schema=None):
+    def persist_kb(storage_dir, dataset_id, schema_profile, table_name=None, kb_manager=None):
         return {"documents_written": 0, "join_edges": 0}
-    def refresh_kb_from_duckdb(db_file, storage_dir, user_schema=None):
+    def refresh_kb_from_duckdb(db_file, storage_dir, kb_manager=None):
         return {"tables_indexed": 0, "join_edges": 0}
     def should_refresh_kb(storage_dir):
         return False
-    def upsert_example_pair(storage_dir, dataset_id, question, sql, tables, tags=None, user_schema=None):
+    def upsert_example_pair(storage_dir, dataset_id, question, sql, tables, tags=None, kb_manager=None):
         return {"success": False}
-    def upsert_join_edges(storage_dir, edges, user_schema=None):
+    def upsert_join_edges(storage_dir, edges, kb_manager=None):
         return {"success": False}
 
 from duckdb_helper import (
     ingest_csv, get_preview, get_full_metadata_for_ai,
-    SAMPLE_ROWS_SCHEMA, write_table_schema_snapshot, DUCKDB_CONFIG,
+    SAMPLE_ROWS_SCHEMA, DUCKDB_CONFIG,
 )
 
 app = Flask(__name__, static_folder="static", static_url_path="")
@@ -136,7 +136,7 @@ def init_auth_db():
                 session_id   VARCHAR
             )
         """)
-        
+
         conn.close()
         logger.info("[auth] auth DB initialized")
     except Exception as e:
@@ -386,37 +386,6 @@ def strip_audit_columns(schema_profile: dict) -> dict:
         cleaned["total_columns"] = len(cleaned["schema"])
     return cleaned
 
-
-def enrich_with_bronze_datatypes(schema_profile: dict, full_table: str) -> dict:
-    if not isinstance(schema_profile, dict):
-        return schema_profile
-    try:
-        conn = duckdb.connect(DB_FILE, read_only=True, config=DUCKDB_CONFIG)
-        # Determine schema from full_table (e.g. 'parag.orders' -> schema='parag', table='orders')
-        _parts = full_table.split('.', 1) if '.' in full_table else [None, full_table]
-        _schema_part = _parts[0] if len(_parts) == 2 else None
-        _snap = f'"{_schema_part}".table_schema_snapshot' if _schema_part else 'table_schema_snapshot'
-        rows = conn.execute(
-            f'SELECT column_name, data_type FROM {_snap} WHERE table_name = ?',
-            [full_table],
-        ).fetchall()
-        conn.close()
-        bronze_map = {str(row[0]): str(row[1]) for row in rows if row and row[0]}
-        logger.info(f"[poc1] bronze datatypes loaded | table={full_table} | cols={len(bronze_map)}")
-    except Exception as e:
-        logger.warning(f"[poc1] bronze datatype lookup failed | table={full_table} | error={e}")
-        return schema_profile
-
-    enriched = json.loads(json.dumps(schema_profile))
-    for col in enriched.get("schema", []) or []:
-        name = col.get("column")
-        bronze = bronze_map.get(name)
-        if bronze:
-            col["bronze_datatype"] = bronze
-            col["actual_data_type"] = bronze
-            if not col.get("data_type"):
-                col["data_type"] = bronze
-    return enriched
 
 
 def remove_audit_checks_from_yaml(yaml_text: str) -> str:
@@ -788,16 +757,11 @@ def upload():
         if not ingest_result.get("success"):
             return jsonify({"error": ingest_result.get("error", "DB ingest failed")}), 500
 
-        snapshot_result = write_table_schema_snapshot(DB_FILE, bare, schema=get_user_schema())
-        if not snapshot_result.get("success"):
-            logger.warning(f"[schema] snapshot write failed: {snapshot_result.get('error')}")
-
         sample, columns, row_count = get_preview(DB_FILE, bare, n=8, row_count=ingest_result["row_count"], schema=get_user_schema())
         return jsonify({
             "dataset_id": dataset_id, "filename": filename,
             "row_count": row_count, "columns": columns,
             "sample": sample, "duckdb": ingest_result,
-            "schema_snapshot": snapshot_result,
         })
     except Exception as e:
         logger.error(f"Upload/ingest failed for dataset={dataset_id} user={user_id}: {e}", exc_info=True)
@@ -850,7 +814,6 @@ def approve_poc1():
             return jsonify({"error": "No schema data received"}), 400
 
         tbl    = table_name(user_id, dataset_id)
-        result = enrich_with_bronze_datatypes(result, tbl)
         logger.info(f"[poc1] bronze enrichment done in {time.time()-t_approve:.3f}s")
 
         versioned_name = save_versioned(user_id, dataset_id, "poc1", result)
@@ -922,7 +885,6 @@ def run_poc7():
     try:
         tbl            = table_name(user_id, dataset_id)
         bare           = bare_table_name(dataset_id)
-        schema_profile = enrich_with_bronze_datatypes(schema_profile, tbl)
         schema_profile = strip_audit_columns(schema_profile)
         schema_json    = json.dumps(schema_profile, indent=2)
         prompt         = poc7.PROMPT.replace("{table}", bare).replace("{schema_profile}", schema_json)
@@ -1030,7 +992,6 @@ def run_poc3a():
         return jsonify({"error": "Play Tune (Tab 2) first"}), 400
     try:
         tbl         = table_name(user_id, dataset_id)
-        poc1_schema = enrich_with_bronze_datatypes(poc1_schema, tbl)
         cpath       = contract_path(user_id, dataset_id)
         if not os.path.exists(cpath):
             contract = {
@@ -1114,7 +1075,7 @@ def run_poc8_query():
         if result.get("ok") and result.get("sql"):
             try:
                 if result.get("tables"):
-                        upsert_example_pair(
+                    upsert_example_pair(
                         dirs["kb"], dataset_id or "kb", question,
                         result.get("sql", ""),
                         result.get("tables", []) or [],
@@ -1213,7 +1174,7 @@ def refresh_kb_route():
     dataset_id = session.get("dataset_id")
     dirs       = get_user_dirs(user_id)
     try:
-        result = refresh_kb_from_duckdb(DB_FILE, dirs["kb"], kb_manager=get_user_kb_manager(user_id))
+        result = refresh_kb_from_duckdb(DB_FILE, dirs["kb"], user_schema=get_user_schema())
         kb = get_user_kb_manager(user_id)
         if kb:
             kb.clear_cache()
