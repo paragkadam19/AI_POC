@@ -3,19 +3,23 @@ app.py — Flask backend for Data Quality POC Console
 =================================================================
 Flow: 01 Signal → 02 Tune → 03 Compose → 04 Soundcheck → 05 Resonance → 06 Pitch Drift → 07 Retune
 
+Multi-tenancy:
+- Every user gets their own schema in DuckDB: {user_id}.{table}
+- Every user gets their own file storage: storage/users/{user_id}/
+- Every user gets their own KB Manager instance
+- STATE is per-session, not global
+
 Human-in-the-loop:
 - Tab 2: AI result shown for review/edit → user clicks Approve → saved
 - Tab 3: AI YAML shown for review/edit → user clicks Approve → saved
 - Tab 4: Runs real SODA checks directly against DuckDB (no AI call)
 - Tab 8: NL→SQL via KB-aware retrieval + Claude
 """
-import os, sys, json, re, time, shutil
+import os, sys, json, re, time, shutil, uuid, functools
 from datetime import datetime
 import yaml
 import duckdb
-from flask import session, redirect, url_for
-import hashlib
-import functools
+from flask import session, redirect
 
 from logger_config import setup_logging, get_logger
 
@@ -31,11 +35,9 @@ logger.info(f"[boot] python={sys.executable}")
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 STORAGE_DIR   = os.path.join(BASE_DIR, "storage")
 ENGINES_DIR   = os.path.join(BASE_DIR, "engines")
-OUTPUTS_DIR   = os.path.join(STORAGE_DIR, "outputs")
-UPLOADS_DIR   = os.path.join(STORAGE_DIR, "uploads")
-CONTRACTS_DIR = os.path.join(STORAGE_DIR, "contracts")
+USERS_DIR     = os.path.join(STORAGE_DIR, "users")   # per-user root
 os.environ["STORAGE_DIR"] = STORAGE_DIR
-for d in (STORAGE_DIR, OUTPUTS_DIR, UPLOADS_DIR, CONTRACTS_DIR):
+for d in (STORAGE_DIR, USERS_DIR):
     os.makedirs(d, exist_ok=True)
 
 if load_dotenv:
@@ -64,31 +66,25 @@ import mfg_poc8_nl_sql as poc8
 from bedrock_client import ask_json, ask
 from prompt_builder import build_schema_discovery_prompt
 from soda_executor import run_soda_checks_from_yaml, sanitize_soda_yaml_text
-# Class-based KB API (new KBManager — may live in engines/kb_manager.py)
 from kb_manager import init_kb_manager, get_kb_manager
 
-# Function-based KB API (original file-store helpers).
-# Try to import; fall back to no-op stubs if the new kb_manager doesn't have them.
 try:
     from kb_manager import (
         persist_kb, refresh_kb_from_duckdb, should_refresh_kb,
         upsert_example_pair, upsert_join_edges,
     )
 except ImportError:
-    def persist_kb(storage_dir, dataset_id, schema_profile, table_name=None):
+    def persist_kb(storage_dir, dataset_id, schema_profile, table_name=None, user_schema=None):
         return {"documents_written": 0, "join_edges": 0}
-
-    def refresh_kb_from_duckdb(db_file, storage_dir):
+    def refresh_kb_from_duckdb(db_file, storage_dir, user_schema=None):
         return {"tables_indexed": 0, "join_edges": 0}
-
     def should_refresh_kb(storage_dir):
         return False
-
-    def upsert_example_pair(storage_dir, dataset_id, question, sql, tables, tags=None):
+    def upsert_example_pair(storage_dir, dataset_id, question, sql, tables, tags=None, user_schema=None):
+        return {"success": False}
+    def upsert_join_edges(storage_dir, edges, user_schema=None):
         return {"success": False}
 
-    def upsert_join_edges(storage_dir, edges):
-        return {"success": False}
 from duckdb_helper import (
     ingest_csv, get_preview, get_full_metadata_for_ai,
     SAMPLE_ROWS_SCHEMA, write_table_schema_snapshot, DUCKDB_CONFIG,
@@ -99,33 +95,38 @@ app.secret_key = "0e804a303436784cb17d9e26a1fb27129ee6f8056ab9b6cbbd9cb82e864100
 CORS(app)
 
 DB_FILE = os.path.join(STORAGE_DIR, "data_resonance.duckdb")
-STATE   = {"dataset_id": None, "filename": None, "poc1_metadata": None}
 UPLOAD_COPY_CHUNK_SIZE = 32 * 1024 * 1024
 #POC1_MODEL_ID = "us.anthropic.claude-sonnet-4-6"
 POC1_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
+# ── Per-user KB Manager registry ──────────────────────────────────────────────
+# Keyed by user_id — one KBManager instance per user, cached in memory
+_KB_REGISTRY: dict = {}
 
-# ── KB Manager initialisation ─────────────────────────────────────────────────
-KB_MANAGER = None
 
+# ── Auth DB init ───────────────────────────────────────────────────────────────
 def init_auth_db():
     """Create admin schema, users and login_activity tables in DuckDB."""
     try:
         conn = duckdb.connect(DB_FILE, read_only=False, config=DUCKDB_CONFIG)
         conn.execute("CREATE SCHEMA IF NOT EXISTS admin")
- 
-        # users table — id is auto increment PK
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS admin.users (
-                id         INTEGER PRIMARY KEY,
-                user_id    VARCHAR UNIQUE NOT NULL,
-                password   VARCHAR NOT NULL,
-                full_name  VARCHAR NOT NULL,
-                is_active  BOOLEAN DEFAULT TRUE
+                id          INTEGER PRIMARY KEY,
+                user_id     VARCHAR UNIQUE NOT NULL,
+                password    VARCHAR NOT NULL,
+                full_name   VARCHAR NOT NULL,
+                schema_name VARCHAR NOT NULL DEFAULT 'main',
+                is_active   BOOLEAN DEFAULT TRUE
             )
         """)
- 
-        # login_activity table — user_ref_id is FK to admin.users.id
+
+        try:
+            conn.execute("ALTER TABLE admin.users ADD COLUMN schema_name VARCHAR NOT NULL DEFAULT 'main'")
+        except Exception:
+            pass
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS admin.login_activity (
                 id           INTEGER PRIMARY KEY,
@@ -135,37 +136,91 @@ def init_auth_db():
                 session_id   VARCHAR
             )
         """)
- 
-        # Seed default admin user if not exists
-        existing = conn.execute("SELECT COUNT(*) FROM admin.users WHERE user_id = 'admin'").fetchone()[0]
-        if existing == 0:
-            conn.execute("""
-                INSERT INTO admin.users (id, user_id, password, full_name, is_active)
-                VALUES (1, 'admin', 'admin123', 'Administrator', TRUE)
-            """)
-            #logger.info("[auth] default admin user created — user_id=admin, password=admin123")
- 
+        
         conn.close()
         logger.info("[auth] auth DB initialized")
     except Exception as e:
         logger.warning(f"[auth] auth DB init failed (non-critical): {e}")
 
 
-def init_kb_manager_system():
-    """Initialize KB Manager at app startup and wire into poc8."""
-    global KB_MANAGER
-    try:
-        KB_MANAGER = init_kb_manager(DB_FILE)
-        poc8.set_kb_manager(KB_MANAGER)
-        stats = KB_MANAGER.get_stats()
-        logger.info(f"[app] KB Manager initialized: {stats}")
-    except Exception as e:
-        logger.warning(f"[app] KB Manager init failed (non-critical): {e}")
-
-init_kb_manager_system()
-
 init_auth_db()
 
+
+# ── Per-user helpers ───────────────────────────────────────────────────────────
+
+def get_current_user_id() -> str:
+    """Get logged-in user_id from session. Returns empty string if not logged in."""
+    return session.get("user_id", "")
+
+
+def safe_schema_name(user_id: str) -> str:
+    """Convert user_id to a safe DuckDB schema name (fallback only)."""
+    name = re.sub(r"[^a-zA-Z0-9_]", "_", user_id or "").strip("_").lower()
+    if not name:
+        name = "user"
+    if not re.match(r"^[a-zA-Z_]", name):
+        name = f"u_{name}"
+    return name
+
+
+def get_user_schema() -> str:
+    """Get the schema_name for the current logged-in user from session."""
+    return session.get("user_schema") or safe_schema_name(session.get("user_id", ""))
+
+
+def get_user_dirs(user_id: str) -> dict:
+    """Return all per-user directory paths, creating them if needed."""
+    user_root     = os.path.join(USERS_DIR, user_id)
+    uploads_dir   = os.path.join(user_root, "uploads")
+    outputs_dir   = os.path.join(user_root, "outputs")
+    contracts_dir = os.path.join(user_root, "contracts")
+    kb_dir        = os.path.join(user_root, "kb")
+    for d in (user_root, uploads_dir, outputs_dir, contracts_dir, kb_dir):
+        os.makedirs(d, exist_ok=True)
+    return {
+        "root":      user_root,
+        "uploads":   uploads_dir,
+        "outputs":   outputs_dir,
+        "contracts": contracts_dir,
+        "kb":        kb_dir,
+    }
+
+
+def get_user_kb_manager(user_id: str):
+    """Get or create a KBManager instance for this user (per-user schema)."""
+    global _KB_REGISTRY
+    if user_id not in _KB_REGISTRY:
+        try:
+            schema = get_user_schema()
+            kb = init_kb_manager(DB_FILE, user_schema=schema)
+            _KB_REGISTRY[user_id] = kb
+            logger.info(f"[kb] KB Manager created for user={user_id} schema={schema}")
+        except Exception as e:
+            logger.warning(f"[kb] KB Manager init failed for user={user_id}: {e}")
+            return None
+    return _KB_REGISTRY.get(user_id)
+
+
+def get_user_state() -> dict:
+    """Get per-session STATE from Flask session."""
+    return {
+        "dataset_id":    session.get("dataset_id"),
+        "filename":      session.get("filename"),
+        "poc1_metadata": session.get("poc1_metadata"),
+    }
+
+
+def set_user_state(dataset_id: str = None, filename: str = None, poc1_metadata=None):
+    """Save per-session STATE into Flask session."""
+    if dataset_id is not None:
+        session["dataset_id"] = dataset_id
+    if filename is not None:
+        session["filename"] = filename
+    if poc1_metadata is not None:
+        session["poc1_metadata"] = poc1_metadata
+
+
+# ── Auth decorator ─────────────────────────────────────────────────────────────
 def login_required(f):
     @functools.wraps(f)
     def decorated(*args, **kwargs):
@@ -174,115 +229,13 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
-@app.route("/login")
-def login_page():
-    if session.get("user_id"):
-        return redirect("/")
-    return send_from_directory("static", "login.html")
 
-
-@app.route("/api/auth/login", methods=["POST"])
-def auth_login():
-    body     = request.get_json(silent=True) or {}
-    user_id  = (body.get("user_id") or "").strip()
-    password = (body.get("password") or "").strip()
- 
-    if not user_id or not password:
-        return jsonify({"success": False, "error": "User ID and Password are required."}), 400
- 
-    try:
-        conn = duckdb.connect(DB_FILE, read_only=False, config=DUCKDB_CONFIG)
-        row  = conn.execute(
-            "SELECT id, user_id, password, full_name, is_active FROM admin.users WHERE user_id = ?",
-            [user_id]
-        ).fetchone()
- 
-        if not row:
-            conn.close()
-            return jsonify({"success": False, "error": "User ID not found."}), 401
- 
-        db_id, db_user_id, db_password, full_name, is_active = row
- 
-        if not is_active:
-            conn.close()
-            return jsonify({"success": False, "error": "Your account is inactive. Contact admin."}), 403
- 
-        if password != db_password:
-            conn.close()
-            return jsonify({"success": False, "error": "Incorrect password."}), 401
- 
-        # Generate session ID
-        import uuid
-        from datetime import datetime as dt
-        session_id = str(uuid.uuid4())
- 
-        # Get next login_activity id
-        max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM admin.login_activity").fetchone()[0]
-        next_id = max_id + 1
- 
-        # Insert login activity row
-        conn.execute("""
-            INSERT INTO admin.login_activity (id, user_ref_id, login_time, logout_time, session_id)
-            VALUES (?, ?, ?, NULL, ?)
-        """, [next_id, db_id, dt.now(), session_id])
-        conn.close()
- 
-        # Save to session
-        session["user_id"]          = db_user_id
-        session["full_name"]        = full_name
-        session["user_ref_id"]      = db_id
-        session["session_id"]       = session_id
-        session["activity_row_id"]  = next_id
- 
-        logger.info(f"[auth] login success | user={db_user_id} | activity_id={next_id}")
-        return jsonify({"success": True, "full_name": full_name})
- 
-    except Exception as e:
-        logger.error(f"[auth] login failed: {e}", exc_info=True)
-        return jsonify({"success": False, "error": "Server error."}), 500
-
-
-@app.route("/api/auth/logout", methods=["POST"])
-def auth_logout():
-    user          = session.get("user_id", "unknown")
-    activity_id   = session.get("activity_row_id")
- 
-    # Update logout_time in login_activity
-    if activity_id:
-        try:
-            from datetime import datetime as dt
-            conn = duckdb.connect(DB_FILE, read_only=False, config=DUCKDB_CONFIG)
-            conn.execute("""
-                UPDATE admin.login_activity
-                SET logout_time = ?
-                WHERE id = ?
-            """, [dt.now(), activity_id])
-            conn.close()
-            logger.info(f"[auth] logout recorded | user={user} | activity_id={activity_id}")
-        except Exception as e:
-            logger.warning(f"[auth] logout time update failed: {e}")
- 
-    session.clear()
-    return jsonify({"success": True})
-
- 
-@app.route("/api/auth/me", methods=["GET"])
-def auth_me():
-    if not session.get("user_id"):
-        return jsonify({"logged_in": False}), 401
-    return jsonify({
-        "logged_in": True,
-        "user_id":   session.get("user_id"),
-        "full_name": session.get("full_name"),
-    })
-
-
-
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── helpers ────────────────────────────────────────────────────────────────────
 def make_dataset_id(filename: str) -> str:
     base = os.path.splitext(filename or "")[0]
     stem = re.sub(r"[^A-Za-z0-9]+", "_", base).strip("_").lower()
     return stem or "dataset"
+
 
 _last_ts = {"value": None, "seq": 0}
 def ts() -> str:
@@ -294,13 +247,16 @@ def ts() -> str:
         _last_ts["seq"]   = 0
     return base if _last_ts["seq"] == 0 else f"{base}_{_last_ts['seq']:03d}"
 
-def dataset_dir(dataset_id: str) -> str:
-    d = os.path.join(OUTPUTS_DIR, dataset_id)
+
+def dataset_dir(user_id: str, dataset_id: str) -> str:
+    dirs = get_user_dirs(user_id)
+    d = os.path.join(dirs["outputs"], dataset_id)
     os.makedirs(d, exist_ok=True)
     return d
 
-def save_versioned(dataset_id: str, stage: str, data, ext="json") -> str:
-    d              = dataset_dir(dataset_id)
+
+def save_versioned(user_id: str, dataset_id: str, stage: str, data, ext="json") -> str:
+    d              = dataset_dir(user_id, dataset_id)
     stamp          = ts()
     versioned_name = f"{stage}_{stamp}.{ext}"
     latest_name    = f"{stage}_latest.{ext}"
@@ -309,6 +265,7 @@ def save_versioned(dataset_id: str, stage: str, data, ext="json") -> str:
         with open(os.path.join(d, name), "w") as f:
             f.write(text)
     return versioned_name
+
 
 def _parse_join_label(label: str) -> tuple:
     text = (label or "").strip()
@@ -320,8 +277,9 @@ def _parse_join_label(label: str) -> tuple:
         return left.strip(), right.strip()
     return text, text
 
-def list_versions(dataset_id: str, stage: str, ext="json") -> list:
-    d       = dataset_dir(dataset_id)
+
+def list_versions(user_id: str, dataset_id: str, stage: str, ext="json") -> list:
+    d       = dataset_dir(user_id, dataset_id)
     pattern = re.compile(rf"^{re.escape(stage)}_(\d{{8}}_\d{{6}})\.{ext}$")
     out     = []
     for name in os.listdir(d):
@@ -330,32 +288,62 @@ def list_versions(dataset_id: str, stage: str, ext="json") -> list:
             out.append({"file": name, "timestamp": m.group(1)})
     return sorted(out, key=lambda x: x["timestamp"])
 
-def load_latest(dataset_id: str, stage: str, ext="json"):
-    path = os.path.join(dataset_dir(dataset_id), f"{stage}_latest.{ext}")
+
+def load_latest(user_id: str, dataset_id: str, stage: str, ext="json"):
+    path = os.path.join(dataset_dir(user_id, dataset_id), f"{stage}_latest.{ext}")
     if not os.path.exists(path):
         return None
     with open(path) as f:
         return json.load(f) if ext == "json" else f.read()
 
-def current_csv_path():
-    if not STATE["dataset_id"]:
+
+def current_csv_path(user_id: str, dataset_id: str):
+    if not dataset_id:
         return None
-    d = os.path.join(UPLOADS_DIR, STATE["dataset_id"])
+    dirs = get_user_dirs(user_id)
+    d = os.path.join(dirs["uploads"], dataset_id)
     if not os.path.isdir(d):
         return None
     versions = sorted(os.listdir(d))
     return os.path.join(d, versions[-1]) if versions else None
 
-def contract_path(dataset_id: str) -> str:
-    return os.path.join(CONTRACTS_DIR, f"{dataset_id}_contract.json")
 
-def table_name(dataset_id: str) -> str:
+def contract_path(user_id: str, dataset_id: str) -> str:
+    dirs = get_user_dirs(user_id)
+    return os.path.join(dirs["contracts"], f"{dataset_id}_contract.json")
+
+
+def table_name(user_id: str, dataset_id: str) -> str:
+    """Returns fully qualified table name: {user_schema}.{dataset_table}"""
+    schema = get_user_schema()
+    name   = re.sub(r"[^a-zA-Z0-9_]", "_", dataset_id or "").strip("_")
+    if not name:
+        name = "dataset"
+    if not re.match(r"^[A-Za-z_]", name):
+        name = f"t_{name}"
+    return f"{schema}.{name}"
+
+
+def bare_table_name(dataset_id: str) -> str:
+    """Returns just the table part without schema prefix."""
     name = re.sub(r"[^a-zA-Z0-9_]", "_", dataset_id or "").strip("_")
     if not name:
         name = "dataset"
     if not re.match(r"^[A-Za-z_]", name):
         name = f"t_{name}"
     return name
+
+
+def ensure_user_schema(user_id: str):
+    """Create DuckDB schema for user if it doesn't exist."""
+    schema = get_user_schema() or get_user_schema()
+    try:
+        conn = duckdb.connect(DB_FILE, read_only=False, config=DUCKDB_CONFIG)
+        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+        conn.close()
+        logger.info(f"[schema] ensured schema={schema} for user={user_id}")
+    except Exception as e:
+        logger.warning(f"[schema] schema creation failed for user={user_id}: {e}")
 
 
 AUDIT_COLUMN_NAMES = {"system_date", "system_active", "file_path"}
@@ -399,24 +387,24 @@ def strip_audit_columns(schema_profile: dict) -> dict:
     return cleaned
 
 
-def enrich_with_bronze_datatypes(schema_profile: dict, table: str) -> dict:
+def enrich_with_bronze_datatypes(schema_profile: dict, full_table: str) -> dict:
     if not isinstance(schema_profile, dict):
         return schema_profile
     try:
         conn = duckdb.connect(DB_FILE, read_only=True, config=DUCKDB_CONFIG)
+        # Determine schema from full_table (e.g. 'parag.orders' -> schema='parag', table='orders')
+        _parts = full_table.split('.', 1) if '.' in full_table else [None, full_table]
+        _schema_part = _parts[0] if len(_parts) == 2 else None
+        _snap = f'"{_schema_part}".table_schema_snapshot' if _schema_part else 'table_schema_snapshot'
         rows = conn.execute(
-            """
-            SELECT column_name, data_type
-            FROM table_schema_snapshot
-            WHERE table_name = ?
-            """,
-            [table],
+            f'SELECT column_name, data_type FROM {_snap} WHERE table_name = ?',
+            [full_table],
         ).fetchall()
         conn.close()
         bronze_map = {str(row[0]): str(row[1]) for row in rows if row and row[0]}
-        logger.info(f"[poc1] bronze datatypes loaded | table={table} | cols={len(bronze_map)}")
+        logger.info(f"[poc1] bronze datatypes loaded | table={full_table} | cols={len(bronze_map)}")
     except Exception as e:
-        logger.warning(f"[poc1] bronze datatype lookup failed | table={table} | error={e}")
+        logger.warning(f"[poc1] bronze datatype lookup failed | table={full_table} | error={e}")
         return schema_profile
 
     enriched = json.loads(json.dumps(schema_profile))
@@ -434,23 +422,19 @@ def enrich_with_bronze_datatypes(schema_profile: dict, table: str) -> dict:
 def remove_audit_checks_from_yaml(yaml_text: str) -> str:
     if not yaml_text:
         return yaml_text
-
     lines = yaml_text.splitlines()
     out = []
     skip = False
     current_indent = 0
-
     for line in lines:
         stripped = line.lstrip()
         indent = len(line) - len(stripped)
         lower = stripped.lower()
         mentions_audit = any(name in lower for name in AUDIT_COLUMN_NAMES)
-
         if stripped.startswith("- ") and mentions_audit:
             skip = True
             current_indent = indent
             continue
-
         if skip:
             if stripped.startswith("- ") and indent <= current_indent:
                 skip = False
@@ -458,24 +442,25 @@ def remove_audit_checks_from_yaml(yaml_text: str) -> str:
                 continue
             else:
                 skip = False
-
         if not skip:
             out.append(line)
-
     return "\n".join(out)
 
-def maybe_refresh_kb() -> None:
-    if should_refresh_kb(STORAGE_DIR):
+
+def maybe_refresh_kb(user_id: str) -> None:
+    dirs = get_user_dirs(user_id)
+    if should_refresh_kb(dirs["kb"]):
         try:
-            result = refresh_kb_from_duckdb(DB_FILE, STORAGE_DIR)
+            result = refresh_kb_from_duckdb(DB_FILE, dirs["kb"], kb_manager=get_user_kb_manager(user_id))
             logger.info(
-                f"[kb] auto refresh triggered | tables={result.get('tables_indexed', 0)} | joins={result.get('join_edges', 0)}"
+                f"[kb] auto refresh | user={user_id} | tables={result.get('tables_indexed', 0)}"
             )
-            # Re-wire KB Manager after refresh so poc8 sees the updated catalog
-            if KB_MANAGER:
-                KB_MANAGER.clear_cache()
+            kb = get_user_kb_manager(user_id)
+            if kb:
+                kb.clear_cache()
         except Exception as e:
-            logger.warning(f"[kb] auto refresh skipped due to error: {e}")
+            logger.warning(f"[kb] auto refresh skipped for user={user_id}: {e}")
+
 
 def _schema_map(schema_profile: dict) -> dict:
     return {
@@ -485,7 +470,7 @@ def _schema_map(schema_profile: dict) -> dict:
     }
 
 
-# ── contract / schema comparison helpers ─────────────────────────────────────
+# ── contract / schema comparison helpers ──────────────────────────────────────
 def compare_contract_to_schema(contract: dict, current_schema: dict) -> dict:
     contract = contract or {}
     current  = _schema_map(current_schema)
@@ -600,34 +585,146 @@ def compare_schema_snapshots(previous_schema: dict, current_schema: dict, previo
     }
 
 
-# ── static UI ─────────────────────────────────────────────────────────────────
+# ── Auth routes ────────────────────────────────────────────────────────────────
+@app.route("/login")
+def login_page():
+    if session.get("user_id"):
+        return redirect("/")
+    return send_from_directory("static", "login.html")
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def auth_login():
+    body     = request.get_json(silent=True) or {}
+    user_id  = (body.get("user_id") or "").strip()
+    password = (body.get("password") or "").strip()
+
+    if not user_id or not password:
+        return jsonify({"success": False, "error": "User ID and Password are required."}), 400
+
+    try:
+        conn = duckdb.connect(DB_FILE, read_only=False, config=DUCKDB_CONFIG)
+        row  = conn.execute(
+            "SELECT id, user_id, password, full_name, schema_name, is_active FROM admin.users WHERE user_id = ?",
+            [user_id]
+        ).fetchone()
+
+        if not row:
+            conn.close()
+            return jsonify({"success": False, "error": "User ID not found."}), 401
+
+        db_id, db_user_id, db_password, full_name, db_schema_name, is_active = row
+
+        if not is_active:
+            conn.close()
+            return jsonify({"success": False, "error": "Your account is inactive. Contact admin."}), 403
+
+        if password != db_password:
+            conn.close()
+            return jsonify({"success": False, "error": "Incorrect password."}), 401
+
+        from datetime import datetime as dt
+        session_id = str(uuid.uuid4())
+
+        max_id  = conn.execute("SELECT COALESCE(MAX(id), 0) FROM admin.login_activity").fetchone()[0]
+        next_id = max_id + 1
+
+        conn.execute("""
+            INSERT INTO admin.login_activity (id, user_ref_id, login_time, logout_time, session_id)
+            VALUES (?, ?, ?, NULL, ?)
+        """, [next_id, db_id, dt.now(), session_id])
+        conn.close()
+
+        # Save to session
+        session["user_id"]         = db_user_id
+        session["full_name"]       = full_name
+        session["user_ref_id"]     = db_id
+        session["session_id"]      = session_id
+        session["activity_row_id"] = next_id
+        session["user_schema"]     = db_schema_name  # from admin.users.schema_name
+
+        # Ensure user schema exists in DuckDB
+        ensure_user_schema(db_user_id)
+
+        # Ensure per-user KB Manager is ready
+        get_user_kb_manager(db_user_id)
+
+        logger.info(f"[auth] login success | user={db_user_id} | activity_id={next_id}")
+        return jsonify({"success": True, "full_name": full_name})
+
+    except Exception as e:
+        logger.error(f"[auth] login failed: {e}", exc_info=True)
+        return jsonify({"success": False, "error": "Server error."}), 500
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    user        = session.get("user_id", "unknown")
+    activity_id = session.get("activity_row_id")
+
+    if activity_id:
+        try:
+            from datetime import datetime as dt
+            conn = duckdb.connect(DB_FILE, read_only=False, config=DUCKDB_CONFIG)
+            conn.execute("""
+                UPDATE admin.login_activity
+                SET logout_time = ?
+                WHERE id = ?
+            """, [dt.now(), activity_id])
+            conn.close()
+            logger.info(f"[auth] logout recorded | user={user} | activity_id={activity_id}")
+        except Exception as e:
+            logger.warning(f"[auth] logout time update failed: {e}")
+
+    session.clear()
+    return jsonify({"success": True})
+
+
+@app.route("/api/auth/me", methods=["GET"])
+def auth_me():
+    if not session.get("user_id"):
+        return jsonify({"logged_in": False}), 401
+    return jsonify({
+        "logged_in": True,
+        "user_id":   session.get("user_id"),
+        "full_name": session.get("full_name"),
+    })
+
+
+# ── Static UI ──────────────────────────────────────────────────────────────────
 @app.route("/")
 @login_required
 def index():
     return send_from_directory("static", "index.html")
 
+
 @app.route("/api/status")
 def status():
-    ds = STATE["dataset_id"]
+    user_id    = get_current_user_id()
+    dataset_id = session.get("dataset_id")
+    filename   = session.get("filename")
     return jsonify({
-        "csv_ready":  bool(ds and current_csv_path()),
-        "poc1_ready": bool(ds and load_latest(ds, "poc1") is not None),
-        "csv_file":   STATE["filename"],
-        "dataset_id": ds,
+        "csv_ready":  bool(dataset_id and current_csv_path(user_id, dataset_id)),
+        "poc1_ready": bool(dataset_id and load_latest(user_id, dataset_id, "poc1") is not None),
+        "csv_file":   filename,
+        "dataset_id": dataset_id,
     })
+
 
 @app.route("/api/datasets")
 def list_datasets():
-    out = []
-    if os.path.isdir(OUTPUTS_DIR):
-        for dataset_id in sorted(os.listdir(OUTPUTS_DIR)):
+    user_id = get_current_user_id()
+    dirs    = get_user_dirs(user_id)
+    out     = []
+    if os.path.isdir(dirs["outputs"]):
+        for dataset_id in sorted(os.listdir(dirs["outputs"])):
             out.append({
                 "dataset_id":     dataset_id,
-                "poc1_versions":  len(list_versions(dataset_id, "poc1")),
-                "poc2_versions":  len(list_versions(dataset_id, "poc2")),
-                "poc3a_versions": len(list_versions(dataset_id, "poc3a")),
-                "poc3b_versions": len(list_versions(dataset_id, "poc3b")),
-                "has_contract":   os.path.exists(contract_path(dataset_id)),
+                "poc1_versions":  len(list_versions(user_id, dataset_id, "poc1")),
+                "poc2_versions":  len(list_versions(user_id, dataset_id, "poc2")),
+                "poc3a_versions": len(list_versions(user_id, dataset_id, "poc3a")),
+                "poc3b_versions": len(list_versions(user_id, dataset_id, "poc3b")),
+                "has_contract":   os.path.exists(contract_path(user_id, dataset_id)),
             })
     return jsonify(out)
 
@@ -635,6 +732,8 @@ def list_datasets():
 # ── Tab 1: CSV Upload + DuckDB ingest ─────────────────────────────────────────
 @app.route("/api/upload", methods=["POST"])
 def upload():
+    user_id      = get_current_user_id()
+    dirs         = get_user_dirs(user_id)
     filename     = "pasted.csv"
     csv_path     = None
     dataset_id   = None
@@ -643,24 +742,24 @@ def upload():
     if content_type.startswith("application/octet-stream"):
         filename   = request.args.get("filename", filename)
         dataset_id = make_dataset_id(filename)
-        udir       = os.path.join(UPLOADS_DIR, dataset_id)
+        udir       = os.path.join(dirs["uploads"], dataset_id)
         os.makedirs(udir, exist_ok=True)
         csv_path   = os.path.join(udir, f"{ts()}.csv")
         t0 = time.time()
         with open(csv_path, "wb") as out:
             shutil.copyfileobj(request.stream, out, length=UPLOAD_COPY_CHUNK_SIZE)
-        logger.info(f"upload streamed to disk in {time.time()-t0:.2f}s | file={filename}")
+        logger.info(f"upload streamed to disk in {time.time()-t0:.2f}s | file={filename} | user={user_id}")
 
     elif "file" in request.files:
         f          = request.files["file"]
         filename   = f.filename or filename
         dataset_id = make_dataset_id(filename)
-        udir       = os.path.join(UPLOADS_DIR, dataset_id)
+        udir       = os.path.join(dirs["uploads"], dataset_id)
         os.makedirs(udir, exist_ok=True)
         csv_path   = os.path.join(udir, f"{ts()}.csv")
         t0 = time.time()
         f.save(csv_path)
-        logger.info(f"upload saved to disk (multipart) in {time.time()-t0:.2f}s | file={filename}")
+        logger.info(f"upload saved to disk (multipart) in {time.time()-t0:.2f}s | file={filename} | user={user_id}")
 
     else:
         body = request.get_json(silent=True)
@@ -668,7 +767,7 @@ def upload():
             text       = body["csv_text"]
             filename   = body.get("filename", filename)
             dataset_id = make_dataset_id(filename)
-            udir       = os.path.join(UPLOADS_DIR, dataset_id)
+            udir       = os.path.join(dirs["uploads"], dataset_id)
             os.makedirs(udir, exist_ok=True)
             csv_path   = os.path.join(udir, f"{ts()}.csv")
             with open(csv_path, "w") as out:
@@ -677,23 +776,23 @@ def upload():
     if not csv_path:
         return jsonify({"error": "No CSV provided"}), 400
 
-    STATE["dataset_id"] = dataset_id
-    STATE["filename"]   = filename
+    set_user_state(dataset_id=dataset_id, filename=filename)
 
     try:
-        table = table_name(dataset_id)
-        t1    = time.time()
-        ingest_result = ingest_csv(csv_path, DB_FILE, table, original_filename=filename)
-        logger.info(f"DuckDB ingest completed in {time.time()-t1:.2f}s | table={table}")
+        tbl    = table_name(user_id, dataset_id)
+        bare   = bare_table_name(dataset_id)
+        t1     = time.time()
+        ingest_result = ingest_csv(csv_path, DB_FILE, bare, original_filename=filename, schema=get_user_schema())
+        logger.info(f"DuckDB ingest completed in {time.time()-t1:.2f}s | table={tbl} | user={user_id}")
 
         if not ingest_result.get("success"):
             return jsonify({"error": ingest_result.get("error", "DB ingest failed")}), 500
 
-        snapshot_result = write_table_schema_snapshot(DB_FILE, table)
+        snapshot_result = write_table_schema_snapshot(DB_FILE, bare, schema=get_user_schema())
         if not snapshot_result.get("success"):
             logger.warning(f"[schema] snapshot write failed: {snapshot_result.get('error')}")
 
-        sample, columns, row_count = get_preview(DB_FILE, table, n=8, row_count=ingest_result["row_count"])
+        sample, columns, row_count = get_preview(DB_FILE, bare, n=8, row_count=ingest_result["row_count"], schema=get_user_schema())
         return jsonify({
             "dataset_id": dataset_id, "filename": filename,
             "row_count": row_count, "columns": columns,
@@ -701,26 +800,27 @@ def upload():
             "schema_snapshot": snapshot_result,
         })
     except Exception as e:
-        logger.error(f"Upload/ingest failed for dataset={dataset_id}: {e}", exc_info=True)
+        logger.error(f"Upload/ingest failed for dataset={dataset_id} user={user_id}: {e}", exc_info=True)
         return jsonify({"error": f"DB error: {str(e)}"}), 500
 
 
-# ── Tab 2: Tune - Schema Intelligence  ───────────────────────────────────────────
+# ── Tab 2: Tune - Schema Intelligence ─────────────────────────────────────────
 @app.route("/api/poc1/run", methods=["POST"])
 def run_poc1():
-    ds       = STATE["dataset_id"]
-    csv_path = current_csv_path()
-    if not ds or not csv_path:
+    user_id    = get_current_user_id()
+    dataset_id = session.get("dataset_id")
+    csv_path   = current_csv_path(user_id, dataset_id)
+    if not dataset_id or not csv_path:
         return jsonify({"error": "Upload a CSV first"}), 400
     try:
         t_start         = time.time()
         file_size_bytes = os.path.getsize(csv_path)
-        tbl             = table_name(ds)
+        tbl             = table_name(user_id, dataset_id)
+        bare            = bare_table_name(dataset_id)
         logger.info(f"[poc1] STEP 1 - getsize done")
 
-        metadata = get_full_metadata_for_ai(DB_FILE, tbl, STATE["filename"], file_size_bytes, SAMPLE_ROWS_SCHEMA)
+        metadata = get_full_metadata_for_ai(DB_FILE, bare, session.get("filename"), file_size_bytes, SAMPLE_ROWS_SCHEMA, schema=get_user_schema())
         logger.info(f"[poc1] STEP 2 - metadata fetched")
-        STATE["poc1_metadata"] = metadata
 
         system_prompt, user_prompt = build_schema_discovery_prompt(metadata)
         logger.info(f"[poc1] STEP 3 - prompt built | chars={len(system_prompt)+len(user_prompt)}")
@@ -730,21 +830,18 @@ def run_poc1():
         logger.info(f"[poc1] STEP 4 - AI call done in {time.time()-t_ai:.3f}s | total={time.time()-t_start:.3f}s")
 
         result = _filter_audit_fields(result)
-        logger.info(
-            "[poc1] bronze datatypes loaded from snapshot | sample=%s",
-            [(col.get("column"), col.get("data_type")) for col in (result.get("schema", []) or [])[:5]],
-        )
-        result["_dataset_id"] = ds
+        result["_dataset_id"] = dataset_id
         return jsonify(result)
     except Exception as e:
-        logger.error(f"Tune - Schema Intelligence, failed for dataset={ds}: {e}", exc_info=True)
+        logger.error(f"Tune - Schema Intelligence failed for dataset={dataset_id} user={user_id}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/poc1/approve", methods=["POST"])
 def approve_poc1():
-    ds = STATE["dataset_id"]
-    if not ds:
+    user_id    = get_current_user_id()
+    dataset_id = session.get("dataset_id")
+    if not dataset_id:
         return jsonify({"error": "No active dataset"}), 400
     try:
         t_approve = time.time()
@@ -752,97 +849,84 @@ def approve_poc1():
         if not result:
             return jsonify({"error": "No schema data received"}), 400
 
-        t_bronze = time.time()
-        result = enrich_with_bronze_datatypes(result, table_name(ds))
-        logger.info(
-            "[poc1] bronze_datatype in approve payload | sample=%s",
-            [
-                (col.get("column"), col.get("bronze_datatype"), col.get("data_type"))
-                for col in (result.get("schema", []) or [])[:5]
-            ],
-        )
-        logger.info(f"[poc1] bronze enrichment done in {time.time()-t_bronze:.3f}s")
+        tbl    = table_name(user_id, dataset_id)
+        result = enrich_with_bronze_datatypes(result, tbl)
+        logger.info(f"[poc1] bronze enrichment done in {time.time()-t_approve:.3f}s")
 
-        t_save = time.time()
-        versioned_name = save_versioned(ds, "poc1", result)
-        logger.info(f"[poc1] schema approved and saved | dataset={ds} | file={versioned_name}")
+        versioned_name = save_versioned(user_id, dataset_id, "poc1", result)
+        logger.info(f"[poc1] schema approved and saved | dataset={dataset_id} | user={user_id} | file={versioned_name}")
 
-        cpath           = contract_path(ds)
+        cpath           = contract_path(user_id, dataset_id)
         is_new_contract = not os.path.exists(cpath)
         if is_new_contract:
-            os.makedirs(CONTRACTS_DIR, exist_ok=True)
             contract = {
                 col["column"]: col.get("bronze_datatype") or col["data_type"]
                 for col in result.get("schema", [])
             }
             with open(cpath, "w") as f:
                 json.dump(contract, f, indent=2)
-            logger.info(f"[poc1] contract locked | dataset={ds}")
+            logger.info(f"[poc1] contract locked | dataset={dataset_id} | user={user_id}")
 
-        # Persist to KB (function-based API for file storage)
+        # Persist to KB (per-user storage dir)
         try:
-            t_kb = time.time()
-            kb_result = persist_kb(STORAGE_DIR, ds, result, table_name=table_name(ds))
-            logger.info(
-                f"[kb] KB file store updated | db={DB_FILE} | table={table_name(ds)} | "
-                f"docs={kb_result.get('documents_written', 0)} | success={kb_result.get('success')}"
-            )
-            logger.info(f"[kb] persist_kb elapsed={time.time()-t_kb:.3f}s")
+            dirs      = get_user_dirs(user_id)
+            kb_result = persist_kb(dirs["kb"], dataset_id, result, table_name=table_name(user_id, dataset_id), kb_manager=get_user_kb_manager(user_id))
+            logger.info(f"[kb] KB updated | user={user_id} | docs={kb_result.get('documents_written', 0)}")
         except Exception as e:
             logger.warning(f"[kb] persist_kb failed (non-critical): {e}")
 
-        # Invalidate KB Manager cache so next query sees the new table
-        if KB_MANAGER:
+        # Invalidate user's KB Manager cache
+        kb = get_user_kb_manager(user_id)
+        if kb:
             try:
-                t_cache = time.time()
-                KB_MANAGER.clear_cache()
-                logger.info("[kb] KB Manager cache cleared after schema approval")
-                logger.info(f"[kb] cache clear elapsed={time.time()-t_cache:.3f}s")
+                kb.clear_cache()
+                logger.info(f"[kb] KB Manager cache cleared | user={user_id}")
             except Exception as e:
                 logger.warning(f"[kb] cache clear failed (non-critical): {e}")
 
         if os.getenv("KB_REFRESH_ON_APPROVAL", "0").lower() in {"1", "true", "yes"}:
-            t_refresh = time.time()
-            maybe_refresh_kb()
-            logger.info(f"[kb] maybe_refresh_kb elapsed={time.time()-t_refresh:.3f}s")
+            maybe_refresh_kb(user_id)
 
         logger.info(f"[poc1] approve total elapsed={time.time()-t_approve:.3f}s")
-
         return jsonify({
             "success": True,
             "version_file": versioned_name,
             "contract_created": is_new_contract,
         })
     except Exception as e:
-        logger.error(f"Schema approval (poc1) failed for dataset={ds}: {e}", exc_info=True)
+        logger.error(f"Schema approval (poc1) failed for dataset={dataset_id} user={user_id}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/poc1/versions")
 def poc1_versions():
-    ds = STATE["dataset_id"]
-    if not ds:
+    user_id    = get_current_user_id()
+    dataset_id = session.get("dataset_id")
+    if not dataset_id:
         return jsonify({"error": "No active dataset"}), 400
-    return jsonify(list_versions(ds, "poc1"))
+    return jsonify(list_versions(user_id, dataset_id, "poc1"))
 
 
 # ── Tab 3: SODA YAML (POC 7) ──────────────────────────────────────────────────
 @app.route("/api/poc7/run", methods=["POST"])
 def run_poc7():
-    ds = STATE["dataset_id"]
-    if not ds:
+    user_id    = get_current_user_id()
+    dataset_id = session.get("dataset_id")
+    if not dataset_id:
         return jsonify({"error": "Upload a CSV first"}), 400
 
-    schema_profile = load_latest(ds, "poc1")
+    schema_profile = load_latest(user_id, dataset_id, "poc1")
     if not schema_profile:
         return jsonify({"error": "Tune - Schema Intelligence must be approved first (Tab 2 → Approve & Save)."}), 400
 
     try:
-        schema_profile = enrich_with_bronze_datatypes(schema_profile, table_name(ds))
+        tbl            = table_name(user_id, dataset_id)
+        bare           = bare_table_name(dataset_id)
+        schema_profile = enrich_with_bronze_datatypes(schema_profile, tbl)
         schema_profile = strip_audit_columns(schema_profile)
-        schema_json = json.dumps(schema_profile, indent=2)
-        prompt = poc7.PROMPT.replace("{table}", table_name(ds)).replace("{schema_profile}", schema_json)
-        logger.info(f"[poc7] using approved poc1_latest.json | dataset={ds}")
+        schema_json    = json.dumps(schema_profile, indent=2)
+        prompt         = poc7.PROMPT.replace("{table}", bare).replace("{schema_profile}", schema_json)
+        logger.info(f"[poc7] using approved poc1_latest.json | dataset={dataset_id} | user={user_id}")
 
         yaml_output = ask(prompt, poc7.SYSTEM).strip()
         if yaml_output.startswith("```"):
@@ -856,17 +940,18 @@ def run_poc7():
             1 for line in yaml_output.split("\n")
             if line.strip().startswith("- ") and not line.strip().startswith("- value")
         )
-        logger.info(f"[poc7] YAML generated | checks={check_count}")
-        return jsonify({"yaml": yaml_output, "check_count": check_count, "dataset_id": ds})
+        logger.info(f"[poc7] YAML generated | checks={check_count} | user={user_id}")
+        return jsonify({"yaml": yaml_output, "check_count": check_count, "dataset_id": dataset_id})
     except Exception as e:
-        logger.error(f"DQ YAML generation (poc7) failed for dataset={ds}: {e}", exc_info=True)
+        logger.error(f"DQ YAML generation (poc7) failed for dataset={dataset_id} user={user_id}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/poc7/approve", methods=["POST"])
 def approve_poc7():
-    ds = STATE["dataset_id"]
-    if not ds:
+    user_id    = get_current_user_id()
+    dataset_id = session.get("dataset_id")
+    if not dataset_id:
         return jsonify({"error": "No active dataset"}), 400
     try:
         body = request.get_json()
@@ -877,6 +962,20 @@ def approve_poc7():
         if not yaml_text:
             return jsonify({"error": "YAML content is empty"}), 400
 
+        # Replace bare table names in fail queries with schema-qualified names
+        bare = bare_table_name(dataset_id)
+        tbl  = table_name(user_id, dataset_id)
+        schema = get_user_schema()
+        
+        # Replace both "FROM bare_table" and "FROM schema.bare_table" patterns
+        # Use word boundaries to avoid partial matches
+        yaml_text = re.sub(
+            rf"(\bFROM\s+){re.escape(bare)}(\b)",
+            rf"\1{tbl}\2",
+            yaml_text,
+            flags=re.IGNORECASE
+        )
+
         repaired_yaml = sanitize_soda_yaml_text(yaml_text)
         try:
             yaml.safe_load(repaired_yaml)
@@ -884,8 +983,8 @@ def approve_poc7():
             logger.warning(f"[poc7] YAML still invalid after sanitize; saving original: {e}")
             repaired_yaml = yaml_text
 
-        versioned_name = save_versioned(ds, "soda", repaired_yaml, ext="yaml")
-        logger.info(f"[poc7] YAML approved and saved | dataset={ds} | file={versioned_name}")
+        versioned_name = save_versioned(user_id, dataset_id, "soda", repaired_yaml, ext="yaml")
+        logger.info(f"[poc7] YAML approved and saved | dataset={dataset_id} | user={user_id} | file={versioned_name}")
 
         check_count = sum(
             1 for line in yaml_text.split("\n")
@@ -893,42 +992,46 @@ def approve_poc7():
         )
         return jsonify({"success": True, "version_file": versioned_name, "check_count": check_count})
     except Exception as e:
-        logger.error(f"YAML approval (poc7) failed for dataset={ds}: {e}", exc_info=True)
+        logger.error(f"YAML approval (poc7) failed for dataset={dataset_id} user={user_id}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
-# ── Tab 4: Data Quality (real SODA checks via DuckDB) ────────────────────────
+# ── Tab 4: Data Quality (real SODA checks via DuckDB) ─────────────────────────
 @app.route("/api/poc2/run", methods=["POST"])
 def run_poc2():
-    ds = STATE["dataset_id"]
-    if not ds or not current_csv_path():
+    user_id    = get_current_user_id()
+    dataset_id = session.get("dataset_id")
+    if not dataset_id or not current_csv_path(user_id, dataset_id):
         return jsonify({"error": "Upload a CSV first"}), 400
 
-    yaml_path = os.path.join(dataset_dir(ds), "soda_latest.yaml")
+    yaml_path = os.path.join(dataset_dir(user_id, dataset_id), "soda_latest.yaml")
     if not os.path.exists(yaml_path):
         return jsonify({"error": "Generate and approve Quality Checks YAML (Tab 3) first"}), 400
 
     try:
-        tbl    = table_name(ds)
-        result = run_soda_checks_from_yaml(DB_FILE, yaml_path, tbl)
-        result["_dataset_id"] = ds
-        save_versioned(ds, "poc2", result)
+        tbl    = table_name(user_id, dataset_id)
+        bare   = bare_table_name(dataset_id)
+        result = run_soda_checks_from_yaml(DB_FILE, yaml_path, tbl, bare_table=bare)
+        result["_dataset_id"] = dataset_id
+        save_versioned(user_id, dataset_id, "poc2", result)
         return jsonify(result)
     except Exception as e:
-        logger.error(f"Data quality check run (poc2) failed for dataset={ds}: {e}", exc_info=True)
+        logger.error(f"Data quality check run (poc2) failed for dataset={dataset_id} user={user_id}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
-# ── Tab 5: Schema Validation (POC 3a) ────────────────────────────────────────
+# ── Tab 5: Schema Validation (POC 3a) ─────────────────────────────────────────
 @app.route("/api/poc3a/run", methods=["POST"])
 def run_poc3a():
-    ds          = STATE["dataset_id"]
-    poc1_schema = ds and load_latest(ds, "poc1")
+    user_id     = get_current_user_id()
+    dataset_id  = session.get("dataset_id")
+    poc1_schema = dataset_id and load_latest(user_id, dataset_id, "poc1")
     if not poc1_schema:
         return jsonify({"error": "Play Tune (Tab 2) first"}), 400
     try:
-        poc1_schema = enrich_with_bronze_datatypes(poc1_schema, table_name(ds))
-        cpath = contract_path(ds)
+        tbl         = table_name(user_id, dataset_id)
+        poc1_schema = enrich_with_bronze_datatypes(poc1_schema, tbl)
+        cpath       = contract_path(user_id, dataset_id)
         if not os.path.exists(cpath):
             contract = {
                 col["column"]: col.get("bronze_datatype") or col["data_type"]
@@ -939,83 +1042,88 @@ def run_poc3a():
         with open(cpath) as f:
             contract = json.load(f)
 
-        result                  = compare_contract_to_schema(contract, poc1_schema)
-        result["_dataset_id"]   = ds
+        result                   = compare_contract_to_schema(contract, poc1_schema)
+        result["_dataset_id"]    = dataset_id
         result["_contract_file"] = os.path.basename(cpath)
-        save_versioned(ds, "poc3a", result)
+        save_versioned(user_id, dataset_id, "poc3a", result)
         return jsonify(result)
     except Exception as e:
-        logger.error(f"Schema validation (poc3a) failed for dataset={ds}: {e}", exc_info=True)
+        logger.error(f"Schema validation (poc3a) failed for dataset={dataset_id} user={user_id}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
-# ── Tab 6: Schema Change Discovery (POC 3b) ──────────────────────────────────
+# ── Tab 6: Schema Change Discovery (POC 3b) ───────────────────────────────────
 @app.route("/api/poc3b/run", methods=["POST"])
 def run_poc3b():
-    ds             = STATE["dataset_id"]
-    current_schema = ds and load_latest(ds, "poc1")
+    user_id        = get_current_user_id()
+    dataset_id     = session.get("dataset_id")
+    current_schema = dataset_id and load_latest(user_id, dataset_id, "poc1")
     if not current_schema:
         return jsonify({"error": "Play Tune (Tab 2) first"}), 400
     try:
-        versions = list_versions(ds, "poc1")
+        versions = list_versions(user_id, dataset_id, "poc1")
         if len(versions) < 2:
             result = {
                 "change_detected": False,
                 "summary": "First profiled upload — no previous snapshot to compare against.",
                 "new_columns": [], "dropped_columns": [], "possible_renames": [],
                 "type_changes": [], "reordered": False, "recommended_actions": [],
-                "is_first_run": True, "_dataset_id": ds,
+                "is_first_run": True, "_dataset_id": dataset_id,
             }
-            save_versioned(ds, "poc3b", result)
+            save_versioned(user_id, dataset_id, "poc3b", result)
             return jsonify(result)
 
         previous_file = versions[-2]["file"]
-        with open(os.path.join(dataset_dir(ds), previous_file)) as f:
+        with open(os.path.join(dataset_dir(user_id, dataset_id), previous_file)) as f:
             previous_schema = json.load(f)
 
         result = compare_schema_snapshots(previous_schema, current_schema, previous_file=previous_file)
-        result["_dataset_id"] = ds
-        save_versioned(ds, "poc3b", result)
+        result["_dataset_id"] = dataset_id
+        save_versioned(user_id, dataset_id, "poc3b", result)
         return jsonify(result)
     except Exception as e:
-        logger.error(f"Schema change detection (poc3b) failed for dataset={ds}: {e}", exc_info=True)
+        logger.error(f"Schema change detection (poc3b) failed for dataset={dataset_id} user={user_id}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
-# ── Tab 7 / Tab 8: NL → SQL Query Builder (POC 8) ────────────────────────────
+# ── Tab 7: NL → SQL Query Builder (POC 8) ─────────────────────────────────────
 @app.route("/api/poc8/query", methods=["POST"])
 def run_poc8_query():
-    ds = STATE["dataset_id"]
-    body     = request.get_json(silent=True) or {}
-    question = (body.get("question") or "").strip()
+    user_id    = get_current_user_id()
+    dataset_id = session.get("dataset_id")
+    dirs       = get_user_dirs(user_id)
+    body       = request.get_json(silent=True) or {}
+    question   = (body.get("question") or "").strip()
     if not question:
         return jsonify({"error": "Please enter a question"}), 400
 
     try:
-        if KB_MANAGER:
-            KB_MANAGER.load_catalog(force_refresh=False)
+        kb = get_user_kb_manager(user_id)
+        if kb:
+            poc8.set_kb_manager(kb)
+            kb.load_catalog(force_refresh=False)
+
         result = poc8.question_to_sql(
             db_file=DB_FILE,
-            ds=ds,
-            storage_dir=STORAGE_DIR,
+            ds=dataset_id,
+            storage_dir=dirs["kb"],
             question=question,
             ask_json_fn=ask_json,
         )
 
         if result.get("ok") and result.get("sql"):
-            # Save successful query as an example pair
             try:
                 if result.get("tables"):
-                    upsert_example_pair(
-                        STORAGE_DIR, ds or "kb", question,
+                        upsert_example_pair(
+                        dirs["kb"], dataset_id or "kb", question,
                         result.get("sql", ""),
                         result.get("tables", []) or [],
                         tags=["poc8", "tab8", "auto_saved"],
+                        kb_manager=get_user_kb_manager(user_id),
                     )
             except Exception as e:
                 logger.warning(f"[poc8] example pair save skipped: {e}")
 
-            # Save join edges discovered during query
             try:
                 join_edges = result.get("join_paths", []) or []
                 if join_edges:
@@ -1023,33 +1131,33 @@ def run_poc8_query():
                     for edge in join_edges:
                         left_col, right_col = _parse_join_label(str(edge.get("join_column") or ""))
                         normalized.append({
-                            "left_table":  edge.get("left"),
-                            "left_column": left_col,
-                            "right_table": edge.get("right"),
+                            "left_table":   edge.get("left"),
+                            "left_column":  left_col,
+                            "right_table":  edge.get("right"),
                             "right_column": right_col,
-                            "confidence": float(edge.get("confidence") or 0.5),
-                            "reason":  "from_tab8_query",
-                            "source":  "tab8",
+                            "confidence":   float(edge.get("confidence") or 0.5),
+                            "reason":       "from_tab8_query",
+                            "source":       "tab8",
                         })
-                    upsert_join_edges(STORAGE_DIR, normalized)
+                    upsert_join_edges(dirs["kb"], normalized, kb_manager=get_user_kb_manager(user_id))
             except Exception as e:
                 logger.warning(f"[poc8] join edge save skipped: {e}")
 
-        result["_dataset_id"] = ds or "kb"
+        result["_dataset_id"] = dataset_id or "kb"
         return jsonify(result)
     except Exception as e:
-        logger.error(f"NL→SQL query generation failed for dataset={ds}: {e}", exc_info=True)
+        logger.error(f"NL→SQL query generation failed for dataset={dataset_id} user={user_id}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
-# ── KB routes ─────────────────────────────────────────────────────────────────
-
+# ── KB routes ──────────────────────────────────────────────────────────────────
 @app.route("/api/kb/status", methods=["GET"])
 def kb_status():
-    """Get KB Manager status and statistics."""
+    user_id = get_current_user_id()
     try:
-        if KB_MANAGER:
-            stats = KB_MANAGER.get_stats()
+        kb = get_user_kb_manager(user_id)
+        if kb:
+            stats = kb.get_stats()
             return jsonify({"success": True, "status": "✅ KB Ready", "stats": stats})
         return jsonify({"success": False, "status": "❌ KB Not Initialized"}), 500
     except Exception as e:
@@ -1059,17 +1167,17 @@ def kb_status():
 
 @app.route("/api/kb/stats", methods=["GET"])
 def kb_stats():
-    """Get KB statistics (alias for /api/kb/status)."""
     return kb_status()
 
 
 @app.route("/api/kb/catalog", methods=["GET"])
 def kb_catalog_route():
-    """Get the full catalog of registered tables."""
+    user_id = get_current_user_id()
     try:
-        if not KB_MANAGER:
+        kb = get_user_kb_manager(user_id)
+        if not kb:
             return jsonify({"error": "KB Manager not initialized"}), 500
-        catalog = KB_MANAGER.load_catalog(force_refresh=True)
+        catalog = kb.load_catalog(force_refresh=True)
         return jsonify({
             "success": True,
             "tables": list(catalog.keys()),
@@ -1083,11 +1191,12 @@ def kb_catalog_route():
 
 @app.route("/api/kb/join-graph", methods=["GET"])
 def kb_join_graph():
-    """Get the join graph."""
+    user_id = get_current_user_id()
     try:
-        if not KB_MANAGER:
+        kb = get_user_kb_manager(user_id)
+        if not kb:
             return jsonify({"error": "KB Manager not initialized"}), 500
-        joins = KB_MANAGER.load_joins(force_refresh=True)
+        joins = kb.load_joins(force_refresh=True)
         edges = []
         for src, targets in joins.items():
             for tgt, col in targets:
@@ -1100,13 +1209,15 @@ def kb_join_graph():
 
 @app.route("/api/kb/refresh", methods=["POST"])
 def refresh_kb_route():
-    """Force a full KB refresh from DuckDB."""
-    ds = STATE["dataset_id"]
+    user_id    = get_current_user_id()
+    dataset_id = session.get("dataset_id")
+    dirs       = get_user_dirs(user_id)
     try:
-        result = refresh_kb_from_duckdb(DB_FILE, STORAGE_DIR)
-        if KB_MANAGER:
-            KB_MANAGER.clear_cache()
-        result["_dataset_id"] = ds
+        result = refresh_kb_from_duckdb(DB_FILE, dirs["kb"], kb_manager=get_user_kb_manager(user_id))
+        kb = get_user_kb_manager(user_id)
+        if kb:
+            kb.clear_cache()
+        result["_dataset_id"] = dataset_id
         return jsonify(result)
     except Exception as e:
         logger.error(f"KB refresh failed: {e}", exc_info=True)
@@ -1115,23 +1226,23 @@ def refresh_kb_route():
 
 @app.route("/api/kb/build", methods=["POST"])
 def kb_build():
-    """
-    Register the current dataset's approved schema into the KB.
-    Called automatically after Tab 2 approval (also callable manually).
-    """
-    ds = STATE["dataset_id"]
-    if not ds:
+    user_id    = get_current_user_id()
+    dataset_id = session.get("dataset_id")
+    if not dataset_id:
         return jsonify({"error": "No active dataset"}), 400
     try:
-        poc1_schema = load_latest(ds, "poc1")
+        poc1_schema = load_latest(user_id, dataset_id, "poc1")
         if not poc1_schema:
             return jsonify({"error": "No approved schema found — complete Tab 2 first"}), 400
 
-        result = persist_kb(STORAGE_DIR, ds, poc1_schema, table_name=table_name(ds))
-        if KB_MANAGER:
-            KB_MANAGER.clear_cache()
-        logger.info(f"[kb] manual KB build done | dataset={ds} | docs={result.get('documents_written', 0)}")
+        dirs      = get_user_dirs(user_id)
+        tbl       = table_name(user_id, dataset_id)
+        result = persist_kb(dirs["kb"], dataset_id, poc1_schema, table_name=table_name(user_id, dataset_id), kb_manager=get_user_kb_manager(user_id))
+        kb        = get_user_kb_manager(user_id)
+        if kb:
+            kb.clear_cache()
+        logger.info(f"[kb] manual KB build done | dataset={dataset_id} | user={user_id} | docs={result.get('documents_written', 0)}")
         return jsonify({"success": True, **result})
     except Exception as e:
-        logger.error(f"[kb] build failed for dataset={ds}: {e}", exc_info=True)
+        logger.error(f"[kb] build failed for dataset={dataset_id} user={user_id}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500

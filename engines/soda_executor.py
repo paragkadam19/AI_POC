@@ -83,13 +83,21 @@ def sanitize_soda_yaml_text(yaml_text: str) -> str:
     return "\n".join(out)
 
 
-def parse_soda_checks(yaml_content: Dict[str, Any], table_name: str) -> List[Dict[str, Any]]:
-    """Extract check definitions from SODA YAML."""
+def parse_soda_checks(yaml_content: Dict[str, Any], table_name: str, full_table_name: str = None) -> List[Dict[str, Any]]:
+    """Extract check definitions from SODA YAML.
+    
+    table_name here is the bare table name used in YAML key matching
+    (e.g. 'orders', not 'parag.orders').
+    
+    full_table_name is the fully qualified name for SQL generation
+    (e.g. 'parag.orders'). If not provided, falls back to table_name.
+    """
     checks = []
 
     if not yaml_content:
         return checks
 
+    # Use bare table_name for YAML key matching
     target_key = f"checks for {table_name}"
     checks_list = None
     for key, value in yaml_content.items():
@@ -99,6 +107,9 @@ def parse_soda_checks(yaml_content: Dict[str, Any], table_name: str) -> List[Dic
 
     if checks_list is None or not isinstance(checks_list, list):
         return checks
+
+    # Use full_table_name for SQL generation, fallback to table_name
+    sql_table = full_table_name or table_name
 
     check_id_counter = 1
     for check_def in checks_list:
@@ -132,7 +143,7 @@ def parse_soda_checks(yaml_content: Dict[str, Any], table_name: str) -> List[Dic
         valid_values = extra.get("valid values") if isinstance(extra, dict) else None
 
         check_type, sql_query, expected = parse_check_string(
-            check_str, table_name, valid_values=valid_values, extra=extra
+            check_str, sql_table, valid_values=valid_values, extra=extra
         )
 
         if check_type:
@@ -151,7 +162,11 @@ def parse_soda_checks(yaml_content: Dict[str, Any], table_name: str) -> List[Dic
 def parse_check_string(check_str: str, table_name: str,
                         valid_values: Optional[List[str]] = None,
                         extra: Optional[Dict] = None) -> Tuple[str, str, str]:
-    """Parse a single SODA check string into type, SQL query, and expected result."""
+    """Parse a single SODA check string into type, SQL query, and expected result.
+    
+    table_name here is the fully qualified name used in SQL
+    (e.g. 'parag.orders' for multi-tenant, or just 'orders' for single user).
+    """
 
     check_str = check_str.strip()
     extra = extra or {}
@@ -183,7 +198,7 @@ def parse_check_string(check_str: str, table_name: str,
                 f"{operator} {value}"
             )
 
-    # 3. invalid_count (enum/categorical)
+    # 3. invalid_count (enum/categorical/regex)
     if "invalid_count" in check_str:
         match = re.match(r"invalid_count\(([\w\-\"']+)\)\s*([<>=!]+)\s*(\d+)", check_str)
         if match:
@@ -209,7 +224,6 @@ def parse_check_string(check_str: str, table_name: str,
                 sql = f'SELECT COUNT(*) FROM {table_name} WHERE 1=0'
 
             return ("invalid_count", sql, f"{operator} {value}")
-
 
     # 4. duplicate_count
     if "duplicate_count" in check_str:
@@ -255,8 +269,7 @@ def parse_check_string(check_str: str, table_name: str,
                 f"{operator} {value}"
             )
 
-
-    # avg check
+    # 6. avg check
     if re.search(r"avg\(", check_str):
         match = re.match(r"avg\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.: ]+)", check_str)
         if match:
@@ -268,9 +281,9 @@ def parse_check_string(check_str: str, table_name: str,
                 "avg_check",
                 f'SELECT AVG("{col_name}") FROM {table_name}',
                 f"{operator} {value}"
-            )        
+            )
 
-    # between check
+    # 7. between check
     if re.search(r"between\(", check_str):
         match = re.match(r"between\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.: ]+)\s+and\s+([\w\-\.: ]+)", check_str, re.IGNORECASE)
         if match:
@@ -282,7 +295,7 @@ def parse_check_string(check_str: str, table_name: str,
                 "= 0"
             )
 
-    # freshness check
+    # 8. freshness check
     if re.search(r"freshness\(", check_str):
         match = re.match(r"freshness\(([\w\-\"']+)\)\s*([<>=!]+)\s*(\d+)\s*(d|h|m)?", check_str, re.IGNORECASE)
         if match:
@@ -297,9 +310,9 @@ def parse_check_string(check_str: str, table_name: str,
                 "freshness_check",
                 f'SELECT COUNT(*) FROM {table_name} WHERE TRY_CAST("{col_name}" AS DATE) < CURRENT_DATE - INTERVAL {value} {interval}',
                 "= 0"
-            )                
+            )
 
-    # null_percent check
+    # 9. missing_percent check
     if "missing_percent" in check_str:
         match = re.match(r"missing_percent\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.]+)", check_str)
         if match:
@@ -313,7 +326,7 @@ def parse_check_string(check_str: str, table_name: str,
                 f"{operator} {value}"
             )
 
-    # uniqueness_ratio check
+    # 10. uniqueness_ratio check
     if "uniqueness_ratio" in check_str:
         match = re.match(r"uniqueness_ratio\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.]+)", check_str)
         if match:
@@ -326,9 +339,8 @@ def parse_check_string(check_str: str, table_name: str,
                 f'SELECT ROUND(COUNT(DISTINCT "{col_name}") * 1.0 / COUNT(*), 4) FROM {table_name}',
                 f"{operator} {value}"
             )
-                    
 
-    # 6. min/max (numeric or date range)
+    # 11. min/max (numeric or date range)
     if re.search(r"min\(", check_str):
         match = re.match(r"min\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.: ]+)", check_str)
         if match:
@@ -359,18 +371,11 @@ def parse_check_string(check_str: str, table_name: str,
                 f"{operator} {value}"
             )
 
-    # 6. failed rows (NEW!)
+    # 12. failed rows
     if check_str == "failed rows":
         fail_query = extra.get("fail query", "")
         if fail_query:
-            # Clean up the query
             fail_query = fail_query.strip()
-            fail_query = re.sub(
-                r"\bFROM\s+dataset\b",
-                f"FROM {table_name}",
-                fail_query,
-                flags=re.IGNORECASE,
-            )
             fail_query = re.sub(
                 r"\bFROM\s+dataset\b",
                 f"FROM {table_name}",
@@ -391,45 +396,26 @@ def parse_check_string(check_str: str, table_name: str,
 def _normalize_duckdb_regex(sql: str) -> str:
     """
     Best-effort cleanup for regex expressions.
-
-    The prompt should already generate DuckDB-safe regex syntax. This helper
-    now only performs light normalization for legacy inputs.
+    The prompt should already generate DuckDB-safe regex syntax.
     """
     return sql
 
 
 def _normalize_duckdb_dates(sql: str) -> str:
-    """
-    Normalize common date function spellings to DuckDB syntax.
-    """
+    """Normalize common date function spellings to DuckDB syntax."""
     if not sql:
         return sql
-    sql = re.sub(
-        r"\bDATEDIFF\s*\(\s*year\s*,",
-        "date_diff('year',",
-        sql,
-        flags=re.IGNORECASE,
-    )
-    sql = re.sub(
-        r"\bDATEDIFF\s*\(\s*month\s*,",
-        "date_diff('month',",
-        sql,
-        flags=re.IGNORECASE,
-    )
-    sql = re.sub(
-        r"\bDATEDIFF\s*\(\s*day\s*,",
-        "date_diff('day',",
-        sql,
-        flags=re.IGNORECASE,
-    )
+    sql = re.sub(r"\bDATEDIFF\s*\(\s*year\s*,",  "date_diff('year',",  sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bDATEDIFF\s*\(\s*month\s*,", "date_diff('month',", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bDATEDIFF\s*\(\s*day\s*,",   "date_diff('day',",   sql, flags=re.IGNORECASE)
     return sql
 
 
 def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Execute all checks against DuckDB and return results.
+    table_name is the fully qualified name (e.g. parag.orders).
     """
-
     conn = duckdb.connect(db_file, read_only=True)
 
     results = []
@@ -437,31 +423,27 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
     failed_count = 0
 
     for check in checks:
-        check_id = check["check_id"]
+        check_id   = check["check_id"]
         check_name = check["check_name"]
         check_type = check["type"]
-        sql_query = check["query"]
-        expected = check["expected"]
+        sql_query  = check["query"]
+        expected   = check["expected"]
 
         try:
             logger.info(
                 f"[soda] executing check | id={check_id} name={check_name} type={check_type} "
                 f"sql={sql_query} expected={expected}"
             )
-            cursor = conn.execute(sql_query)
-            result = cursor.fetchall()
+            cursor      = conn.execute(sql_query)
+            result      = cursor.fetchall()
             description = cursor.description
-            
+
             if check_type == "failed_rows":
-                # For failed rows: count the returned rows
-                # If 0 rows → PASS (no violations)
-                # If > 0 rows → FAIL (violations found)
                 actual_value = len(result) if result else 0
-                passed = actual_value == 0
-                failed_rows = _rows_to_dicts(description, result, limit=3)
-                
+                passed       = actual_value == 0
+                failed_rows  = _rows_to_dicts(description, result, limit=3)
+
                 if not passed:
-                    # Show the failing data
                     error_msg = f"Found {actual_value} rows violating rule:\n"
                     for i, row in enumerate(failed_rows):
                         error_msg += f"  Row {i+1}: {row}\n"
@@ -474,7 +456,6 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
                     f"status={'PASS' if passed else 'FAIL'}"
                 )
             else:
-                # For other checks: evaluate the result
                 actual_value = result[0][0] if result else None
                 passed, error_msg = evaluate_check(actual_value, expected, check_type)
                 logger.info(
@@ -487,16 +468,15 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
             else:
                 failed_count += 1
 
-            # Make actual_value JSON-serializable
             results.append({
-                "check_id": check_id,
-                "check_name": check_name,
-                "type": check_type,
-                "passed": passed,
+                "check_id":     check_id,
+                "check_name":   check_name,
+                "type":         check_type,
+                "passed":       passed,
                 "actual_value": make_serializable(actual_value),
-                "expected": expected,
+                "expected":     expected,
                 "error_message": error_msg,
-                "failed_rows": make_serializable(failed_rows) if check_type == "failed_rows" else [],
+                "failed_rows":  make_serializable(failed_rows) if check_type == "failed_rows" else [],
             })
 
         except Exception as e:
@@ -507,25 +487,24 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
                 exc_info=True,
             )
             results.append({
-                "check_id": check_id,
-                "check_name": check_name,
-                "type": check_type,
-                "passed": False,
+                "check_id":     check_id,
+                "check_name":   check_name,
+                "type":         check_type,
+                "passed":       False,
                 "actual_value": None,
-                "expected": expected,
+                "expected":     expected,
                 "error_message": f"Query failed: {str(e)}",
-                "failed_rows": [],
+                "failed_rows":  [],
             })
 
     conn.close()
 
-    # Ensure entire result is JSON-serializable
     return make_serializable({
-        "audit_passed": failed_count == 0,
-        "total_checks": len(checks),
+        "audit_passed":  failed_count == 0,
+        "total_checks":  len(checks),
         "passed_checks": passed_count,
         "failed_checks": failed_count,
-        "checks": results
+        "checks":        results
     })
 
 
@@ -546,9 +525,8 @@ def evaluate_check(actual_value: Any, expected_str: str, check_type: str) -> Tup
     if expected_value in {"today", "current_date"}:
         expected_value = date.today().isoformat()
 
-    # Date-ish expected values are compared lexicographically after normalization.
     if re.match(r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?$", str(expected_value)):
-        actual_str = actual_value.isoformat() if isinstance(actual_value, (date, datetime)) else str(actual_value)
+        actual_str        = actual_value.isoformat() if isinstance(actual_value, (date, datetime)) else str(actual_value)
         expected_str_norm = str(expected_value)
         if operator == ">":
             passed = actual_str > expected_str_norm
@@ -571,8 +549,8 @@ def evaluate_check(actual_value: Any, expected_str: str, check_type: str) -> Tup
 
     try:
         expected_value = float(expected_value) if '.' in expected_value else int(expected_value)
-        actual_value = float(actual_value)
-    except:
+        actual_value   = float(actual_value)
+    except Exception:
         return False, f"Could not convert to number: actual={actual_value}, expected={expected_value}"
 
     if operator == ">":
@@ -596,23 +574,37 @@ def evaluate_check(actual_value: Any, expected_str: str, check_type: str) -> Tup
     return True, None
 
 
-def run_soda_checks_from_yaml(db_file: str, yaml_path: str, table_name: str) -> Dict[str, Any]:
+def run_soda_checks_from_yaml(
+    db_file: str,
+    yaml_path: str,
+    table_name: str,
+    bare_table: str = None
+) -> Dict[str, Any]:
     """
     End-to-end: load YAML → parse checks → execute → return results.
+
+    table_name : fully qualified name used in SQL (e.g. parag.orders)
+    bare_table : bare name used in YAML key matching (e.g. orders)
+                 If not provided, falls back to table_name.
     """
     yaml_content = load_soda_yaml(yaml_path)
-    checks = parse_soda_checks(yaml_content, table_name)
+
+    # YAML keys use bare table name: "checks for orders"
+    # SQL queries use fully qualified name: parag.orders
+    yaml_table = bare_table or table_name
+    checks     = parse_soda_checks(yaml_content, yaml_table, full_table_name=table_name)
 
     if not checks:
         return {
             "audit_passed": False,
-            "error": f"No checks found in {yaml_path} for table {table_name}",
+            "error": f"No checks found in {yaml_path} for table {yaml_table}",
             "total_checks": 0,
             "passed_checks": 0,
             "failed_checks": 0,
             "checks": []
         }
 
+    # Execute SQL against fully qualified table
     results = execute_checks(db_file, table_name, checks)
 
     return results

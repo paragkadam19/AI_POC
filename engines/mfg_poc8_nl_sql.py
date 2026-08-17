@@ -353,6 +353,13 @@ def _repair_sql_column_names(sql: str, catalog: Dict[str, Any], tables: List[str
         return sql
 
     table_names = {str(t).strip().lower() for t in tables if t}
+    # also add bare names and schema-qualified parts to protect them
+    for t in list(table_names):
+        if "." in t:
+            table_names.add(t.split(".", 1)[1])  # add bare name
+        # add all aliases (single letters like a, s, addr, ls)
+    # protect schema prefixes
+    table_names.update({t.split(".")[0] for t in table_names if "." in t})
     known_columns = []
     for table_name in tables:
         meta = catalog.get(table_name) or {}
@@ -1023,10 +1030,10 @@ Generate the SQL query."""
             }
 
         logger.info(f"[poc8] SQL generated: {sql[:80]}...")
-        repaired_sql = _repair_sql_column_names(sql, catalog, final_tables)
-        if repaired_sql != sql:
-            logger.info(f"[poc8] SQL repaired: {repaired_sql[:80]}...")
-            sql = repaired_sql
+        # repaired_sql = _repair_sql_column_names(sql, catalog, final_tables)
+        # if repaired_sql != sql:
+        #     logger.info(f"[poc8] SQL repaired: {repaired_sql[:80]}...")
+        #     sql = repaired_sql
 
         # 6. EXECUTE
         try:
@@ -1051,7 +1058,7 @@ Generate the SQL query."""
                     final_tables,
                     ask_json_fn,
                 )
-                repaired_sql = _repair_sql_column_names(repaired_sql, catalog, final_tables)
+                # repaired_sql = _repair_sql_column_names(repaired_sql, catalog, final_tables)
                 if repaired_sql and repaired_sql != sql:
                     logger.info(f"[poc8] retrying with repaired SQL: {repaired_sql[:120]}...")
                     conn = duckdb.connect(db_file, read_only=True)
