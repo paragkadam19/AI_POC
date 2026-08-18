@@ -88,6 +88,26 @@ main { max-width: 1100px; margin: 28px auto; padding: 0 20px; }
 .panel.active { display: block; animation: fadein .2s ease; }
 @keyframes fadein { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
 
+#panel-schema {
+  width: min(1600px, calc(100vw - 40px));
+  margin-left: calc(50% - 50vw + 20px);
+  margin-right: calc(50% - 50vw + 20px);
+}
+
+#panel-kb {
+  width: min(1600px, calc(100vw - 40px));
+  margin-left: calc(50% - 50vw + 20px);
+  margin-right: calc(50% - 50vw + 20px);
+}
+
+#panel-schema .card {
+  width: 100%;
+}
+
+#panel-kb .card {
+  width: 100%;
+}
+
 .card {
   background: #fff; border-radius: var(--radius);
   box-shadow: var(--shadow); padding: 28px;
@@ -127,6 +147,31 @@ table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th { background: var(--steel); color: #fff; text-align: left; padding: 9px 12px; font-weight: 600; white-space: nowrap; }
 td { padding: 8px 12px; border-top: 1px solid var(--gray2); vertical-align: top; }
 tr:nth-child(even) td { background: var(--gray1); }
+
+/* Tune - Schema Intelligence controls */
+.schema-input {
+  width: 100%;
+  border: 1px solid var(--gray2);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 13px;
+  background: #fff;
+}
+.schema-input:focus {
+  outline: none;
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(37,99,235,.12);
+}
+.schema-select {
+  min-width: 120px;
+  font: inherit;
+  font-size: 13px;
+  padding: 8px 10px;
+  border: 1px solid var(--gray2);
+  border-radius: 6px;
+  background: #fff;
+}
 
 /* ── stat strip ── */
 .stat-row, .summary-strip { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
@@ -193,6 +238,7 @@ tr:nth-child(even) td { background: var(--gray1); }
 .ev-card .obs { font-weight: 600; font-size: 13px; color: var(--ink); }
 .ev-card .sig { font-size: 12px; color: var(--dgray); margin-top: 4px; }
 .ev-card .sig::before { content: "→ "; color: var(--teal); }
+.ev-card.chart-card .sig::before { content: ""; }
 
 .fail-card {
   border: 1px solid var(--gray2); border-radius: 8px;

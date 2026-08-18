@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>BAJAJTech.AI Data Resonance</title>
+  <link rel="stylesheet" href="style.css"/>
+  <link rel="icon" type="image/png" href="bajaj_logo.png"/>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <img src="bajaj_techai.png" alt="Bajaj Tech AI" class="logo"/>
+    <div>
+      <h1>Data Resonance</h1>
+      <p>AI-Powered Data Intelligence</p>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px"> <div class="status-pill" id="statusBadge">checking…</div> <span id="welcomeUser" style="font-size:13px;color:rgba(255,255,255,.8);font-weight:600"></span> <button onclick="doLogout()" style="font:inherit;font-size:13px;font-weight:600;padding:6px 14px;border-radius:8px; border:1px solid rgba(255,255,255,.3);background:rgba(255,255,255,.1); color:#fff;cursor:pointer"> Logout </button> </div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-tab="upload">  <span class="num">1</span> Signal</button>
+  <button class="tab" data-tab="schema">         <span class="num">2</span> Tune</button>
+  <button class="tab" data-tab="soda">           <span class="num">3</span> Compose </button>
+  <button class="tab" data-tab="dq">             <span class="num">4</span> Soundcheck</button>
+  <button class="tab" data-tab="kb">             <span class="num">5</span> Resonance</button>
+  <button class="tab" data-tab="validate">       <span class="num">6</span> Pitch Drift</button>
+  <button class="tab" data-tab="changes">        <span class="num">7</span> Retune</button>
+</nav>
+
+<main>
+
+  <!-- TAB 1: UPLOAD -->
+  <section class="panel active" id="panel-upload">
+    <div class="card">
+      <h2>Signal - Data Intake</h2>
+      <p class="hint">Upload your CSV file. It will be automatically ingested into DB right after upload.</p>
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="fileInput" accept=".csv" hidden/>
+        <div class="dz-inner">
+          <span class="dz-icon">⬆</span>
+          <p><strong>Click to choose</strong> or drag a CSV here</p>
+        </div>
+      </div>
+      <div id="uploadResult" class="result hidden">
+        <div class="stat-row" id="uploadStats"></div>
+        <div id="duckdbBanner"></div>
+        <div class="table-wrap"><table id="previewTable"></table></div>
+        <div class="actions">
+          <button class="btn primary" onclick="switchTab('schema')">Continue to Tune - Schema Intelligence →</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 2: Tune -->
+  <section class="panel" id="panel-schema">
+    <div class="card">
+      <h2>Tune - Schema Intelligence</h2>
+      <p class="hint">AI reads every column, infers types, counts nulls, flags quality concerns. This profile drives every other tab.</p>
+      <button class="btn primary" id="runSchemaBtn">Play Tune</button>
+      <div class="loader hidden" id="schemaLoader"><span class="spin"></span> Profiling columns…</div>
+      <div id="schemaResult" class="result hidden"></div>
+    </div>
+  </section>
+
+  <!-- TAB 3: SODA YAML -->
+  <section class="panel" id="panel-soda">
+    <div class="card">
+      <h2>Compose - DQ Rule Generation</h2>
+      <p class="hint">AI builds a Core Quality checks YAML file directly from the discovered schema.</p>
+      <button class="btn primary" id="runSodaBtn">Compose YAML</button>
+      <div class="loader hidden" id="sodaLoader"><span class="spin"></span> Generating DQ checks…</div>
+      <div id="sodaResult" class="result hidden"></div>
+    </div>
+  </section>
+
+  <!-- TAB 4: DATA QUALITY -->
+  <section class="panel" id="panel-dq">
+    <div class="card">
+      <h2>Soundcheck - DQ Execution</h2>
+      <p class="hint">Executes quality checks. Scores every batch (PASS / REVIEW / REJECT).</p>
+      <button class="btn primary" id="runDqBtn">Run Soundcheck</button>
+      <div class="loader hidden" id="dqLoader"><span class="spin"></span> Designing checks and analysing batches…</div>
+      <div id="dqResult" class="result hidden"></div>
+    </div>
+  </section>
+
+  <!-- TAB 5: KB BUILDER -->
+  <section class="panel" id="panel-kb">
+    <div class="card">
+      <h2>Resonance - Natural Language Data Access</h2>
+      <p class="hint">Ask questions in plain English. The platform interprets your request, finds the relevant information and provides clear, reliable answers.</p>
+      <div class="query-box">
+        <label for="nlQuery" style="display:block;font-size:13px;font-weight:600;margin-bottom:8px;color:#0F172A">Your question</label>
+        <textarea id="nlQuery" rows="3" placeholder="Example: provide me the region wise total counts of order."
+          style="width:100%;font:inherit;font-size:14px;line-height:1.5;border:1px solid #CBD5E1;border-radius:10px;padding:12px 14px;resize:vertical;min-height:90px"></textarea>
+      </div>
+      <div class="actions">
+        <button class="btn" id="clearQueryBtn">Clear</button>
+        <button class="btn primary" id="runQueryBtn">Generate SQL</button>
+      </div>
+      <div id="queryLoader" class="loader hidden"><span class="spin"></span> Retrieving schema and generating SQL…</div>
+      <div id="queryResult" class="result hidden"></div>
+    </div>
+  </section>
+  
+  <!-- TAB 6: SCHEMA VALIDATION -->
+  <section class="panel" id="panel-validate">
+    <div class="card">
+      <h2>Pitch Drift - Schema Drift Detection</h2>
+      <p class="hint">Compares the discovered schema against a desired contract. Flags missing columns, extra columns, and type mismatches.</p>
+      <button class="btn primary" id="runValidateBtn">Detect Drift</button>
+      <div class="loader hidden" id="validateLoader"><span class="spin"></span> Validating against contract…</div>
+      <div id="validateResult" class="result hidden"></div>
+    </div>
+  </section>
+
+  <!-- TAB 7: SCHEMA CHANGES -->
+  <section class="panel" id="panel-changes">
+    <div class="card">
+      <h2>Retune — Schema Change Management</h2>
+      <p class="hint">Compares against the most recent PREVIOUS upload snapshot to detect new, dropped, or renamed columns over time.</p>
+      <button class="btn primary" id="runChangesBtn">Manage Schema Changes</button>
+      <div class="loader hidden" id="changesLoader"><span class="spin"></span> Comparing against previous snapshot…</div>
+      <div id="changesResult" class="result hidden"></div>
+    </div>
+  </section>
+
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="app.js?v=20260811_1"></script>
+</body>
+</html>

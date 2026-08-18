@@ -1,6 +1,15 @@
 """
 soda_executor.py — Execute SODA checks against DuckDB data
 ===========================================================
+
+Multi-tenancy
+-------------
+`execute_checks` / `run_soda_checks_from_yaml` now take an optional
+`schema_name`. When given, the connection they open runs
+`SET search_path = '<schema>'` (same pattern as app.py / duckdb_helper.py /
+kb_manager.py), so the unqualified `table_name` baked into every check's SQL
+by `parse_check_string` resolves into that user's own schema instead of
+DuckDB's default "main" schema.
 """
 
 import re
@@ -26,10 +35,61 @@ def make_serializable(obj):
         return obj
 
 
+def _rows_to_dicts(description, rows, limit: int = 3) -> List[Dict[str, Any]]:
+    cols = [d[0] for d in (description or [])]
+    out = []
+    for row in (rows or [])[:limit]:
+        out.append({cols[i]: row[i] for i in range(min(len(cols), len(row)))})
+    return out
+
+
 def load_soda_yaml(yaml_path: str) -> Dict[str, Any]:
     """Parse SODA YAML file and return as dict."""
     with open(yaml_path, 'r') as f:
-        return yaml.safe_load(f)
+        try:
+            return yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            raise ValueError(f"Invalid YAML in {yaml_path}: {e}") from e
+
+
+def sanitize_soda_yaml_text(yaml_text: str) -> str:
+    """
+    Best-effort cleanup for common YAML issues produced by the LLM.
+    """
+    lines = (yaml_text or "").splitlines()
+    out = []
+
+    def quote_scalar(value: str) -> str:
+        value = value.strip()
+        if value.startswith("'") and value.endswith("'"):
+            return value
+        if value.startswith('"') and value.endswith('"'):
+            return value
+        return "'" + value.replace("'", "''") + "'"
+
+    for line in lines:
+        stripped = line.lstrip()
+        indent = line[: len(line) - len(stripped)]
+
+        if stripped.startswith("name:"):
+            raw = stripped[len("name:"):].strip()
+            if raw and not (raw.startswith("'") and raw.endswith("'")):
+                if ":" in raw or '"' in raw or any(ch in raw for ch in ["<", ">", "=", "(", ")", "/"]):
+                    stripped = "name: " + quote_scalar(raw)
+                    line = indent + stripped
+
+        if stripped.startswith("fail query:"):
+            out.append(line)
+            continue
+
+        if re.match(r"^(min|max)\([^)]+\)\s*[<>=!]+\s*.+$", stripped):
+            left, right = stripped.split(":", 1) if ":" in stripped else (None, None)
+            # no-op here; the invalid YAML usually comes from name values
+            pass
+
+        out.append(line)
+
+    return "\n".join(out)
 
 
 def parse_soda_checks(yaml_content: Dict[str, Any], table_name: str) -> List[Dict[str, Any]]:
@@ -107,9 +167,11 @@ def parse_check_string(check_str: str, table_name: str,
 
     # 1. row_count
     if check_str.startswith("row_count"):
-        match = re.match(r"row_count\s*([<>=]+)\s*(\d+)", check_str)
+        match = re.match(r"row_count\s*([<>=!]+)\s*(\d+)", check_str)
         if match:
             operator, value = match.groups()
+            if operator == "==":
+                operator = "="
             return (
                 "row_count",
                 f"SELECT COUNT(*) FROM {table_name}",
@@ -118,10 +180,12 @@ def parse_check_string(check_str: str, table_name: str,
 
     # 2. missing_count (nulls)
     if "missing_count" in check_str:
-        match = re.match(r"missing_count\(([\w\-\"']+)\)\s*([<>=]+)\s*(\d+)", check_str)
+        match = re.match(r"missing_count\(([\w\-\"']+)\)\s*([<>=!]+)\s*(\d+)", check_str)
         if match:
             col_name, operator, value = match.groups()
             col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
             return (
                 "null_check",
                 f'SELECT COUNT(*) FROM {table_name} WHERE "{col_name}" IS NULL',
@@ -130,11 +194,14 @@ def parse_check_string(check_str: str, table_name: str,
 
     # 3. invalid_count (enum/categorical)
     if "invalid_count" in check_str:
-        match = re.match(r"invalid_count\(([\w\-\"']+)\)\s*([<>=]+)\s*(\d+)", check_str)
+        match = re.match(r"invalid_count\(([\w\-\"']+)\)\s*([<>=!]+)\s*(\d+)", check_str)
         if match:
             col_name, operator, value = match.groups()
             col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
 
+            valid_regex = extra.get("valid regex") if isinstance(extra, dict) else None
             if valid_values:
                 escaped = [str(v).replace("'", "''") for v in valid_values]
                 in_list = ", ".join(f"'{v}'" for v in escaped)
@@ -142,20 +209,28 @@ def parse_check_string(check_str: str, table_name: str,
                     f'SELECT COUNT(*) FROM {table_name} '
                     f'WHERE "{col_name}" IS NOT NULL AND "{col_name}" NOT IN ({in_list})'
                 )
+            elif valid_regex:
+                sql = (
+                    f'SELECT COUNT(*) FROM {table_name} '
+                    f'WHERE "{col_name}" IS NOT NULL AND NOT regexp_matches("{col_name}", \'{valid_regex}\')'
+                )
             else:
                 sql = f'SELECT COUNT(*) FROM {table_name} WHERE 1=0'
 
             return ("invalid_count", sql, f"{operator} {value}")
 
+
     # 4. duplicate_count
     if "duplicate_count" in check_str:
-        match = re.match(r"duplicate_count\(([\w\-\"',\s]+)\)\s*([<>=]+)\s*(\d+)", check_str)
+        match = re.match(r"duplicate_count\(([\w\-\"',\s]+)\)\s*([<>=!]+)\s*(\d+)", check_str)
         if match:
             cols_str, operator, value = match.groups()
             cols = [c.strip().strip('"\'') for c in cols_str.split(',')]
             cols_quoted = ', '.join([f'"{c}"' for c in cols])
             null_filter = " AND ".join([f'"{c}" IS NOT NULL' for c in cols])
             where_clause = f"WHERE {null_filter}" if null_filter else ""
+            if operator == "==":
+                operator = "="
             return (
                 "duplicate_count",
                 f"SELECT COUNT(*) - COUNT(DISTINCT ({cols_quoted})) FROM {table_name} {where_clause}",
@@ -164,10 +239,12 @@ def parse_check_string(check_str: str, table_name: str,
 
     # 5. min_length / max_length
     if "min_length" in check_str:
-        match = re.match(r"min_length\(([\w\-\"']+)\)\s*([<>=]+)\s*(\d+)", check_str)
+        match = re.match(r"min_length\(([\w\-\"']+)\)\s*([<>=!]+)\s*(\d+)", check_str)
         if match:
             col_name, operator, value = match.groups()
             col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
             return (
                 "min_length",
                 f'SELECT MIN(LENGTH(CAST("{col_name}" AS VARCHAR))) FROM {table_name}',
@@ -175,36 +252,119 @@ def parse_check_string(check_str: str, table_name: str,
             )
 
     if "max_length" in check_str:
-        match = re.match(r"max_length\(([\w\-\"']+)\)\s*([<>=]+)\s*(\d+)", check_str)
+        match = re.match(r"max_length\(([\w\-\"']+)\)\s*([<>=!]+)\s*(\d+)", check_str)
         if match:
             col_name, operator, value = match.groups()
             col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
             return (
                 "max_length",
                 f'SELECT MAX(LENGTH(CAST("{col_name}" AS VARCHAR))) FROM {table_name}',
                 f"{operator} {value}"
             )
 
-    # 6. min/max (numeric or date range)
-    if re.search(r"min\(", check_str):
-        match = re.match(r"min\(([\w\-\"']+)\)\s*([<>=]+)\s*([\w\-\.: ]+)", check_str)
+
+    # avg check
+    if re.search(r"avg\(", check_str):
+        match = re.match(r"avg\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.: ]+)", check_str)
         if match:
             col_name, operator, value = match.groups()
             col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
+            return (
+                "avg_check",
+                f'SELECT AVG("{col_name}") FROM {table_name}',
+                f"{operator} {value}"
+            )        
+
+    # between check
+    if re.search(r"between\(", check_str):
+        match = re.match(r"between\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.: ]+)\s+and\s+([\w\-\.: ]+)", check_str, re.IGNORECASE)
+        if match:
+            col_name, operator, low, high = match.groups()
+            col_name = col_name.strip('"\'')
+            return (
+                "between_check",
+                f'SELECT COUNT(*) FROM {table_name} WHERE "{col_name}" < {low} OR "{col_name}" > {high}',
+                "= 0"
+            )
+
+    # freshness check
+    if re.search(r"freshness\(", check_str):
+        match = re.match(r"freshness\(([\w\-\"']+)\)\s*([<>=!]+)\s*(\d+)\s*(d|h|m)?", check_str, re.IGNORECASE)
+        if match:
+            col_name, operator, value, unit = match.groups()
+            col_name = col_name.strip('"\'')
+            unit = (unit or "d").lower()
+            interval_map = {"d": "DAY", "h": "HOUR", "m": "MINUTE"}
+            interval = interval_map.get(unit, "DAY")
+            if operator == "==":
+                operator = "="
+            return (
+                "freshness_check",
+                f'SELECT COUNT(*) FROM {table_name} WHERE TRY_CAST("{col_name}" AS DATE) < CURRENT_DATE - INTERVAL {value} {interval}',
+                "= 0"
+            )                
+
+    # null_percent check
+    if "missing_percent" in check_str:
+        match = re.match(r"missing_percent\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.]+)", check_str)
+        if match:
+            col_name, operator, value = match.groups()
+            col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
+            return (
+                "null_percent_check",
+                f'SELECT ROUND(COUNT(*) FILTER (WHERE "{col_name}" IS NULL) * 100.0 / COUNT(*), 2) FROM {table_name}',
+                f"{operator} {value}"
+            )
+
+    # uniqueness_ratio check
+    if "uniqueness_ratio" in check_str:
+        match = re.match(r"uniqueness_ratio\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.]+)", check_str)
+        if match:
+            col_name, operator, value = match.groups()
+            col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
+            return (
+                "uniqueness_ratio_check",
+                f'SELECT ROUND(COUNT(DISTINCT "{col_name}") * 1.0 / COUNT(*), 4) FROM {table_name}',
+                f"{operator} {value}"
+            )
+                    
+
+    # 6. min/max (numeric or date range)
+    if re.search(r"min\(", check_str):
+        match = re.match(r"min\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.: ]+)", check_str)
+        if match:
+            col_name, operator, value = match.groups()
+            col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
+            is_date_check = bool(re.match(r"^\d{4}-\d{2}-\d{2}$", value.strip()))
+            col_expr = f'TRY_CAST("{col_name}" AS DATE)' if is_date_check else f'"{col_name}"'
             return (
                 "min_check",
-                f'SELECT MIN("{col_name}") FROM {table_name}',
+                f'SELECT MIN({col_expr}) FROM {table_name}',
                 f"{operator} {value}"
             )
 
     if re.search(r"max\(", check_str):
-        match = re.match(r"max\(([\w\-\"']+)\)\s*([<>=]+)\s*([\w\-\.: ]+)", check_str)
+        match = re.match(r"max\(([\w\-\"']+)\)\s*([<>=!]+)\s*([\w\-\.: ]+)", check_str)
         if match:
             col_name, operator, value = match.groups()
             col_name = col_name.strip('"\'')
+            if operator == "==":
+                operator = "="
+            is_date_check = bool(re.match(r"^\d{4}-\d{2}-\d{2}$", value.strip()))
+            col_expr = f'TRY_CAST("{col_name}" AS DATE)' if is_date_check else f'"{col_name}"'
             return (
                 "max_check",
-                f'SELECT MAX("{col_name}") FROM {table_name}',
+                f'SELECT MAX({col_expr}) FROM {table_name}',
                 f"{operator} {value}"
             )
 
@@ -214,26 +374,20 @@ def parse_check_string(check_str: str, table_name: str,
         if fail_query:
             # Clean up the query
             fail_query = fail_query.strip()
-            # DuckDB does not support "NOT REGEXP"; translate common pattern syntax.
             fail_query = re.sub(
-                r"\bREGEXP_LIKE\s*\(",
-                "regexp_matches(",
+                r"\bFROM\s+dataset\b",
+                f"FROM {table_name}",
                 fail_query,
                 flags=re.IGNORECASE,
             )
-            regex_match = re.search(
-                r"WHERE\s+(\w+)\s+NOT\s+REGEXP\s+'([^']+)'",
+            fail_query = re.sub(
+                r"\bFROM\s+dataset\b",
+                f"FROM {table_name}",
                 fail_query,
                 flags=re.IGNORECASE,
             )
-            if regex_match:
-                col_name, pattern = regex_match.groups()
-                fail_query = re.sub(
-                    r"WHERE\s+\w+\s+NOT\s+REGEXP\s+'[^']+'",
-                    f"WHERE NOT regexp_matches({col_name}, '{pattern}')",
-                    fail_query,
-                    flags=re.IGNORECASE,
-                )
+            fail_query = _normalize_duckdb_regex(fail_query)
+            fail_query = _normalize_duckdb_dates(fail_query)
             return (
                 "failed_rows",
                 fail_query,
@@ -243,12 +397,57 @@ def parse_check_string(check_str: str, table_name: str,
     return ("unknown", "", check_str)
 
 
-def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _normalize_duckdb_regex(sql: str) -> str:
+    """
+    Best-effort cleanup for regex expressions.
+
+    The prompt should already generate DuckDB-safe regex syntax. This helper
+    now only performs light normalization for legacy inputs.
+    """
+    return sql
+
+
+def _normalize_duckdb_dates(sql: str) -> str:
+    """
+    Normalize common date function spellings to DuckDB syntax.
+    """
+    if not sql:
+        return sql
+    sql = re.sub(
+        r"\bDATEDIFF\s*\(\s*year\s*,",
+        "date_diff('year',",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    sql = re.sub(
+        r"\bDATEDIFF\s*\(\s*month\s*,",
+        "date_diff('month',",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    sql = re.sub(
+        r"\bDATEDIFF\s*\(\s*day\s*,",
+        "date_diff('day',",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    return sql
+
+
+def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]],
+                    schema_name: Optional[str] = None) -> Dict[str, Any]:
     """
     Execute all checks against DuckDB and return results.
+
+    When schema_name is given, SET search_path scopes this connection to the
+    user's own schema, so the unqualified `table_name` baked into every
+    check's SQL (by parse_check_string, above) resolves into that schema
+    instead of DuckDB's default "main" schema.
     """
 
     conn = duckdb.connect(db_file, read_only=True)
+    if schema_name:
+        conn.execute(f"SET search_path = '{schema_name}'")
 
     results = []
     passed_count = 0
@@ -262,7 +461,13 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
         expected = check["expected"]
 
         try:
-            result = conn.execute(sql_query).fetchall()
+            logger.info(
+                f"[soda] executing check | id={check_id} name={check_name} type={check_type} "
+                f"sql={sql_query} expected={expected}"
+            )
+            cursor = conn.execute(sql_query)
+            result = cursor.fetchall()
+            description = cursor.description
             
             if check_type == "failed_rows":
                 # For failed rows: count the returned rows
@@ -270,22 +475,29 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
                 # If > 0 rows → FAIL (violations found)
                 actual_value = len(result) if result else 0
                 passed = actual_value == 0
+                failed_rows = _rows_to_dicts(description, result, limit=3)
                 
                 if not passed:
                     # Show the failing data
                     error_msg = f"Found {actual_value} rows violating rule:\n"
-                    if result:
-                        # Show first 3 failing rows
-                        for i, row in enumerate(result[:3]):
-                            error_msg += f"  Row {i+1}: {row}\n"
-                        if len(result) > 3:
-                            error_msg += f"  ... and {len(result) - 3} more rows"
+                    for i, row in enumerate(failed_rows):
+                        error_msg += f"  Row {i+1}: {row}\n"
+                    if actual_value > len(failed_rows):
+                        error_msg += f"  ... and {actual_value - len(failed_rows)} more rows"
                 else:
                     error_msg = None
+                logger.info(
+                    f"[soda] failed_rows result | id={check_id} rows={actual_value} "
+                    f"status={'PASS' if passed else 'FAIL'}"
+                )
             else:
                 # For other checks: evaluate the result
                 actual_value = result[0][0] if result else None
                 passed, error_msg = evaluate_check(actual_value, expected, check_type)
+                logger.info(
+                    f"[soda] check result | id={check_id} actual={actual_value} "
+                    f"expected={expected} status={'PASS' if passed else 'FAIL'}"
+                )
 
             if passed:
                 passed_count += 1
@@ -300,11 +512,17 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
                 "passed": passed,
                 "actual_value": make_serializable(actual_value),
                 "expected": expected,
-                "error_message": error_msg
+                "error_message": error_msg,
+                "failed_rows": make_serializable(failed_rows) if check_type == "failed_rows" else [],
             })
 
         except Exception as e:
             failed_count += 1
+            logger.error(
+                f"[soda] check execution failed | id={check_id} name={check_name} "
+                f"type={check_type} sql={sql_query} error={e}",
+                exc_info=True,
+            )
             results.append({
                 "check_id": check_id,
                 "check_name": check_name,
@@ -312,7 +530,8 @@ def execute_checks(db_file: str, table_name: str, checks: List[Dict[str, Any]]) 
                 "passed": False,
                 "actual_value": None,
                 "expected": expected,
-                "error_message": f"Query failed: {str(e)}"
+                "error_message": f"Query failed: {str(e)}",
+                "failed_rows": [],
             })
 
     conn.close()
@@ -333,11 +552,16 @@ def evaluate_check(actual_value: Any, expected_str: str, check_type: str) -> Tup
     if actual_value is None:
         return False, "Actual value is NULL"
 
-    match = re.match(r"([<>=]+)\s*([\d\.-]+)", expected_str.strip())
+    expected_raw = expected_str.strip()
+    match = re.match(r"([<>=]+)\s*([\w\-\.: ]+)", expected_raw)
     if not match:
         return False, f"Could not parse expected: {expected_str}"
 
     operator, expected_value = match.groups()
+    expected_value = expected_value.strip().lower()
+
+    if expected_value in {"today", "current_date"}:
+        expected_value = date.today().isoformat()
 
     # Date-ish expected values are compared lexicographically after normalization.
     if re.match(r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?$", str(expected_value)):
@@ -389,11 +613,11 @@ def evaluate_check(actual_value: Any, expected_str: str, check_type: str) -> Tup
     return True, None
 
 
-def run_soda_checks_from_yaml(db_file: str, yaml_path: str, table_name: str) -> Dict[str, Any]:
+def run_soda_checks_from_yaml(db_file: str, yaml_path: str, table_name: str,
+                               schema_name: Optional[str] = None) -> Dict[str, Any]:
     """
     End-to-end: load YAML → parse checks → execute → return results.
     """
-
     yaml_content = load_soda_yaml(yaml_path)
     checks = parse_soda_checks(yaml_content, table_name)
 
@@ -407,6 +631,6 @@ def run_soda_checks_from_yaml(db_file: str, yaml_path: str, table_name: str) -> 
             "checks": []
         }
 
-    results = execute_checks(db_file, table_name, checks)
+    results = execute_checks(db_file, table_name, checks, schema_name=schema_name)
 
     return results

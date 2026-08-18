@@ -2,7 +2,7 @@
 ## AI-Powered Pipeline · AWS Bedrock · DuckDB · SODA Core
 
 6 POCs demonstrating AI-powered data quality on manufacturing CSV data.
-Upload any CSV → DuckDB ingest → Schema Discovery → SODA YAML → Data Quality → Schema Validation → Schema Changes.
+01 Signal → 02 Tune → 03 Compose → 04 Soundcheck → 05 Resonance → 06 Pitch Drift → 07 Retune
 
 ---
 
@@ -17,12 +17,9 @@ poc_package/
 ├── duckdb_helper.py             ← DuckDB ingest + sampling (no Polars)
 ├── data_loader.py               ← Polars CSV reader (CLI POCs only)
 ├── ingest_to_duckdb.py          ← Standalone DuckDB ingestion script
-├── soda_config.yml              ← SODA datasource config (points to DuckDB)
 ├── requirements.txt             ← All Python dependencies
 │
 ├── engines/                     ← All POC logic
-│   ├── mfg_poc1_schema.py       ← Schema Discovery & Column Profiling
-│   ├── mfg_poc2_quality.py      ← Data Quality + Batch Analysis
 │   ├── mfg_poc3a_drift.py       ← Schema Validation (hardcoded contract)
 │   ├── mfg_poc3b_drift.py       ← Schema Change Discovery (snapshots)
 │   ├── mfg_poc7_soda_yaml.py    ← SODA YAML Generator
@@ -70,14 +67,15 @@ poc_package/
 4. **Security credentials** → **Create access key** → **Local code**
 5. Download the CSV — you need Access Key ID and Secret Access Key
 
-### Step 3 — Configure AWS CLI
+### Step 3 — Add AWS Credentials to `.env`
 
-```bash
-aws configure
-# AWS Access Key ID:     [from IAM]
-# AWS Secret Access Key: [from IAM]
-# Default region name:   us-east-1
-# Default output format: json
+Create or update `.env` in the project root or `poc_package/`:
+
+```env
+AWS_ACCESS_KEY_ID=your_access_key_id
+AWS_SECRET_ACCESS_KEY=your_secret_access_key
+AWS_SESSION_TOKEN=your_session_token_optional
+AWS_REGION=us-east-1
 ```
 
 ### Step 4 — Run Setup Script
@@ -90,23 +88,11 @@ bash setup.sh
 This will:
 - Create a Python virtual environment
 - Install all packages from `requirements.txt`
-  (boto3, flask, duckdb, polars, soda-core-duckdb, pyyaml, etc.)
-- Verify AWS credentials
+  (boto3, flask, duckdb, polars, langfuse, soda-core-duckdb, pyyaml, etc.)
+- Verify AWS credentials from `.env`
 - Test a live Bedrock API call
 
-### Step 5 — Configure SODA (for running checks against DuckDB)
-
-```bash
-cat > soda_config.yml << 'EOF'
-data_source manufacturing:
-  type: duckdb
-  path: /full/path/to/poc_package/ai_poc_dq.duckdb
-EOF
-```
-
-Replace the path with your actual `poc_package` folder path.
-
-### Step 6 — Run the Web UI
+### Step 5 — Run the Web UI
 
 ```bash
 source venv/bin/activate
@@ -114,7 +100,7 @@ python app.py
 # Open: http://localhost:5000
 ```
 
-### Step 7 — Run CLI POCs (optional, no UI)
+### Step 6 — Run CLI POCs (optional, no UI)
 
 ```bash
 source venv/bin/activate
@@ -133,21 +119,12 @@ python run_manufacturing.py --poc 1 3
 
 | Tab | POC | What it does | Data source |
 |-----|-----|--------------|-------------|
-| 1 CSV Upload | — | Upload CSV → auto-ingest into DuckDB | `f.save()` stream, no RAM |
-| 2 Schema Discovery | POC 1 | AI profiles every column (types, nulls, samples) | DuckDB SUMMARIZE + 500-row SAMPLE |
+| 1 Signal | — | Upload CSV → auto-ingest into DuckDB | `f.save()` stream, no RAM |
+| 2 Tune | AI profiles every column (types, nulls, samples) | DuckDB SUMMARIZE + 500-row SAMPLE |
 | 3 SODA YAML | POC 7 | AI generates SODA Core checks from schema profile | POC 1 JSON only |
 | 4 Data Quality | POC 2 | AI designs + runs DQ checks, scores batches | DuckDB 1000-row SAMPLE |
 | 5 Schema Validation | POC 3a | Compares schema against locked contract | POC 1 JSON only |
 | 6 Schema Changes | POC 3b | Compares current vs previous upload snapshot | POC 1 snapshots only |
-
----
-
-## Running SODA Scan (after Tab 3)
-
-```bash
-# Close DBeaver first — DuckDB allows only one connection at a time
-soda scan -d manufacturing -c soda_config.yml outputs/<dataset_id>/soda_latest.yaml
-```
 
 ---
 
@@ -157,7 +134,7 @@ soda scan -d manufacturing -c soda_config.yml outputs/<dataset_id>/soda_latest.y
 |------|--------------------|--------------------|
 | Upload | `f.read()` → 2GB in Python RAM | `f.save()` → streams disk-to-disk |
 | DuckDB ingest | `sample_size=-1` scans all rows | `sample_size=200000` fast type detection |
-| Schema Discovery | Polars reads full file | DuckDB SUMMARIZE on full dataset, 500-row SAMPLE sent to AI |
+| Tune | DuckDB SUMMARIZE on full dataset, 500-row SAMPLE sent to AI |
 | Data Quality | Polars reads full file | DuckDB 1000-row reservoir SAMPLE sent to AI |
 | SODA / Validation / Changes | — | JSON only, zero data reads |
 
@@ -187,7 +164,7 @@ Schema snapshots enable drift detection:
 | Error | Fix |
 |-------|-----|
 | `AccessDeniedException` | Enable model access in Bedrock console (Step 1) |
-| `NoCredentialsError` | Run `aws configure` |
+| `NoCredentialsError` | Add `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` to `.env` |
 | `IO Error: Could not set lock on DuckDB file` | Close DBeaver — DuckDB allows only one connection |
 | `JSONDecodeError` | Claude returned non-JSON — usually throttle; retry |
 | `ThrottlingException` | Wait 5s between calls — already handled by `bedrock_client.py` |
@@ -205,7 +182,7 @@ CSV Upload (any size)
    uploads/<dataset_id>/<timestamp>.csv
         │
         ▼  DuckDB read_csv_auto (sample_size=10000)
-   ai_poc_dq.duckdb  →  tbl_<dataset_id>
+   data_resonance.duckdb  →  tbl_<dataset_id>
         │
         ├──► DuckDB SUMMARIZE  ──► POC 1 (full-dataset stats)
         │

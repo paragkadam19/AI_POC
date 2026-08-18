@@ -1,3 +1,0 @@
-data_source ai_poc_dq:
-  type: duckdb
-  path: ${STORAGE_DIR}/ai_poc_dq.duckdb
