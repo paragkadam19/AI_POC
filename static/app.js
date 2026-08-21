@@ -1,6 +1,7 @@
 /* app.js — Manufacturing Data Quality POC Console */
 
-// Load user info and show welcome (async () => { try { const res = await fetch("/api/auth/me"); const data = await res.json(); if (data.logged_in) { const el = document.getElementById("welcomeUser"); if (el) el.textContent = Welcome, ${data.full_name}; } else { window.location.href = "/login"; } } catch { window.location.href = "/login"; } })();
+// Load user info and show welcome
+(async () => { try { const res = await fetch("/api/auth/me"); const data = await res.json(); if (data.logged_in) { const el = document.getElementById("welcomeUser"); if (el) el.textContent = `Welcome, ${data.full_name}`; } else { window.location.href = "/login"; } } catch { window.location.href = "/login"; } })();
 
 async function doLogout() { await fetch("/api/auth/logout", { method: "POST" }); window.location.href = "/login"; }
 
@@ -148,16 +149,34 @@ function toChartNumber(v) {
    envelope), so it only touches disk once on the backend.
 ═══════════════════════════════════════════════════════ */
 const dz = $("dropzone"), fi = $("fileInput");
-dz.addEventListener("click", () => fi.click());
-dz.addEventListener("dragover",  (e) => { e.preventDefault(); dz.classList.add("drag"); });
+let _uploadInProgress = false;
+
+function setUploadBusy(busy) {
+  _uploadInProgress = busy;
+  fi.disabled = busy;
+  dz.classList.toggle("disabled", busy);
+  dz.style.pointerEvents = busy ? "none" : "";   // functional block, doesn't depend on CSS existing
+  const loader = $("uploadLoader");
+  if (loader) loader.classList.toggle("hidden", !busy);
+}
+
+dz.addEventListener("click", () => { if (!_uploadInProgress) fi.click(); });
+dz.addEventListener("dragover",  (e) => { e.preventDefault(); if (!_uploadInProgress) dz.classList.add("drag"); });
 dz.addEventListener("dragleave", ()  => dz.classList.remove("drag"));
 dz.addEventListener("drop", (e) => {
   e.preventDefault(); dz.classList.remove("drag");
+  if (_uploadInProgress) return;
   if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]);
 });
-fi.addEventListener("change", () => { if (fi.files.length) uploadFile(fi.files[0]); });
+fi.addEventListener("change", () => {
+  if (_uploadInProgress) return;
+  if (fi.files.length) uploadFile(fi.files[0]);
+});
 
 async function uploadFile(file) {
+  if (_uploadInProgress) return;   // guards any path that reaches here despite the checks above
+  setUploadBusy(true);
+  hide("uploadResult");
   try {
     const res = await fetch(`/api/upload?filename=${encodeURIComponent(file.name)}`, {
       method: "POST",
@@ -170,7 +189,94 @@ async function uploadFile(file) {
     renderUpload(data);
   } catch (e) {
     alert("Upload failed: " + e.message);
+  } finally {
+    setUploadBusy(false);
+    fi.value = "";   // reset so re-selecting the SAME file still fires 'change' on retry
   }
+}
+
+/* ── S3 browse / upload ──────────────────────────────────────────────────
+   "Upload to S3" PUTs straight from the browser to S3 via a presigned URL
+   — the app never sees the file body, which sidesteps slow-network and
+   ALB/gunicorn timeout concerns for large files entirely. "Browse S3"
+   lists what's already there and lets you (re-)ingest a chosen file.
+═══════════════════════════════════════════════════════ */
+const browseS3Btn = $("browseS3Btn"), uploadToS3Btn = $("uploadToS3Btn");
+
+if (browseS3Btn) {
+  browseS3Btn.addEventListener("click", async () => {
+    const panel = $("s3Panel");
+    panel.classList.remove("hidden");
+    panel.innerHTML = `<div class="loader"><span class="spin"></span> Listing S3 files…</div>`;
+    try {
+      const data = await api("/api/s3/list");
+      if (!data.files || !data.files.length) {
+        panel.innerHTML = `<div class="banner info">No files in S3 yet for this schema.</div>`;
+        return;
+      }
+      panel.innerHTML = `<div class="table-wrap"><table>
+        <thead><tr><th>File</th><th>Size (MB)</th><th>Uploaded</th><th></th></tr></thead>
+        <tbody>${data.files.map(f => `<tr>
+          <td>${f.filename}</td><td>${f.size_mb}</td><td style="font-size:12px;color:#94A3B8">${f.last_modified}</td>
+          <td><button class="btn sm" onclick="ingestFromS3('${f.key}')">Ingest</button></td>
+        </tr>`).join("")}</tbody></table></div>`;
+    } catch (e) {
+      panel.innerHTML = `<div class="banner error">✗ ${e.message}</div>`;
+    }
+  });
+}
+
+async function ingestFromS3(key) {
+  if (_uploadInProgress) return;
+  setUploadBusy(true);
+  hide("uploadResult");
+  try {
+    const data = await api("/api/s3/ingest", { method: "POST", body: JSON.stringify({ key }) });
+    resetWorkflowAfterUpload(data);
+    renderUpload(data);
+  } catch (e) {
+    alert("Ingest from S3 failed: " + e.message);
+  } finally {
+    setUploadBusy(false);
+  }
+}
+
+if (uploadToS3Btn) {
+  uploadToS3Btn.addEventListener("click", () => {
+    if (_uploadInProgress) return;
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".csv";
+    input.onchange = async () => {
+      if (!input.files.length) return;
+      const file = input.files[0];
+      setUploadBusy(true);
+      hide("uploadResult");
+      try {
+        const presign = await api("/api/s3/presign-upload", {
+          method: "POST",
+          body: JSON.stringify({ filename: file.name }),
+        });
+        const putRes = await fetch(presign.upload_url, {
+          method: "PUT",
+          headers: { "Content-Type": "text/csv" },
+          body: file,
+        });
+        if (!putRes.ok) throw new Error(`S3 upload failed (${putRes.status})`);
+        const data = await api("/api/s3/ingest", {
+          method: "POST",
+          body: JSON.stringify({ key: presign.key }),
+        });
+        resetWorkflowAfterUpload(data);
+        renderUpload(data);
+      } catch (e) {
+        alert("Upload to S3 failed: " + e.message);
+      } finally {
+        setUploadBusy(false);
+      }
+    };
+    input.click();
+  });
 }
 
 function renderUpload(data) {
@@ -597,18 +703,35 @@ function rejectSoda() {
 }
 
 /* ═══════════════════════════════════════════════════════
-   TAB 7 — NL → SQL
+   TAB 5 — NL → SQL (Resonance)
+   Human-in-the-loop: generate shows the SQL for review/edit,
+   nothing executes against real data until Execute is clicked.
 ═══════════════════════════════════════════════════════ */
 const nlQuery = $("nlQuery");
 const runQueryBtn = $("runQueryBtn");
 const clearQueryBtn = $("clearQueryBtn");
 let tab7Chart = null;
+let _pendingPoc8 = null;   // { question, tables, join_paths } from the last successful generate
+
+const POC8_PALETTE = [
+  "#EABFB8", "#F0CBC2", "#F0D9D1", "#EECEBF", "#F1E3DA",
+  "#B8D4EA", "#C2D8F0", "#D1DEF0", "#BFCFEE", "#DAE1F1",
+  "#EAD6B8", "#F0E0C2", "#F0E8D1", "#EEE4BF", "#F1EEDA",
+  "#CEEAB8", "#D3F0C2", "#DAF0D1", "#CAEEBF", "#DEF1DA",
+  "#EAB8C5", "#F0C2CB", "#F0D1D5", "#EEBFC2", "#F1DADA",
+  "#B8EAE1", "#C2F0EA", "#D1F0EE", "#BFEDEE", "#DAEFF1",
+  "#D4B8EA", "#DFC2F0", "#E7D1F0", "#E3BFEE", "#EDDAF1",
+  "#D2EAB8", "#D6F0C2", "#DDF0D1", "#CEEEBF", "#E0F1DA",
+  "#EACCB8", "#F0D7C2", "#F0E1D1", "#EEDBBF", "#F1E9DA",
+  "#EAB8C1", "#F0C2C7", "#F0D1D3", "#EEBFBF", "#F1DCDA",
+];
 
 if (clearQueryBtn && nlQuery) {
   clearQueryBtn.addEventListener("click", () => {
     nlQuery.value = "";
     $("queryResult").classList.add("hidden");
     $("queryResult").innerHTML = "";
+    _pendingPoc8 = null;
   });
 }
 
@@ -622,13 +745,15 @@ if (runQueryBtn) {
 
     show("queryLoader"); hide("queryResult");
     runQueryBtn.disabled = true;
+    _pendingPoc8 = null;
 
     try {
-      const data = await api("/api/poc8/query", {
+      const useExamples = $("useExamplesToggle") ? $("useExamplesToggle").checked : true;
+      const data = await api("/api/poc8/generate", {
         method: "POST",
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({ question, use_examples: useExamples }),
       });
-      renderQuery(data);
+      renderGeneratedSql(data, question);
     } catch (e) {
       $("queryResult").classList.remove("hidden");
       $("queryResult").innerHTML = `<div class="banner error">✗ ${e.message}</div>`;
@@ -639,30 +764,108 @@ if (runQueryBtn) {
   });
 }
 
-function renderQuery(d) {
+function renderGeneratedSql(d, question) {
   const el = $("queryResult");
   el.classList.remove("hidden");
 
-  if (tab7Chart) {
-    tab7Chart.destroy();
-    tab7Chart = null;
-  }
+  if (tab7Chart) { tab7Chart.destroy(); tab7Chart = null; }
 
   if (!d.ok) {
     const warnings = asArray(d.warnings).map(w => `<li>${escapeHtml(String(w))}</li>`).join("");
     const detail = d.detail ? `<div class="ev-card"><div class="obs">Detail</div><div class="sig">${escapeHtml(String(d.detail))}</div></div>` : "";
     el.innerHTML = `
-      <div class="banner error">✗ ${escapeHtml(d.error || "Query failed")}</div>
+      <div class="banner error">✗ ${escapeHtml(d.error || "SQL generation failed")}</div>
       <div class="card-list">
-        <div class="ev-card"><div class="obs">Question</div><div class="sig">${escapeHtml(d.question || "")}</div></div>
+        <div class="ev-card"><div class="obs">Question</div><div class="sig">${escapeHtml(question || "")}</div></div>
         <div class="ev-card"><div class="obs">Warnings</div><div class="sig"><ul style="margin:0;padding-left:18px">${warnings || "<li>No SQL returned</li>"}</ul></div></div>
         ${detail}
       </div>`;
     return;
   }
 
-  const previewRows = (d.preview && d.preview.rows) || d.rows || [];
-  const previewCols = (d.preview && d.preview.columns) || d.columns || [];
+  _pendingPoc8 = { question, tables: d.tables || [], join_paths: d.join_paths || [] };
+
+  const warningsList = asArray(d.warnings);
+  const warnings = warningsList.length
+    ? `<div class="banner info">Warnings: ${warningsList.map((w) => escapeHtml(String(w))).join(" · ")}</div>`
+    : "";
+
+  el.innerHTML = `
+    <div class="banner ok">✓ SQL generated — review before running</div>
+    ${warnings}
+    <h3>Generated SQL <span style="font-size:12px;font-weight:400;color:#94A3B8">(edit if needed, then Execute)</span></h3>
+    <textarea id="poc8SqlEditor"
+      style="width:100%;min-height:180px;font-family:'SF Mono',Consolas,monospace;font-size:13px;
+        background:#0F172A;color:#E2E8F0;padding:16px;border-radius:8px;border:none;resize:vertical;line-height:1.6"
+      spellcheck="false">${escapeHtml(d.sql || "")}</textarea>
+    <div class="actions">
+      <button class="btn" onclick="switchTab('kb')">✗ Discard</button>
+      <button class="btn primary" id="executePoc8Btn" onclick="executePoc8Query()">▶ Execute Query</button>
+    </div>
+    <div id="poc8ExecutionArea"></div>`;
+}
+
+async function executePoc8Query() {
+  const editor = $("poc8SqlEditor");
+  const btn = $("executePoc8Btn");
+  if (!editor || !_pendingPoc8) return;
+
+  const sql = editor.value.trim();
+  if (!sql) {
+    alert("SQL is empty — nothing to execute.");
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  const area = $("poc8ExecutionArea");
+  area.innerHTML = `<div class="loader"><span class="spin"></span> Executing…</div>`;
+
+  try {
+    const data = await api("/api/poc8/execute", {
+      method: "POST",
+      body: JSON.stringify({
+        sql,
+        question: _pendingPoc8.question,
+        tables: _pendingPoc8.tables,
+        join_paths: _pendingPoc8.join_paths,
+      }),
+    });
+    renderExecutionResult(data);
+  } catch (e) {
+    area.innerHTML = `<div class="banner error">✗ ${e.message}</div>`;
+  }
+  if (btn) btn.disabled = false;
+}
+
+function renderExecutionResult(d) {
+  const area = $("poc8ExecutionArea");
+  if (!area) return;
+
+  if (tab7Chart) { tab7Chart.destroy(); tab7Chart = null; }
+
+  if (!d.ok) {
+    const warnings = asArray(d.warnings).map(w => `<li>${escapeHtml(String(w))}</li>`).join("");
+    const detail = d.detail ? `<div class="ev-card"><div class="obs">Detail</div><div class="sig">${escapeHtml(String(d.detail))}</div></div>` : "";
+    area.innerHTML = `
+      <div class="banner error">✗ ${escapeHtml(d.error || "Execution failed")}</div>
+      <div class="card-list">
+        <div class="ev-card"><div class="obs">Warnings</div><div class="sig"><ul style="margin:0;padding-left:18px">${warnings || "<li>No details</li>"}</ul></div></div>
+        ${detail}
+      </div>`;
+    return;
+  }
+
+  // If the backend auto-repaired the SQL (e.g. after a DuckDB error),
+  // reflect the SQL that actually ran back into the editor rather than
+  // leaving the person's original text there looking like what executed.
+  const editor = $("poc8SqlEditor");
+  if (editor && d.sql && d.sql.trim() !== editor.value.trim()) {
+    editor.value = d.sql;
+  }
+  if (editor) editor.readOnly = true;
+
+  const previewRows = d.rows || [];
+  const previewCols = d.columns || [];
 
   let previewHtml = "<div style='color:#94A3B8;font-size:12px'>No preview rows returned.</div>";
   if (previewRows.length && previewCols.length) {
@@ -687,56 +890,19 @@ function renderQuery(d) {
     : inferredSpec;
   const chartData = (d.chart_data && d.chart_data.length ? d.chart_data : previewRows) || [];
   const chartType = normalizeChartType(chartSpec.chart_type || "table");
-  console.log("[tab7] render payload", {
-    ok: d.ok,
-    chartSpec,
-    chartType,
-    previewCols,
-    previewRowsCount: previewRows.length,
-    chartDataCount: chartData.length,
-    chartCanvasWillRender: chartType !== "table",
-    hasChartJs: !!window.Chart,
-  });
   const chartHtml = chartType !== "table"
     ? `<div class="card-list"><div class="ev-card chart-card"><div class="obs">Chart</div><div class="sig"><div style="position:relative;height:380px"><canvas id="tab7Chart"></canvas></div></div></div></div>`
     : "";
 
-  el.innerHTML = `
-    <div class="banner ok">✓ SQL generated and validated</div>
+  area.innerHTML = `
+    <div class="banner ok">✓ Query executed</div>
     ${warnings}
-  ${chartHtml}
-  ${chartType !== "table" && !chartData.length ? `<div class="banner info">No chart data available for this result.</div>` : ""}
-    <h3>Generated SQL</h3>
-    <textarea readonly style="width:100%;min-height:180px;font-family:'SF Mono',Consolas,monospace;font-size:13px;
-      background:#0F172A;color:#E2E8F0;padding:16px;border-radius:8px;border:none;resize:vertical;line-height:1.6">${escapeHtml(d.sql || "")}</textarea>
+    ${chartHtml}
+    ${chartType !== "table" && !chartData.length ? `<div class="banner info">No chart data available for this result.</div>` : ""}
     <h3>Preview</h3>
-    ${previewHtml}
-  `;
+    ${previewHtml}`;
 
-const POC8_PALETTE = [
-  // terracotta family
-  "#EABFB8", "#F0CBC2", "#F0D9D1", "#EECEBF", "#F1E3DA",
-  // slate blue family
-  "#B8D4EA", "#C2D8F0", "#D1DEF0", "#BFCFEE", "#DAE1F1",
-  // mustard / ochre family
-  "#EAD6B8", "#F0E0C2", "#F0E8D1", "#EEE4BF", "#F1EEDA",
-  // sage family
-  "#CEEAB8", "#D3F0C2", "#DAF0D1", "#CAEEBF", "#DEF1DA",
-  // dusty rose family
-  "#EAB8C5", "#F0C2CB", "#F0D1D5", "#EEBFC2", "#F1DADA",
-  // deep teal family
-  "#B8EAE1", "#C2F0EA", "#D1F0EE", "#BFEDEE", "#DAEFF1",
-  // plum / heather family
-  "#D4B8EA", "#DFC2F0", "#E7D1F0", "#E3BFEE", "#EDDAF1",
-  // moss family
-  "#D2EAB8", "#D6F0C2", "#DDF0D1", "#CEEEBF", "#E0F1DA",
-  // warm taupe / stone family
-  "#EACCB8", "#F0D7C2", "#F0E1D1", "#EEDBBF", "#F1E9DA",
-  // wine / burgundy family
-  "#EAB8C1", "#F0C2C7", "#F0D1D3", "#EEBFBF", "#F1DCDA",
-];
-
-if (chartType !== "table" && window.Chart && $("tab7Chart")) {
+  if (chartType !== "table" && window.Chart && $("tab7Chart")) {
     const ctx = $("tab7Chart").getContext("2d");
     const inferred = inferChartSpec(chartData, previewCols);
     const picked = pickChartFields(chartSpec, chartData, previewCols.length ? previewCols : Object.keys(chartData[0] || {}));
@@ -745,10 +911,8 @@ if (chartType !== "table" && window.Chart && $("tab7Chart")) {
     const labels = chartData.map((row) => String(row?.[xKey] ?? "")).filter((v) => v !== "");
     const values = chartData.map((row) => toChartNumber(row?.[yKey] ?? 0));
 
-    console.log("[tab7] chart debug", { chartSpec, chartType, xKey, yKey, chartData, previewCols });
-
     if (!labels.length || !values.length || !xKey || !yKey) {
-      console.warn("[tab7] chart skipped: unusable axes", { chartSpec, previewCols, xKey, yKey });
+      console.warn("[tab5] chart skipped: unusable axes", { chartSpec, previewCols, xKey, yKey });
       return;
     }
 
@@ -769,29 +933,72 @@ if (chartType !== "table" && window.Chart && $("tab7Chart")) {
         options: {
           responsive: true,
           maintainAspectRatio: false,
-          plugins: {
-            legend: { display: chartKind !== "bar" },
-          },
+          plugins: { legend: { display: chartKind !== "bar" } },
         },
       });
-    } else {
-      console.warn("[tab7] chart type not rendered in UI", chartKind);
     }
-  } else {
-    console.warn("[tab7] chart not created", {
-      chartType,
-      hasChartJs: !!window.Chart,
-      hasCanvas: !!$("tab7Chart"),
-    });
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   TAB 8 — CHECK SIGNAL: browse uploaded CSVs
+═══════════════════════════════════════════════════════ */
+const refreshDatasetsBtn = $("refreshDatasetsBtn");
+if (refreshDatasetsBtn) {
+  refreshDatasetsBtn.addEventListener("click", loadCheckSignal);
+}
+
+async function loadCheckSignal() {
+  show("checkSignalLoader"); hide("checkSignalResult");
+  try {
+    const data = await api("/api/dataset/list");
+    renderCheckSignal(data.tables || []);
+  } catch (e) {
+    $("checkSignalResult").classList.remove("hidden");
+    $("checkSignalResult").innerHTML = `<div class="banner error">✗ ${e.message}</div>`;
+  }
+  hide("checkSignalLoader");
+}
+
+function renderCheckSignal(tables) {
+  const el = $("checkSignalResult");
+  el.classList.remove("hidden");
+
+  if (!tables || !tables.length) {
+    el.innerHTML = `<div class="banner info">No CSVs uploaded yet.</div>`;
+    return;
+  }
+
+  let html = `<div class="table-wrap"><table>
+    <thead><tr><th>Table</th><th></th></tr></thead><tbody>`;
+  tables.forEach(t => {
+    html += `<tr>
+      <td><strong>${t}</strong></td>
+      <td><button class="btn sm" onclick="viewDatasetPreview('${t}')">Preview</button></td>
+    </tr>`;
+  });
+  html += `</tbody></table></div><div id="datasetPreviewArea"></div>`;
+  el.innerHTML = html;
+}
+
+async function viewDatasetPreview(datasetId) {
+  const area = $("datasetPreviewArea");
+  area.innerHTML = `<div class="loader"><span class="spin"></span> Loading preview…</div>`;
+  try {
+    const data = await api(`/api/dataset/${encodeURIComponent(datasetId)}/preview`);
+    area.innerHTML = `
+      <h3>${data.table} · ${data.row_count} rows</h3>
+      <div class="table-wrap"><table>
+        <thead><tr>${data.columns.map(c => `<th>${c}</th>`).join("")}</tr></thead>
+        <tbody>${data.sample.map(r => `<tr>${data.columns.map(c => `<td>${fmt(r[c])}</td>`).join("")}</tr>`).join("")}</tbody>
+      </table></div>`;
+  } catch (e) {
+    area.innerHTML = `<div class="banner error">✗ ${e.message}</div>`;
   }
 }
 
 /* ═══════════════════════════════════════════════════════
    TAB 4 — DATA QUALITY (POC 2)
-   Now powered by soda_executor.py running real SQL checks
-   against DuckDB — no AI call, no CSV sample over the wire.
-   Response shape changed: { audit_passed, total_checks,
-   passed_checks, failed_checks, checks: [...] }
 ═══════════════════════════════════════════════════════ */
 $("runDqBtn").addEventListener("click", async () => {
   show("dqLoader"); hide("dqResult");

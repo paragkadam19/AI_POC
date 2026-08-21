@@ -1,20 +1,36 @@
 # main.py
 # main.py — must be the FIRST thing, before other imports
+import os
 import warnings
 import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
-import requests
-_orig_merge = requests.Session.merge_environment_settings
-def _merge_no_verify(self, url, proxies, stream, verify, cert):
-    settings = _orig_merge(self, url, proxies, stream, verify, cert)
-    settings["verify"] = False
-    return settings
-requests.Session.merge_environment_settings = _merge_no_verify
+# This bypasses TLS certificate verification for every outbound `requests`
+# call in the process. It exists to work around a corporate proxy on the
+# office network that re-signs HTTPS traffic with an internal CA — without
+# it, every outbound request fails cert verification against that proxy's
+# self-signed cert.
+#
+# It has no purpose once this runs in AWS: there's no intercepting proxy
+# there, real certs verify fine, and leaving it unconditionally on means
+# every outbound call this app makes (Langfuse telemetry, anything else
+# using `requests`) is exposed to MITM with zero verification, forever,
+# for an app with real logins.
+#
+# Set DISABLE_SSL_VERIFICATION=1 for local dev behind that proxy.
+# Leave it unset in AWS — the default below is "verify normally."
+if os.getenv("DISABLE_SSL_VERIFICATION", "0").lower() in {"1", "true", "yes"}:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+
+    import requests
+    _orig_merge = requests.Session.merge_environment_settings
+    def _merge_no_verify(self, url, proxies, stream, verify, cert):
+        settings = _orig_merge(self, url, proxies, stream, verify, cert)
+        settings["verify"] = False
+        return settings
+    requests.Session.merge_environment_settings = _merge_no_verify
 
 # ... rest of your existing main.py imports/code below
-import os
 from app import app
 
 if __name__ == "__main__":

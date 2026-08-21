@@ -17,9 +17,9 @@ config = Config(
     retries={"max_attempts": 3, "mode": "adaptive"}
 )
 
-MODEL_HAIKU = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+MODEL_HAIKU = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
 MODEL_TITAN_EMBED = "amazon.titan-embed-text-v2:0"
-REGION      = "us-east-1"
+REGION      = "ap-south-1"
 
 _client = None
 
@@ -32,7 +32,8 @@ _token_stats = {
 
 _langfuse = None
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+if os.getenv("DISABLE_SSL_VERIFICATION", "0").lower() in {"1", "true", "yes"}:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 load_dotenv()
 
@@ -87,20 +88,28 @@ def get_client():
     global _client
     if _client is None:
         access_key, secret_key, session_token, region = _aws_env_config()
-        if not access_key or not secret_key:
-            raise RuntimeError(
-                "Missing AWS credentials in .env. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY "
-                "(and optionally AWS_SESSION_TOKEN / AWS_REGION)."
-            )
 
         client_kwargs = {
             "service_name": "bedrock-runtime",
             "region_name": region,
-            "aws_access_key_id": access_key,
-            "aws_secret_access_key": secret_key,
         }
-        if session_token:
-            client_kwargs["aws_session_token"] = session_token
+        # Only pass explicit keys when they're actually set (e.g. local dev
+        # without an instance role attached). On EC2, leave these unset —
+        # boto3's default credential chain then resolves the instance role
+        # automatically via IMDS. The previous version *required* static
+        # keys and raised if they were missing, which made it impossible
+        # to use the IAM role this deployment is built around.
+        if access_key and secret_key:
+            client_kwargs["aws_access_key_id"] = access_key
+            client_kwargs["aws_secret_access_key"] = secret_key
+            if session_token:
+                client_kwargs["aws_session_token"] = session_token
+
+        # Same corporate-proxy workaround as main.py's DISABLE_SSL_VERIFICATION,
+        # applied here too since boto3 has its own HTTP stack — the requests-
+        # library monkeypatch in main.py doesn't cover Bedrock calls at all.
+        # Off by default; only set the env var for local dev behind that proxy.
+        disable_verify = os.getenv("DISABLE_SSL_VERIFICATION", "0").lower() in {"1", "true", "yes"}
 
         _client = boto3.client(**client_kwargs, verify=False, config=config)
     return _client

@@ -49,7 +49,7 @@ from logger_config import get_logger
 
 logger = get_logger(__name__)
 DEBUG_NLQ_PROMPTS = os.getenv("DEBUG_NLQ_PROMPTS", "").lower() in {"1", "true", "yes"}
-MODEL_ID = "us.anthropic.claude-sonnet-4-6"
+MODEL_ID = "global.anthropic.claude-sonnet-4-6"
 AUDIT_COLUMNS = {"system_date", "system_active", "file_path"}
 CHART_INTENT_WORDS = {
     "trend", "trends", "compare", "comparison", "breakdown", "distribution",
@@ -774,25 +774,38 @@ def _connect_for_execution(db_file: str, schema_name: Optional[str] = None):
 # ============================================================================
 # MAIN QUESTION → SQL FLOW
 # ============================================================================
+#
+# Split into two explicit steps — generate_sql() then execute_sql() — so a
+# person can review (and edit) the SQL before anything runs against real
+# data. This is the same human-in-the-loop pattern already used for Tab 2
+# (schema approval) and Tab 3 (SODA YAML approval); NL-to-SQL didn't have
+# it before, which is also part of why a wrong-table answer could execute
+# and get silently auto-saved as a "trusted" example.
+#
+# question_to_sql() below is kept as a backward-compatible one-shot wrapper
+# that just chains the two, for any caller that hasn't been updated.
+# ============================================================================
 
-def question_to_sql(
+def generate_sql(
     db_file: str,
     ds: str,
     storage_dir: str,
     question: str,
     ask_json_fn=None,
-    want_chart: bool = True,
     schema_name: Optional[str] = None,
+    use_examples: bool = True,
 ) -> Dict[str, Any]:
     """
-    Convert a natural language question into SQL using KB-aware retrieval.
+    Retrieval + prompt-building + SQL generation only — does NOT execute
+    the SQL. That's the separate, explicit execute_sql() step below, so
+    the generated SQL can be shown to a person for review/edit first.
 
-    schema_name: the logged-in user's DuckDB schema. When given, this
-    resolves a KBManager scoped to that schema (rather than the boot-time
-    default) and scopes the SQL-execution connections to it too, so both
-    retrieval and execution stay within that user's own tables.
+    use_examples: when False, skips loading saved few-shot examples for
+    this call entirely — an escape hatch for when saved examples seem to
+    be steering the model toward a wrong answer (as opposed to editing or
+    deleting the stored examples themselves).
 
-    Returns {ok, sql, tables, join_paths, warnings, error, ...}
+    Returns {ok, sql, tables, join_paths, warnings, error}.
     """
     if not ask_json_fn:
         from bedrock_client import ask_json
@@ -812,33 +825,6 @@ def question_to_sql(
         except Exception as e:
             logger.warning(f"[poc8] could not resolve schema-scoped KB manager ({e}); falling back to default")
             kb = _KB_MANAGER
-
-    def build_success_payload(sql: str, rows: List[Dict[str, Any]], cols: List[str], retrieval_method: str, extra_warnings: List[str] = None):
-        extra_warnings = extra_warnings or []
-        chart_spec = {"chart_type": "table", "reason": "chart disabled"}
-        chart_data = rows
-        if want_chart:
-            chart_spec = recommend_chart_spec(question, rows, cols, sql=sql, ask_json_fn=ask_json_fn)
-            chart_data = prepare_chart_dataset(rows, chart_spec)
-        logger.info(
-            f"[poc8] chart spec | type={chart_spec.get('chart_type')} | "
-            f"x={chart_spec.get('x_axis')} | y={chart_spec.get('y_axis')} | "
-            f"rows={len(chart_data)} | cols={cols}"
-        )
-        logger.info(f"[poc8] chart data preview | {chart_data[:3]}")
-        return {
-            "ok": True,
-            "sql": sql,
-            "tables": final_tables,
-            "join_paths": join_paths,
-            "rows": rows,
-            "row_count": len(rows),
-            "columns": cols,
-            "warnings": warnings + extra_warnings,
-            "retrieval_method": retrieval_method,
-            "chart_spec": chart_spec,
-            "chart_data": chart_data,
-        }
 
     try:
         # 1. RETRIEVE: Vector semantic search via KB Manager
@@ -879,10 +865,8 @@ def question_to_sql(
         for src_table, targets in (joins_raw or {}).items():
             for tgt_table, join_col in targets:
                 join_graph[src_table].append((tgt_table, join_col))
-                # Default confidence for KB-loaded edges
                 edge_confidence[(src_table, tgt_table)] = 0.85
 
-        # Expand via joins with confidence filtering
         expanded = expand_via_join_graph(
             tables,
             join_graph,
@@ -927,8 +911,8 @@ def question_to_sql(
             final_tables,
         )
 
-        # 4. LOAD EXAMPLES: Few-shot pairs
-        examples = kb.load_examples(min_quality=0.80, limit=3)
+        # 4. LOAD EXAMPLES: Few-shot pairs (skippable via use_examples=False)
+        examples = kb.load_examples(min_quality=0.80, limit=3) if use_examples else []
 
         # 5. PROMPT: Few-shot NL→SQL
         few_shot = "\n\n".join(
@@ -1077,7 +1061,7 @@ QUESTION: {question}
 
 Generate the SQL query."""
 
-        logger.info(f"[poc8] Calling Claude with {len(final_tables)} tables in context...")
+        logger.info(f"[poc8] Calling Claude with {len(final_tables)} tables in context... (use_examples={use_examples})")
         if DEBUG_NLQ_PROMPTS:
             logger.info(
                 "\n"
@@ -1134,90 +1118,206 @@ Generate the SQL query."""
             logger.info(f"[poc8] SQL repaired: {repaired_sql[:80]}...")
             sql = repaired_sql
 
-        # 6. EXECUTE — scoped to the user's own schema when schema_name is given.
-        try:
-            conn = _connect_for_execution(db_file, schema_name=schema_name)
-            result_rows = conn.execute(sql).fetchall()
-            result_cols = [d[0] for d in conn.description] if conn.description else []
-            conn.close()
-
-            # Convert to dicts
-            results = [dict(zip(result_cols, row)) for row in result_rows]
-
-            return build_success_payload(sql, results, result_cols, "vector_semantic_search")
-
-        except Exception as exec_err:
-            logger.error(f"[poc8] SQL execution failed: {exec_err}")
-            try:
-                repaired_sql = _repair_sql_with_error(
-                    question,
-                    sql,
-                    str(exec_err),
-                    catalog,
-                    final_tables,
-                    ask_json_fn,
-                )
-                pre_column_repair_sql = repaired_sql
-                repaired_sql = _repair_sql_column_names(repaired_sql, catalog, final_tables)
-                if repaired_sql and repaired_sql != pre_column_repair_sql:
-                    logger.info(
-                        f"[poc8] column-name repair changed the LLM's repaired SQL: "
-                        f"before={pre_column_repair_sql!r} after={repaired_sql!r}"
-                    )
-                if repaired_sql and repaired_sql != sql:
-                    logger.info(f"[poc8] retrying with repaired SQL: {repaired_sql[:120]}...")
-                    conn = _connect_for_execution(db_file, schema_name=schema_name)
-                    result_rows = conn.execute(repaired_sql).fetchall()
-                    result_cols = [d[0] for d in conn.description] if conn.description else []
-                    conn.close()
-                    results = [dict(zip(result_cols, row)) for row in result_rows]
-                    return build_success_payload(
-                        repaired_sql,
-                        results,
-                        result_cols,
-                        "vector_semantic_search",
-                        [f"SQL repaired after DuckDB error: {str(exec_err)}"],
-                    )
-            except Exception as repair_err:
-                # IMPORTANT: this used to be a bare logger.warning that
-                # discarded the repair attempt entirely. If the repair-retry
-                # execution itself throws, the caller/UI need to know a
-                # *second*, different error happened — otherwise the final
-                # response below reports the stale original exec_err even
-                # though the actual failure was the repaired SQL.
-                logger.error(
-                    f"[poc8] SQL repair retry failed | repaired_sql={repaired_sql!r} | "
-                    f"repair_err={repair_err}"
-                )
-                warnings.append(
-                    f"Repair attempt also failed executing: {repaired_sql[:200] if repaired_sql else '(no SQL)'} "
-                    f"— {str(repair_err)}"
-                )
-                return {
-                    "ok": False,
-                    "sql": repaired_sql or sql,
-                    "error": f"SQL execution failed after repair attempt: {str(repair_err)}",
-                    "detail": str(repair_err),
-                    "original_error": str(exec_err),
-                    "tables": final_tables,
-                    "join_paths": join_paths,
-                    "warnings": warnings,
-                }
-            return {
-                "ok": False,
-                "sql": sql,
-                "error": f"SQL execution failed: {str(exec_err)}",
-                "detail": str(exec_err),
-                "tables": final_tables,
-                "join_paths": join_paths,
-                "warnings": warnings,
-            }
+        return {
+            "ok": True,
+            "sql": sql,
+            "tables": final_tables,
+            "join_paths": join_paths,
+            "warnings": warnings,
+        }
 
     except Exception as e:
-        logger.error(f"[poc8] question_to_sql failed: {e}", exc_info=True)
+        logger.error(f"[poc8] generate_sql failed: {e}", exc_info=True)
         return {
             "ok": False,
             "error": f"Query generation failed: {str(e)}",
             "tables": tables,
             "warnings": warnings,
         }
+
+
+def execute_sql(
+    db_file: str,
+    sql: str,
+    question: str = "",
+    schema_name: Optional[str] = None,
+    tables: Optional[List[str]] = None,
+    join_paths: Optional[List[dict]] = None,
+    want_chart: bool = True,
+    ask_json_fn=None,
+) -> Dict[str, Any]:
+    """
+    Executes a SQL string — normally the (possibly human-edited) output of
+    generate_sql(), reviewed and approved by a person before this runs.
+    Still does the same error-repair retry generate_sql's caller used to
+    get for free (one LLM-assisted repair attempt on a DuckDB error), since
+    a human editing SQL by hand can introduce the same kind of binder error
+    Claude's own first draft could.
+
+    tables / join_paths are only used for the repair-prompt context and for
+    echoing back into the response — pass through whatever generate_sql()
+    returned. question is used for chart-intent detection and, by the
+    caller, for the same wrong-table auto-save guard as before.
+    """
+    if not ask_json_fn:
+        from bedrock_client import ask_json
+        ask_json_fn = ask_json
+
+    tables = tables or []
+    join_paths = join_paths or []
+    warnings: List[str] = []
+
+    sql = (sql or "").strip()
+    if not sql or not sql.upper().startswith(("SELECT", "WITH", "EXPLAIN")):
+        return {
+            "ok": False,
+            "error": "Only SELECT / WITH / EXPLAIN queries are allowed.",
+            "tables": tables,
+            "warnings": warnings,
+        }
+
+    # Reload the catalog for column-name repair / error-repair context.
+    # Cheap in the common case: KBManager caches load_catalog(), and
+    # generate_sql() already populated that cache earlier in this request
+    # flow (same schema, same process).
+    kb = None
+    catalog: Dict[str, Any] = {}
+    try:
+        if schema_name:
+            from kb_manager import get_kb_manager
+            kb = get_kb_manager(db_file, schema_name=schema_name)
+        else:
+            kb = _KB_MANAGER
+        if kb:
+            catalog = kb.load_catalog(force_refresh=False)
+    except Exception as e:
+        logger.warning(f"[poc8] catalog reload for execute_sql failed (non-fatal): {e}")
+
+    if catalog:
+        sql = _repair_sql_column_names(sql, catalog, tables)
+
+    def build_success_payload(final_sql: str, rows: List[Dict[str, Any]], cols: List[str], extra_warnings: List[str] = None):
+        extra_warnings = extra_warnings or []
+        chart_spec = {"chart_type": "table", "reason": "chart disabled"}
+        chart_data = rows
+        if want_chart:
+            chart_spec = recommend_chart_spec(question, rows, cols, sql=final_sql, ask_json_fn=ask_json_fn)
+            chart_data = prepare_chart_dataset(rows, chart_spec)
+        logger.info(
+            f"[poc8] chart spec | type={chart_spec.get('chart_type')} | "
+            f"x={chart_spec.get('x_axis')} | y={chart_spec.get('y_axis')} | "
+            f"rows={len(chart_data)} | cols={cols}"
+        )
+        return {
+            "ok": True,
+            "sql": final_sql,
+            "tables": tables,
+            "join_paths": join_paths,
+            "rows": rows,
+            "row_count": len(rows),
+            "columns": cols,
+            "warnings": warnings + extra_warnings,
+            "chart_spec": chart_spec,
+            "chart_data": chart_data,
+        }
+
+    try:
+        conn = _connect_for_execution(db_file, schema_name=schema_name)
+        result_rows = conn.execute(sql).fetchall()
+        result_cols = [d[0] for d in conn.description] if conn.description else []
+        conn.close()
+        results = [dict(zip(result_cols, row)) for row in result_rows]
+        return build_success_payload(sql, results, result_cols)
+
+    except Exception as exec_err:
+        logger.error(f"[poc8] SQL execution failed: {exec_err}")
+        repaired_sql = ""
+        try:
+            repaired_sql = _repair_sql_with_error(
+                question,
+                sql,
+                str(exec_err),
+                catalog,
+                tables,
+                ask_json_fn,
+            )
+            pre_column_repair_sql = repaired_sql
+            if catalog:
+                repaired_sql = _repair_sql_column_names(repaired_sql, catalog, tables)
+            if repaired_sql and repaired_sql != pre_column_repair_sql:
+                logger.info(
+                    f"[poc8] column-name repair changed the LLM's repaired SQL: "
+                    f"before={pre_column_repair_sql!r} after={repaired_sql!r}"
+                )
+            if repaired_sql and repaired_sql != sql:
+                logger.info(f"[poc8] retrying with repaired SQL: {repaired_sql[:120]}...")
+                conn = _connect_for_execution(db_file, schema_name=schema_name)
+                result_rows = conn.execute(repaired_sql).fetchall()
+                result_cols = [d[0] for d in conn.description] if conn.description else []
+                conn.close()
+                results = [dict(zip(result_cols, row)) for row in result_rows]
+                return build_success_payload(
+                    repaired_sql,
+                    results,
+                    result_cols,
+                    [f"SQL repaired after DuckDB error: {str(exec_err)}"],
+                )
+        except Exception as repair_err:
+            logger.error(
+                f"[poc8] SQL repair retry failed | repaired_sql={repaired_sql!r} | "
+                f"repair_err={repair_err}"
+            )
+            warnings.append(
+                f"Repair attempt also failed executing: {repaired_sql[:200] if repaired_sql else '(no SQL)'} "
+                f"— {str(repair_err)}"
+            )
+            return {
+                "ok": False,
+                "sql": repaired_sql or sql,
+                "error": f"SQL execution failed after repair attempt: {str(repair_err)}",
+                "detail": str(repair_err),
+                "original_error": str(exec_err),
+                "tables": tables,
+                "join_paths": join_paths,
+                "warnings": warnings,
+            }
+        return {
+            "ok": False,
+            "sql": sql,
+            "error": f"SQL execution failed: {str(exec_err)}",
+            "detail": str(exec_err),
+            "tables": tables,
+            "join_paths": join_paths,
+            "warnings": warnings,
+        }
+
+
+def question_to_sql(
+    db_file: str,
+    ds: str,
+    storage_dir: str,
+    question: str,
+    ask_json_fn=None,
+    want_chart: bool = True,
+    schema_name: Optional[str] = None,
+    use_examples: bool = True,
+) -> Dict[str, Any]:
+    """
+    Backward-compatible one-shot wrapper: generate + execute in a single
+    call, same overall behavior this module had before being split into
+    generate_sql() and execute_sql() for the human-in-the-loop review step.
+    New code (app.py's /api/poc8/generate + /api/poc8/execute routes)
+    calls those two directly; this just chains them for anything else that
+    hasn't been updated to the two-step flow.
+    """
+    gen = generate_sql(
+        db_file, ds, storage_dir, question,
+        ask_json_fn=ask_json_fn, schema_name=schema_name, use_examples=use_examples,
+    )
+    if not gen.get("ok"):
+        return gen
+    return execute_sql(
+        db_file, gen["sql"], question=question, schema_name=schema_name,
+        tables=gen.get("tables"), join_paths=gen.get("join_paths"),
+        want_chart=want_chart, ask_json_fn=ask_json_fn,
+    )

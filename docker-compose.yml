@@ -1,24 +1,30 @@
-version: "3.9"
-
 services:
-  data-resonance:
+  poc8-app:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: data-resonance-poc
+    image: poc8:latest
     ports:
-      - "5000:5000"
+      - "8000:8000"
     volumes:
-      # Persist storage so data survives container restarts
+      # Must be /app/storage — that's the actual root app.py's STORAGE_DIR
+      # and logger_config.py's LOG_DIR both resolve to. DuckDB file,
+      # uploaded CSVs, KB vector index, and the rotating log file all live
+      # here. On EC2 this maps to an EBS-backed directory (see user-data.sh).
       - ./storage:/app/storage
-    env_file:
-      - .env
     environment:
-      - FLASK_ENV=production
-      - PYTHONUNBUFFERED=1
-    restart: unless-stopped
+      - AWS_REGION=ap-south-1
+      # No AWS_ACCESS_KEY_ID / SECRET here — the EC2 instance role supplies
+      # Bedrock credentials automatically via instance metadata. Never bake
+      # keys into the image or compose file.
+      # Uncomment only if you're running this locally behind a corporate
+      # proxy that intercepts TLS — leave it unset everywhere else,
+      # including EC2:
+      # - DISABLE_SSL_VERIFICATION=1
+    restart: always
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/api/status"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
-      timeout: 10s
+      timeout: 5s
       retries: 3
+      start_period: 20s

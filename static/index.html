@@ -28,6 +28,7 @@
   <button class="tab" data-tab="kb">             <span class="num">5</span> Resonance</button>
   <button class="tab" data-tab="validate">       <span class="num">6</span> Pitch Drift</button>
   <button class="tab" data-tab="changes">        <span class="num">7</span> Retune</button>
+  <button class="tab" data-tab="checksignal">    <span class="num">8</span> Check Signal</button>
 </nav>
 
 <main>
@@ -44,6 +45,12 @@
           <p><strong>Click to choose</strong> or drag a CSV here</p>
         </div>
       </div>
+      <div class="actions" style="margin-top:12px">
+        <button class="btn" id="browseS3Btn">Browse S3</button>
+        <button class="btn" id="uploadToS3Btn">Upload to S3</button>
+      </div>
+      <div id="s3Panel" class="hidden" style="margin-top:12px"></div>
+      <div class="loader hidden" id="uploadLoader"><span class="spin"></span> Uploading and ingesting — large files can take several minutes, please don't click again…</div>
       <div id="uploadResult" class="result hidden">
         <div class="stat-row" id="uploadStats"></div>
         <div id="duckdbBanner"></div>
@@ -98,6 +105,9 @@
         <textarea id="nlQuery" rows="3" placeholder="Example: provide me the region wise total counts of order."
           style="width:100%;font:inherit;font-size:14px;line-height:1.5;border:1px solid #CBD5E1;border-radius:10px;padding:12px 14px;resize:vertical;min-height:90px"></textarea>
       </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-top:10px;color:#475569">
+        <input type="checkbox" id="useExamplesToggle" checked/> Use saved examples as guidance
+      </label>
       <div class="actions">
         <button class="btn" id="clearQueryBtn">Clear</button>
         <button class="btn primary" id="runQueryBtn">Generate SQL</button>
@@ -129,9 +139,20 @@
     </div>
   </section>
 
+  <!-- TAB 8: CHECK SIGNAL — browse uploaded CSVs -->
+  <section class="panel" id="panel-checksignal">
+    <div class="card">
+      <h2>Check Signal - Uploaded Data</h2>
+      <p class="hint">Every CSV ingested into this schema, with a preview of the underlying table.</p>
+      <button class="btn primary" id="refreshDatasetsBtn">Refresh List</button>
+      <div class="loader hidden" id="checkSignalLoader"><span class="spin"></span> Loading datasets…</div>
+      <div id="checkSignalResult" class="result hidden"></div>
+    </div>
+  </section>
+
 </main>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
-<script src="app.js?v=20260811_1"></script>
+<script src="app.js?v=20260820_2"></script>
 </body>
 </html>

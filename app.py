@@ -38,6 +38,7 @@ from datetime import datetime
 import yaml
 import duckdb
 from flask import session, redirect, url_for
+from werkzeug.security import generate_password_hash, check_password_hash
 import hashlib
 import functools
 
@@ -141,8 +142,13 @@ CORS(app)
 
 DB_FILE = os.path.join(STORAGE_DIR, "data_resonance.duckdb")
 UPLOAD_COPY_CHUNK_SIZE = 32 * 1024 * 1024
-#POC1_MODEL_ID = "us.anthropic.claude-sonnet-4-6"
-POC1_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+#POC1_MODEL_ID = "global.anthropic.claude-sonnet-4-6"
+POC1_MODEL_ID = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+# NOTE: POC1_MODEL_ID isn't actually passed to ask_json() in run_poc1() below
+# (no model= argument) — Tab 2's schema discovery currently always uses
+# whichever model bedrock_client.MODEL_HAIKU defaults to, not this constant.
+# Harmless as-is, but worth knowing if you ever expect changing this line to
+# change Tab 2's model.
 
 # Per-session cache for the (possibly large) poc1 metadata blob. Keyed by
 # session_id so it doesn't leak between users the way a single global dict
@@ -229,6 +235,26 @@ def _kb_manager_for_session():
     return get_kb_manager(DB_FILE, schema_name=_current_schema_name())
 
 
+def _verify_and_maybe_upgrade_password(conn, db_id, stored_password: str, plain_password: str) -> bool:
+    """
+    True if plain_password matches stored_password. Handles both hashed
+    rows (created going forward) and legacy plaintext rows (anything
+    inserted before this fix existed): a successful legacy match is
+    transparently rewritten as a hash, so the table migrates itself as
+    people log in rather than needing a bulk migration step.
+    """
+    if stored_password.startswith(("pbkdf2:", "scrypt:")):
+        return check_password_hash(stored_password, plain_password)
+    if stored_password == plain_password:
+        conn.execute(
+            "UPDATE admin.users SET password = ? WHERE id = ?",
+            [generate_password_hash(plain_password), db_id],
+        )
+        logger.info(f"[auth] upgraded legacy plaintext password to hash | user_ref_id={db_id}")
+        return True
+    return False
+
+
 def init_auth_db():
     """Create admin schema, users and login_activity tables in DuckDB."""
     try:
@@ -265,16 +291,43 @@ def init_auth_db():
             )
         """)
 
+        # Sequence for login_activity.id — replaces the old SELECT MAX(id)+1
+        # pattern, which races when two logins land in the same instant
+        # (real risk under concurrent demo users on multiple gunicorn
+        # threads). START is set past any legacy rows so upgrading an
+        # existing deployment can't collide with IDs already in use.
+        existing_max_activity_id = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM admin.login_activity"
+        ).fetchone()[0]
+        conn.execute(
+            f"CREATE SEQUENCE IF NOT EXISTS admin.login_activity_id_seq "
+            f"START {int(existing_max_activity_id) + 1}"
+        )
+
         # Seed default admin user if not exists
         existing = conn.execute("SELECT COUNT(*) FROM admin.users WHERE user_id = 'admin'").fetchone()[0]
         if existing == 0:
             default_schema = _sanitize_schema_name("admin")
+            # No more hardcoded 'admin123' — that's a well-known default on
+            # an app that's about to be public. Set ADMIN_INITIAL_PASSWORD
+            # in .env to choose your own; otherwise one is generated and
+            # logged once, right now, at first boot only.
+            admin_password = os.getenv("ADMIN_INITIAL_PASSWORD")
+            if not admin_password:
+                import secrets as _secrets
+                admin_password = _secrets.token_urlsafe(12)
+                logger.warning(
+                    "[auth] ADMIN_INITIAL_PASSWORD not set — generated a "
+                    f"random initial admin password: {admin_password}\n"
+                    "  This prints once, right now. Save it, or set "
+                    "ADMIN_INITIAL_PASSWORD in your .env before first boot "
+                    "to choose your own."
+                )
             conn.execute("""
                 INSERT INTO admin.users (id, user_id, password, full_name, schema_name, is_active)
-                VALUES (1, 'admin', 'admin123', 'Administrator', ?, TRUE)
-            """, [default_schema])
+                VALUES (1, 'admin', ?, 'Administrator', ?, TRUE)
+            """, [generate_password_hash(admin_password), default_schema])
             _ensure_schema(conn, default_schema)
-            #logger.info("[auth] default admin user created — user_id=admin, password=admin123")
 
         # Backfill schema_name for any existing rows that predate this column
         # (or were inserted manually without one).
@@ -316,6 +369,19 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
+
+@app.route("/health")
+def health_check():
+    """
+    Liveness check for the ALB target group. Deliberately unauthenticated
+    (the ALB has no session cookie) and deliberately shallow — it doesn't
+    touch DuckDB, so it can never itself become a source of write-lock
+    contention. It only confirms the Flask process is up and responding;
+    that's what the ALB needs to decide whether to route traffic here.
+    """
+    return jsonify({"status": "ok"}), 200
+
+
 @app.route("/login")
 def login_page():
     if session.get("user_id"):
@@ -349,7 +415,7 @@ def auth_login():
             conn.close()
             return jsonify({"success": False, "error": "Your account is inactive. Contact admin."}), 403
  
-        if password != db_password:
+        if not _verify_and_maybe_upgrade_password(conn, db_id, db_password, password):
             conn.close()
             return jsonify({"success": False, "error": "Incorrect password."}), 401
 
@@ -367,9 +433,10 @@ def auth_login():
         from datetime import datetime as dt
         session_id = str(uuid.uuid4())
  
-        # Get next login_activity id
-        max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM admin.login_activity").fetchone()[0]
-        next_id = max_id + 1
+        # Sequence-generated id — see init_auth_db(). Replaces the old
+        # SELECT MAX(id)+1 pattern, which two concurrent logins could
+        # compute identically and then both try to insert.
+        next_id = conn.execute("SELECT nextval('admin.login_activity_id_seq')").fetchone()[0]
  
         # Insert login activity row
         conn.execute("""
@@ -808,6 +875,43 @@ def list_datasets():
 
 
 # ── Tab 1: CSV Upload + DuckDB ingest ─────────────────────────────────────────
+def _ingest_csv_and_respond(csv_path: str, dataset_id: str, filename: str, schema_name: str):
+    """
+    Shared by /api/upload and /api/s3/ingest — everything after a CSV is
+    already sitting on local disk: ingest into DuckDB, snapshot the schema,
+    build the preview response. Keeping this in one place means the two
+    upload paths can't silently drift from each other.
+    """
+    try:
+        table = table_name(dataset_id)
+        t1    = time.time()
+        ingest_result = ingest_csv(
+            csv_path, DB_FILE, table,
+            original_filename=filename, schema_name=schema_name,
+        )
+        logger.info(f"DuckDB ingest completed in {time.time()-t1:.2f}s | schema={schema_name} | table={table}")
+
+        if not ingest_result.get("success"):
+            return jsonify({"error": ingest_result.get("error", "DB ingest failed")}), 500
+
+        snapshot_result = write_table_schema_snapshot(DB_FILE, table, schema_name=schema_name)
+        if not snapshot_result.get("success"):
+            logger.warning(f"[schema] snapshot write failed: {snapshot_result.get('error')}")
+
+        sample, columns, row_count = get_preview(
+            DB_FILE, table, n=8, row_count=ingest_result["row_count"], schema_name=schema_name,
+        )
+        return jsonify({
+            "dataset_id": dataset_id, "filename": filename,
+            "row_count": row_count, "columns": columns,
+            "sample": sample, "duckdb": ingest_result,
+            "schema_snapshot": snapshot_result,
+        })
+    except Exception as e:
+        logger.error(f"Upload/ingest failed for dataset={dataset_id}: {e}", exc_info=True)
+        return jsonify({"error": f"DB error: {str(e)}"}), 500
+
+
 @app.route("/api/upload", methods=["POST"])
 @login_required
 def upload():
@@ -857,35 +961,152 @@ def upload():
     session["dataset_id"] = dataset_id
     session["filename"]   = filename
 
+    return _ingest_csv_and_respond(csv_path, dataset_id, filename, schema_name)
+
+
+# ── S3 upload / browse ───────────────────────────────────────────────────────
+# Presigned browser→S3 uploads bypass the Flask app / ALB entirely for the
+# actual data transfer — the app only ever sees a small JSON request to get
+# a presigned URL, and a separate small request to trigger ingest once the
+# object is already sitting in S3. This also sidesteps the ALB/gunicorn
+# timeout tuning that plain large-file uploads through Flask need.
+S3_UPLOAD_BUCKET = os.getenv("S3_UPLOAD_BUCKET", "")
+_s3_client = None
+
+
+def _get_s3_client():
+    global _s3_client
+    if _s3_client is None:
+        import boto3
+        _s3_client = boto3.client("s3", region_name=os.getenv("AWS_REGION", "ap-south-1"),verify=False)
+    return _s3_client
+
+
+@app.route("/api/s3/presign-upload", methods=["POST"])
+@login_required
+def s3_presign_upload():
+    if not S3_UPLOAD_BUCKET:
+        return jsonify({"error": "S3 upload bucket not configured (S3_UPLOAD_BUCKET env var)"}), 501
+    body = request.get_json(silent=True) or {}
+    filename = (body.get("filename") or "").strip()
+    if not filename:
+        return jsonify({"error": "filename required"}), 400
+
+    schema_name = _current_schema_name()
+    safe_name   = re.sub(r"[^A-Za-z0-9._-]", "_", filename)
+    key         = f"{schema_name}/{ts()}_{safe_name}"
+
     try:
-        table = table_name(dataset_id)
-        t1    = time.time()
-        ingest_result = ingest_csv(
-            csv_path, DB_FILE, table,
-            original_filename=filename, schema_name=schema_name,
+        url = _get_s3_client().generate_presigned_url(
+            "put_object",
+            Params={"Bucket": S3_UPLOAD_BUCKET, "Key": key, "ContentType": "text/csv"},
+            ExpiresIn=3600,
         )
-        logger.info(f"DuckDB ingest completed in {time.time()-t1:.2f}s | schema={schema_name} | table={table}")
+        return jsonify({"upload_url": url, "key": key})
+    except Exception as e:
+        logger.error(f"[s3] presign failed: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
-        if not ingest_result.get("success"):
-            return jsonify({"error": ingest_result.get("error", "DB ingest failed")}), 500
 
-        snapshot_result = write_table_schema_snapshot(DB_FILE, table, schema_name=schema_name)
-        if not snapshot_result.get("success"):
-            logger.warning(f"[schema] snapshot write failed: {snapshot_result.get('error')}")
+@app.route("/api/s3/list", methods=["GET"])
+@login_required
+def s3_list():
+    if not S3_UPLOAD_BUCKET:
+        return jsonify({"error": "S3 upload bucket not configured (S3_UPLOAD_BUCKET env var)"}), 501
+    schema_name = _current_schema_name()
+    try:
+        resp = _get_s3_client().list_objects_v2(Bucket=S3_UPLOAD_BUCKET, Prefix=f"{schema_name}/")
+        files = [
+            {
+                "key": obj["Key"],
+                "filename": obj["Key"].split("/", 1)[-1],
+                "size_mb": round(obj["Size"] / (1024 * 1024), 2),
+                "last_modified": obj["LastModified"].isoformat(),
+            }
+            for obj in resp.get("Contents", [])
+        ]
+        files.sort(key=lambda f: f["last_modified"], reverse=True)
+        return jsonify({"files": files})
+    except Exception as e:
+        logger.error(f"[s3] list failed: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
-        sample, columns, row_count = get_preview(
-            DB_FILE, table, n=8, row_count=ingest_result["row_count"], schema_name=schema_name,
-        )
+
+@app.route("/api/s3/ingest", methods=["POST"])
+@login_required
+def s3_ingest():
+    if not S3_UPLOAD_BUCKET:
+        return jsonify({"error": "S3 upload bucket not configured (S3_UPLOAD_BUCKET env var)"}), 501
+    body = request.get_json(silent=True) or {}
+    key  = (body.get("key") or "").strip()
+    if not key:
+        return jsonify({"error": "key required"}), 400
+
+    schema_name = _current_schema_name()
+    # Enforce the schema-prefix boundary server-side — never trust the
+    # client to only ever ask for keys under its own prefix.
+    if not key.startswith(f"{schema_name}/"):
+        return jsonify({"error": "Not authorized for this object"}), 403
+
+    filename   = key.split("/", 1)[-1]
+    dataset_id = make_dataset_id(filename)
+    udir       = os.path.join(UPLOADS_DIR, schema_name, dataset_id)
+    os.makedirs(udir, exist_ok=True)
+    csv_path   = os.path.join(udir, f"{ts()}.csv")
+
+    try:
+        _get_s3_client().download_file(S3_UPLOAD_BUCKET, key, csv_path)
+    except Exception as e:
+        logger.error(f"[s3] download failed | key={key}: {e}", exc_info=True)
+        return jsonify({"error": f"S3 download failed: {str(e)}"}), 500
+
+    session["dataset_id"] = dataset_id
+    session["filename"]   = filename
+    return _ingest_csv_and_respond(csv_path, dataset_id, filename, schema_name)
+
+
+# ── Check Signal: browse uploaded CSVs ───────────────────────────────────────
+@app.route("/api/dataset/list", methods=["GET"])
+@login_required
+def list_ingested_tables():
+    """
+    Every table actually ingested into this schema's DuckDB — the real
+    source of truth for "what have I uploaded." Distinct from /api/datasets,
+    which only lists datasets that have at least one saved profiling-pipeline
+    stage on disk (poc1/poc7/poc2/poc3a/poc3b) — a raw upload that hasn't
+    been through Tab 2 yet has a real table but no entry there at all.
+    """
+    schema_name = _current_schema_name()
+    try:
+        conn = get_user_conn(read_only=True)
+        rows = conn.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = ? AND table_type = 'BASE TABLE'
+              AND table_name NOT IN ('table_schema_snapshot')
+              AND table_name NOT LIKE 'kb_%'
+            ORDER BY table_name
+        """, [schema_name]).fetchall()
+        conn.close()
+        return jsonify({"tables": [r[0] for r in rows]})
+    except Exception as e:
+        logger.error(f"[check-signal] list failed: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/dataset/<dataset_id>/preview", methods=["GET"])
+@login_required
+def dataset_preview(dataset_id):
+    schema_name = _current_schema_name()
+    try:
+        tbl = table_name(dataset_id)
+        sample, columns, row_count = get_preview(DB_FILE, tbl, n=50, schema_name=schema_name)
         return jsonify({
-            "dataset_id": dataset_id, "filename": filename,
-            "row_count": row_count, "columns": columns,
-            "sample": sample, "duckdb": ingest_result,
-            "schema_snapshot": snapshot_result,
+            "dataset_id": dataset_id, "table": tbl,
+            "columns": columns, "row_count": row_count, "sample": sample,
         })
     except Exception as e:
-        logger.error(f"Upload/ingest failed for dataset={dataset_id}: {e}", exc_info=True)
-        return jsonify({"error": f"DB error: {str(e)}"}), 500
-
+        logger.error(f"[check-signal] preview failed | dataset={dataset_id}: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 # ── Tab 2: Tune - Schema Intelligence  ───────────────────────────────────────────
 @app.route("/api/poc1/run", methods=["POST"])
@@ -1179,14 +1400,45 @@ def run_poc3b():
         return jsonify({"error": str(e)}), 500
 
 
+def _question_may_reference_wrong_table(question: str, sql: str, catalog_tables) -> str | None:
+    """
+    Returns the name of a table the question explicitly names (as a literal,
+    word-bounded match) if that same table is nowhere in the generated SQL —
+    a cheap, high-precision signal that the SQL answered about the wrong
+    table. Used only to decide whether an NL->SQL result is trustworthy
+    enough to auto-save as a future few-shot example.
+
+    This matters because a wrong-table answer that "succeeds" (it's a real
+    table, so it executes without a SQL error) would otherwise get saved as
+    a trusted example — and every future query in the schema is shown saved
+    examples as precedent, so one bad save keeps steering subsequent
+    questions toward the same wrong table. That's what happened with
+    applicant_data / loan_application_sample: the first wrong answer got
+    saved, then reinforced itself on the next two attempts.
+    """
+    q = (question or "").lower()
+    sql_l = (sql or "").lower()
+    for t in catalog_tables or []:
+        t_l = str(t or "").strip().lower()
+        if len(t_l) < 3:
+            continue
+        if re.search(rf"\b{re.escape(t_l)}\b", q) and not re.search(rf"\b{re.escape(t_l)}\b", sql_l):
+            return t
+    return None
+
+
 # ── Tab 7 / Tab 8: NL → SQL Query Builder (POC 8) ────────────────────────────
-@app.route("/api/poc8/query", methods=["POST"])
+# Split into generate + execute so the SQL is shown for human review/edit
+# before anything runs against real data — same human-in-the-loop pattern
+# as Tab 2 (schema) and Tab 3 (SODA YAML) approval.
+@app.route("/api/poc8/generate", methods=["POST"])
 @login_required
-def run_poc8_query():
+def run_poc8_generate():
     ds          = session.get("dataset_id")
     schema_name = _current_schema_name()
-    body     = request.get_json(silent=True) or {}
-    question = (body.get("question") or "").strip()
+    body        = request.get_json(silent=True) or {}
+    question    = (body.get("question") or "").strip()
+    use_examples = bool(body.get("use_examples", True))
     if not question:
         return jsonify({"error": "Please enter a question"}), 400
 
@@ -1195,28 +1447,79 @@ def run_poc8_query():
             _kb_manager_for_session().load_catalog(force_refresh=False)
         except Exception as e:
             logger.warning(f"[poc8] KB catalog warm-up skipped: {e}")
-        result = poc8.question_to_sql(
+        result = poc8.generate_sql(
             db_file=DB_FILE,
             ds=ds,
             storage_dir=STORAGE_DIR,
             question=question,
             ask_json_fn=ask_json,
             schema_name=schema_name,
+            use_examples=use_examples,
+        )
+        result["_dataset_id"] = ds or "kb"
+        result["_question"] = question
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"NL→SQL generation failed for dataset={ds}: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/poc8/execute", methods=["POST"])
+@login_required
+def run_poc8_execute():
+    ds          = session.get("dataset_id")
+    schema_name = _current_schema_name()
+    body        = request.get_json(silent=True) or {}
+    sql         = (body.get("sql") or "").strip()
+    question    = (body.get("question") or "").strip()
+    tables      = body.get("tables") or []
+    join_paths  = body.get("join_paths") or []
+    if not sql:
+        return jsonify({"error": "No SQL to execute"}), 400
+
+    try:
+        result = poc8.execute_sql(
+            db_file=DB_FILE,
+            sql=sql,
+            question=question,
+            schema_name=schema_name,
+            tables=tables,
+            join_paths=join_paths,
+            ask_json_fn=ask_json,
         )
 
         if result.get("ok") and result.get("sql"):
-            # Save successful query as an example pair
+            # Save successful query as an example pair — but only if the
+            # question didn't explicitly name a table that's absent from
+            # the executed SQL. See _question_may_reference_wrong_table.
+            # Doubly safe now: a person reviewed (and could have edited)
+            # this exact SQL before it ever ran, not just "it didn't error."
+            catalog_tables = result.get("tables") or tables
             try:
-                if result.get("tables"):
-                    upsert_example_pair(
-                        STORAGE_DIR, ds or "kb", question,
-                        result.get("sql", ""),
-                        result.get("tables", []) or [],
-                        tags=["poc8", "tab8", "auto_saved"],
-                        schema_name=schema_name,
-                    )
-            except Exception as e:
-                logger.warning(f"[poc8] example pair save skipped: {e}")
+                catalog_tables = list(_kb_manager_for_session().load_catalog().keys()) or catalog_tables
+            except Exception:
+                pass
+            mismatched_table = _question_may_reference_wrong_table(
+                question, result.get("sql", ""), catalog_tables
+            )
+            if mismatched_table:
+                logger.warning(
+                    f"[poc8] skipped auto-saving example — question names "
+                    f"'{mismatched_table}' but the executed SQL doesn't "
+                    f"reference it | question={question!r} sql={result.get('sql')!r}"
+                )
+            else:
+                try:
+                    if result.get("tables"):
+                        upsert_example_pair(
+                            STORAGE_DIR, ds or "kb", question,
+                            result.get("sql", ""),
+                            result.get("tables", []) or [],
+                            tags=["poc8", "tab8", "auto_saved"],
+                            schema_name=schema_name,
+                        )
+                except Exception as e:
+                    logger.warning(f"[poc8] example pair save skipped: {e}")
 
             # Save join edges discovered during query
             try:
@@ -1241,7 +1544,7 @@ def run_poc8_query():
         result["_dataset_id"] = ds or "kb"
         return jsonify(result)
     except Exception as e:
-        logger.error(f"NL→SQL query generation failed for dataset={ds}: {e}", exc_info=True)
+        logger.error(f"NL→SQL execution failed for dataset={ds}: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 

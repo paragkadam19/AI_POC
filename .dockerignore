@@ -1,0 +1,7 @@
+storage/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.duckdb
+data_resonance.duckdb
