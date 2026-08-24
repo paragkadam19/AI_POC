@@ -527,6 +527,49 @@ def _get_visual_intent(question: str) -> bool:
     return any(tok in q for tok in CHART_INTENT_WORDS)
 
 
+def _merge_redundant_categorical_columns(categorical_cols: List[str], rows: List[Dict[str, Any]]) -> List[str]:
+    """Two categorical columns that are in a 1:1 correspondence across the
+    result rows (e.g. supplier_id + supplier_name selected together, one
+    row per supplier) are the same underlying dimension, not two
+    independent ones — GROUP BY queries commonly select both an id and its
+    display name for readability. Counting both as separate categorical
+    columns forces a spurious "2 categorical" classification, which routes
+    to the grouped-bar branch and can never produce a pie chart even for a
+    plain single-dimension percentage-share question.
+
+    Collapses such pairs down to one column, preferring a "*_name" column
+    over its matching "*_id" counterpart since that's the more readable
+    axis label.
+    """
+    if len(categorical_cols) < 2:
+        return categorical_cols
+
+    dropped = set()
+    for i, a in enumerate(categorical_cols):
+        if a in dropped:
+            continue
+        for b in categorical_cols[i + 1:]:
+            if b in dropped:
+                continue
+            a_vals = [str(r.get(a)) for r in rows]
+            b_vals = [str(r.get(b)) for r in rows]
+            pairs = set(zip(a_vals, b_vals))
+            # Bijective correspondence: every distinct `a` maps to exactly
+            # one distinct `b` and vice versa.
+            if len(pairs) == len(set(a_vals)) == len(set(b_vals)):
+                a_is_name = "name" in a.lower()
+                b_is_name = "name" in b.lower()
+                if a_is_name and not b_is_name:
+                    dropped.add(b)
+                elif b_is_name and not a_is_name:
+                    dropped.add(a)
+                else:
+                    # No naming signal either way — keep the first, drop the second.
+                    dropped.add(b)
+
+    return [c for c in categorical_cols if c not in dropped]
+
+
 def _rule_based_chart_spec(question: str, rows: List[Dict[str, Any]], columns: List[str], sql: str = "") -> Dict[str, Any]:
     if not rows:
         return {"chart_type": "table", "reason": "no rows returned"}
@@ -538,6 +581,7 @@ def _rule_based_chart_spec(question: str, rows: List[Dict[str, Any]], columns: L
     numeric_cols = [c for c in columns if dtypes.get(c) == "numeric"]
     datetime_cols = [c for c in columns if dtypes.get(c) == "datetime"]
     categorical_cols = [c for c in columns if dtypes.get(c) in {"categorical", "text"}]
+    categorical_cols = _merge_redundant_categorical_columns(categorical_cols, rows)
 
     q = (question or "").lower()
     if datetime_cols and numeric_cols and any(tok in q for tok in ("trend", "over time", "month", "week", "day", "year")):
