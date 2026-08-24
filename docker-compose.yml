@@ -1,9 +1,9 @@
 services:
-  poc8-app:
+  dataresonance:
     build:
       context: .
       dockerfile: Dockerfile
-    image: poc8:latest
+    image: dataresonance:latest
     ports:
       - "8000:8000"
     volumes:
